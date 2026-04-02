@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from dimos.core.global_config import global_config
 from dimos.robot.config import GripperConfig, RobotConfig
 from dimos.utils.data import LfsPath
 
