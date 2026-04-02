@@ -183,6 +183,9 @@ class DrakeWorld(WorldSpec):
         self._robot_counter = 0
         self._obstacle_counter = 0
 
+        # Cache: (resolved_path, base_pose) → model_instance (shared URDF at same pose)
+        self._loaded_models: dict[tuple[Path, tuple[float, ...]], Any] = {}
+
         # Built diagram and contexts (created after finalize)
         self._diagram: Any = None
         self._live_context: Context | None = None
@@ -205,8 +208,27 @@ class DrakeWorld(WorldSpec):
             self._robot_counter += 1
             robot_id = f"robot_{self._robot_counter}"
 
-            model_instance = self._load_model(config)
-            self._weld_base_if_needed(config, model_instance)
+            resolved_path = config.model_path.resolve()
+            pose_key = tuple(
+                [config.base_pose.position.x, config.base_pose.position.y,
+                 config.base_pose.position.z, config.base_pose.orientation.x,
+                 config.base_pose.orientation.y, config.base_pose.orientation.z,
+                 config.base_pose.orientation.w]
+            )
+            cache_key = (resolved_path, pose_key)
+            existing_instance = self._loaded_models.get(cache_key)
+
+            if existing_instance is not None:
+                # Reuse the already-loaded model instance (shared URDF at same pose)
+                model_instance = existing_instance
+                logger.info(
+                    f"Reusing shared model instance for '{config.name}' "
+                    f"(same URDF: {resolved_path.name})"
+                )
+            else:
+                model_instance = self._load_model(config)
+                self._weld_base_if_needed(config, model_instance)
+                self._loaded_models[cache_key] = model_instance
 
             self._validate_joints(config, model_instance)
 
