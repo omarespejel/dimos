@@ -19,6 +19,8 @@
       {
         "group": "Getting Started",
         "pages": [
+          "introduction",
+          "quickstart",
           "requirements",
           {
             "group": "Installation",
