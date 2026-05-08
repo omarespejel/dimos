@@ -54,7 +54,7 @@ The default `addopts` in `pyproject.toml` includes a `-m` filter that excludes `
 For non-interactive runs, especially on macOS, prefer `CI=1`. This skips system configurator prompts and avoids test runs trying to change local multicast or sysctl state.
 
 ```bash
-CI=1 ./bin/pytest-slow
+./bin/pytest-slow
 ```
 
 (Shortcut for `pytest -m 'not (tool or mujoco)' dimos` — runs the default suite *and* self-hosted tests, but not `tool` or `mujoco`.)
