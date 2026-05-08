@@ -34,7 +34,7 @@ class GlobalConfig(BaseSettings):
     can_port: str | None = None
     simulation: bool = False
     replay: bool = False
-    replay_db: str = "go2_china_office"
+    replay_db: str = "go2_short"
     replay_file: str | None = None
     record_path: str | None = None
     new_memory: bool = False
