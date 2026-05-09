@@ -380,9 +380,33 @@
                 setStatus(`Connected — ${robotName}`);
             } catch (e) {
                 console.error(e);
-                setStatus(`Connection failed: ${e.message}`);
-                setTimeout(() => navigate('dashboard'), 3000);
+                // Persist the error so you can see it after auto-disconnect from
+                // VR, AND don't auto-redirect — wait for the user to dismiss.
+                const msg = `Connection failed: ${e.message || e}`;
+                localStorage.setItem('teleop_last_error', msg);
+                setStatus(msg);
+                showErrorPanel(msg);
             }
+        }
+
+        function showErrorPanel(msg) {
+            // Replace the status panel with a sticky error + back button.
+            const c = document.getElementById('app');
+            c.innerHTML = `
+            <div class="min-h-screen flex flex-col items-center justify-center p-6">
+                <div class="w-full max-w-md text-center">
+                    <h1 class="text-2xl font-bold text-red-400 mb-4">Connection failed</h1>
+                    <pre class="text-sm text-red-300 px-4 py-3 bg-gray-900 border border-red-800 rounded-lg my-4 whitespace-pre-wrap text-left">${escHtml(msg)}</pre>
+                    <button id="errorBackBtn" class="mt-4 px-6 py-2.5 bg-gray-700 hover:bg-gray-600 text-white text-sm font-medium rounded-lg">
+                        Back to dashboard
+                    </button>
+                </div>
+            </div>`;
+            document.getElementById('errorBackBtn').onclick = () => {
+                const canvas = document.getElementById('canvas');
+                if (canvas) canvas.style.display = 'none';
+                navigate('dashboard');
+            };
         }
 
         // ─── Teleop view ────────────────────────────────────────────────────

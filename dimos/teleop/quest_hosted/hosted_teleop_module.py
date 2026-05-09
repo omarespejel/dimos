@@ -13,24 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Hosted Teleop Module — Cloudflare Realtime client.
+"""Hosted Teleop Module — Cloudflare Realtime SFU client.
 
-Robot is a CLIENT (not a server). On start it:
-
-  1. Builds an aiortc PeerConnection with one DataChannel ``cmd_unreliable``
-     (unordered, maxRetransmits=0 — UDP-like, drop stale frames).
-  2. POSTs the SDP offer to the broker microservice
-     (``{broker_url}/api/v1/sessions``). Broker proxies to Cloudflare
-     Realtime SFU, returns the SDP answer + a session_id.
-  3. Establishes the DataChannel; operator commands (PoseStamped + Joy)
-     start arriving as bytes on cmd_unreliable.
-  4. Heartbeats the broker at 1 Hz to keep the session listed.
-
-On stop, deregisters with broker and closes the PC.
-
-Iteration 1 — operator → robot only. State channels (robot → operator)
-to be added later.
+Robot dials out to a broker (``dimensional-teleop``); operator commands
+arrive on a negotiated ``cmd_unreliable`` DataChannel bound to an SCTP id
+the broker hands us via heartbeat ack after an operator joins.
 """
 
 from __future__ import annotations
@@ -69,25 +56,13 @@ class Hand(IntEnum):
 
 
 class HostedTeleopConfig(ModuleConfig):
-    """Configuration for HostedTeleopModule."""
-
     control_loop_hz: float = 50.0
 
-    # Broker — the microservice that mediates SDP exchange with Cloudflare
-    # Realtime. Robots and operators only ever talk to this; Cloudflare
-    # credentials live on the broker.
-    # Production: https://teleop.dimensionalos.com (deployed from
-    # https://github.com/dimensionalOS/dimensional-teleop)
-    # Local dev:  http://localhost:8000 (dev_broker.py)
-    #             or http://localhost:8450 (dimensional-teleop run locally)
     broker_url: str = "https://teleop.dimensionalos.com"
     broker_api_key: str = ""
-
-    # Robot identity for the broker's session list.
     robot_id: str = ""
     robot_name: str = ""
 
-    # ICE — STUN works in most cases; configure TURN for restrictive networks.
     stun_urls: list[str] = ["stun:stun.cloudflare.com:3478"]
     turn_urls: list[str] = []
     turn_username: str = ""
@@ -99,13 +74,8 @@ class HostedTeleopConfig(ModuleConfig):
 class HostedTeleopModule(Module):
     """Cloudflare-Realtime-based teleop client.
 
-    Outputs (operator → robot, published from received cmd_unreliable bytes):
-      - ``left_controller_output: Out[PoseStamped]``
-      - ``right_controller_output: Out[PoseStamped]``
-      - ``buttons: Out[Buttons]``
-
-    Subclass to override engagement, output formatting, or button packing —
-    same hooks as ``QuestTeleopModule``.
+    Override hooks: ``_handle_engage``, ``_should_publish``,
+    ``_get_output_pose``, ``_publish_msg``, ``_publish_button_state``.
     """
 
     config: HostedTeleopConfig
@@ -117,43 +87,33 @@ class HostedTeleopModule(Module):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
 
-        # Per-hand state
         self._is_engaged: dict[Hand, bool] = {Hand.LEFT: False, Hand.RIGHT: False}
-        self._initial_poses: dict[Hand, PoseStamped | None] = {
-            Hand.LEFT: None,
-            Hand.RIGHT: None,
-        }
-        self._current_poses: dict[Hand, PoseStamped | None] = {
-            Hand.LEFT: None,
-            Hand.RIGHT: None,
-        }
-        self._controllers: dict[Hand, QuestControllerState | None] = {
-            Hand.LEFT: None,
-            Hand.RIGHT: None,
-        }
+        self._initial_poses: dict[Hand, PoseStamped | None] = {Hand.LEFT: None, Hand.RIGHT: None}
+        self._current_poses: dict[Hand, PoseStamped | None] = {Hand.LEFT: None, Hand.RIGHT: None}
+        self._controllers: dict[Hand, QuestControllerState | None] = {Hand.LEFT: None, Hand.RIGHT: None}
         self._lock = threading.RLock()
 
-        # asyncio loop running in a dedicated thread (aiortc + httpx are async)
+        # aiortc + httpx are async; run them on a dedicated event loop thread.
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
 
-        # WebRTC + broker state
         self._pc: RTCPeerConnection | None = None
         self._http: httpx.AsyncClient | None = None
         self._session_id: str | None = None
 
-        # Background threads
+        # cmd_unreliable is opened lazily as a negotiated channel once the
+        # broker reports an SCTP id via heartbeat ack (after an operator joins).
+        self._cmd_channel = None
+        self._cmd_channel_id: int | None = None
+
         self._control_loop_thread: threading.Thread | None = None
         self._heartbeat_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
-        # Fingerprint dispatch — fired in asyncio context from DataChannel.on_message
         self._decoders: dict[bytes, Any] = {
             LCMPoseStamped._get_packed_fingerprint(): self._on_pose_bytes,
             LCMJoy._get_packed_fingerprint(): self._on_joy_bytes,
         }
-
-    # ─── Lifecycle ───────────────────────────────────────────────────────────
 
     @rpc
     def start(self) -> None:
@@ -181,8 +141,6 @@ class HostedTeleopModule(Module):
         self._stop_event_loop()
         super().stop()
 
-    # ─── Event loop thread ───────────────────────────────────────────────────
-
     def _start_event_loop(self) -> None:
         ready = threading.Event()
 
@@ -204,24 +162,12 @@ class HostedTeleopModule(Module):
             self._loop_thread = None
         self._loop = None
 
-    # ─── WebRTC + broker (async, runs on event loop thread) ──────────────────
-
     def _connect_blocking(self) -> None:
-        """Sync wrapper: schedule _connect() and wait."""
-        assert self._loop is not None, "_start_event_loop() must be called first"
+        assert self._loop is not None
         future = asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
         future.result(timeout=20.0)
 
     async def _connect(self) -> None:
-        """Open a WebRTC connection via the broker.
-
-        Steps:
-          1. Build PC + DataChannel('cmd_unreliable', unordered, no-retransmit)
-          2. createOffer + setLocalDescription
-          3. Wait for ICE gathering complete (non-trickle)
-          4. POST {broker}/api/v1/sessions { sdp, type, robot_id, robot_name }
-          5. Apply the returned SDP answer
-        """
         self._http = httpx.AsyncClient(timeout=10.0)
 
         ice_servers = [RTCIceServer(urls=u) for u in self.config.stun_urls]
@@ -236,23 +182,10 @@ class HostedTeleopModule(Module):
 
         self._pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
 
-        # Create cmd_unreliable so the SDP advertises a data plane.
-        # Operator publishes onto this same channel from the browser; the
-        # SFU forwards. Bytes arrive here as on_message events.
-        cmd_channel = self._pc.createDataChannel(
-            "cmd_unreliable",
-            ordered=False,
-            maxRetransmits=0,
-        )
-
-        @cmd_channel.on("open")
-        def _on_open() -> None:
-            logger.info("cmd_unreliable channel open")
-
-        @cmd_channel.on("message")
-        def _on_message(data: Any) -> None:  # bytes from the operator
-            if isinstance(data, bytes):
-                self._dispatch_bytes(data)
+        # Throwaway DataChannel — forces an SCTP m-line into the offer so
+        # the SFU has a transport to bind cmd_unreliable to later. Closed
+        # as soon as the answer is applied.
+        sctp_init = self._pc.createDataChannel("_sctp_init")
 
         @self._pc.on("connectionstatechange")
         async def _on_state() -> None:
@@ -274,16 +207,13 @@ class HostedTeleopModule(Module):
 
             await done
 
-        # Register with broker. Field names match dimensional-teleop's
-        # POST /api/v1/sessions schema (sdp_offer in, sdp_answer out).
         url = f"{self.config.broker_url.rstrip('/')}/api/v1/sessions"
-        headers = self._auth_headers()
         body = {
             "robot_id": self.config.robot_id,
             "robot_name": self.config.robot_name,
             "sdp_offer": self._pc.localDescription.sdp,
         }
-        resp = await self._http.post(url, json=body, headers=headers)
+        resp = await self._http.post(url, json=body, headers=self._auth_headers())
         resp.raise_for_status()
         data = resp.json()
         self._session_id = data["session_id"]
@@ -291,6 +221,12 @@ class HostedTeleopModule(Module):
         await self._pc.setRemoteDescription(
             RTCSessionDescription(sdp=data["sdp_answer"], type="answer")
         )
+
+        try:
+            sctp_init.close()
+        except Exception:
+            pass
+
         logger.info(
             f"Registered with broker: session_id={self._session_id}, "
             f"cf_session_id={data.get('cf_session_id')}"
@@ -303,6 +239,8 @@ class HostedTeleopModule(Module):
                 await self._http.delete(url, headers=self._auth_headers())
             except Exception:
                 logger.exception("Failed to deregister with broker")
+        self._close_cmd_channel()
+        self._cmd_channel_id = None
         if self._pc is not None:
             await self._pc.close()
             self._pc = None
@@ -312,17 +250,9 @@ class HostedTeleopModule(Module):
         self._session_id = None
 
     def _auth_headers(self) -> dict[str, str]:
-        """Robot auth header — dimensional-teleop expects ``X-Robot-API-Key``.
-
-        The configured key must be registered server-side and mapped to a
-        ``robot_id`` matching ``config.robot_id``. The dev broker
-        (``dev_broker.py``) ignores auth entirely.
-        """
         if self.config.broker_api_key:
             return {"X-Robot-API-Key": self.config.broker_api_key}
         return {}
-
-    # ─── Heartbeat ──────────────────────────────────────────────────────────
 
     def _start_heartbeat(self) -> None:
         def runner() -> None:
@@ -346,12 +276,66 @@ class HostedTeleopModule(Module):
         if self._http is None or self._session_id is None:
             return
         url = f"{self.config.broker_url.rstrip('/')}/api/v1/sessions/{self._session_id}/heartbeat"
-        await self._http.post(url, headers=self._auth_headers())
+        try:
+            # Broker's HeartbeatRequest requires a JSON body; {} hits the defaults.
+            resp = await self._http.post(url, json={}, headers=self._auth_headers())
+            resp.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Heartbeat POST failed: {e}")
+            return
 
-    # ─── Bytes dispatch (operator → robot) ──────────────────────────────────
+        try:
+            data = resp.json()
+        except Exception:
+            return
+
+        sub_id = data.get("cmd_channel_subscriber_id")
+        sub_id_int = int(sub_id) if sub_id is not None else None
+
+        if sub_id_int != self._cmd_channel_id:
+            self._close_cmd_channel()
+            self._cmd_channel_id = sub_id_int
+            if sub_id_int is not None:
+                self._open_cmd_channel(sub_id_int)
+
+    def _open_cmd_channel(self, sctp_id: int) -> None:
+        if self._pc is None:
+            return
+        logger.info(
+            f"Operator joined — opening negotiated cmd_unreliable on SCTP id {sctp_id}"
+        )
+        channel = self._pc.createDataChannel(
+            "cmd_unreliable",
+            ordered=False,
+            maxRetransmits=0,
+            negotiated=True,
+            id=sctp_id,
+        )
+
+        @channel.on("open")
+        def _on_open() -> None:
+            logger.info("cmd_unreliable channel OPEN")
+
+        @channel.on("message")
+        def _on_message(data: Any) -> None:
+            if isinstance(data, bytes):
+                self._dispatch_bytes(data)
+
+        @channel.on("close")
+        def _on_close() -> None:
+            logger.info("cmd_unreliable channel closed")
+
+        self._cmd_channel = channel
+
+    def _close_cmd_channel(self) -> None:
+        if self._cmd_channel is not None:
+            try:
+                self._cmd_channel.close()
+            except Exception:
+                pass
+            self._cmd_channel = None
 
     def _dispatch_bytes(self, data: bytes) -> None:
-        """Route raw LCM bytes to the right handler by 8-byte fingerprint."""
         decoder = self._decoders.get(data[:8])
         if decoder:
             decoder(data)
@@ -393,8 +377,6 @@ class HostedTeleopModule(Module):
             return Hand.RIGHT
         raise ValueError(f"Unexpected frame_id: {frame_id!r}")
 
-    # ─── Control loop (publishes Out streams) ───────────────────────────────
-
     def _start_control_loop(self) -> None:
         self._stop_event.clear()
         self._control_loop_thread = threading.Thread(
@@ -429,7 +411,6 @@ class HostedTeleopModule(Module):
                 self._stop_event.wait(sleep_time)
 
     def _handle_engage(self) -> None:
-        """Press-and-hold engage on each controller's primary button."""
         for hand in Hand:
             controller = self._controllers.get(hand)
             if controller is None:
@@ -454,7 +435,6 @@ class HostedTeleopModule(Module):
         return self._is_engaged[hand]
 
     def _get_output_pose(self, hand: Hand) -> PoseStamped | None:
-        """Default: delta from initial engaged pose."""
         current = self._current_poses.get(hand)
         initial = self._initial_poses.get(hand)
         if current is None or initial is None:
