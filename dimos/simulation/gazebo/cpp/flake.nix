@@ -278,16 +278,34 @@
           cmakeFlags = [
             "-DCMAKE_PREFIX_PATH=${gz-cmake};${gz-utils};${gz-math};${gz-common};${gz-plugin}"
           ];
-          # Modern libglvnd's <GL/glxext.h> uses GLintptr/GLsizeiptr without
-          # forward-declaring them — those typedefs live in <GL/glext.h>.
-          # Multiple source files include <GL/glx.h> without pulling in
-          # <GL/gl.h>+<GL/glext.h> first; inject them before every glx.h.
+          # Two source patches:
+          #
+          # (1) Modern libglvnd's <GL/glxext.h> uses GLintptr/GLsizeiptr
+          #     without forward-declaring them — those typedefs live in
+          #     <GL/glext.h>. Inject <GL/gl.h>+<GL/glext.h> before every
+          #     <GL/glx.h>.
+          #
+          # (2) gz-rendering's `OgreRenderEngine::CreateRenderWindow()`
+          #     (the no-arg dummy variant) hands OGRE the X11 ID of a 1x1
+          #     window it created on its own X display connection. OGRE
+          #     opens a SEPARATE display connection and validates the
+          #     handle via XGetWindowAttributes, which can fail with
+          #     "Invalid parentWindowHandle (wrong server or screen)" on
+          #     some X servers (any setup where OGRE's display has a
+          #     different DefaultRootWindow value than gz-rendering's).
+          #     OGRE explicitly skips that validation when parentWindow
+          #     equals DefaultRootWindow — so pass that instead.
           preConfigure = ''
-            echo "[gz-rendering patch] injecting <GL/gl.h>+<GL/glext.h> before <GL/glx.h>"
             for f in $(grep -rl '<GL/glx.h>' ogre/ || true); do
-              echo "[gz-rendering patch] patching $f"
               sed -i 's|<GL/glx.h>|<GL/gl.h>\n# include <GL/glext.h>\n# include <GL/glx.h>|' "$f"
             done
+
+            # Replace the dummyWindowId arg with a runtime-computed
+            # DefaultRootWindow so OGRE skips its parentWindowHandle check.
+            sed -i 's|this->CreateRenderWindow(std::to_string(this->dummyWindowId), 1, 1,|this->CreateRenderWindow(std::to_string(static_cast<unsigned long>(DefaultRootWindow(static_cast<Display*>(this->dummyDisplay)))), 1, 1,|' \
+              ogre/src/OgreRenderEngine.cc
+            grep -q "DefaultRootWindow(static_cast<Display\*>" ogre/src/OgreRenderEngine.cc \
+              || { echo "[gz-rendering patch] dummy window patch did not apply" >&2; exit 1; }
           '';
         };
 
