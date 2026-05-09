@@ -53,11 +53,6 @@ Use `execute_mode_command` with: "WalkMode", "WalkControlWaist", or "RunMode"
 - Tag important locations with `tag_location` so you can return to them later.
 - During `start_exploration`, avoid calling other skills except `stop_movement`.
 
-## Object database (perception2)
-- `list_objects` returns every object you've detected so far with its world position and observation count. Call this when asked "what have you seen?" or before deciding where to go.
-- `find_object("query")` does a name search across the database — e.g. `find_object("flag")` returns matching entries.
-- `goto_object("name")` sets a navigation goal at the object's center. The name must match what `list_objects` shows.
-
 # BEHAVIOR
 Be proactive. Infer reasonable actions from ambiguous requests. Inform the user of your assumption.
 """

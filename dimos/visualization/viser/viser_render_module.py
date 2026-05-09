@@ -42,7 +42,6 @@ from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.nav_msgs.Path import Path as PathMsg
 from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
-from dimos.perception2.msgs import ObjectBoundingBoxes
 from dimos.utils.logging_config import setup_logger
 from dimos.visualization.viser.camera import CameraSpec, g1_d435_default, world_pose
 from dimos.visualization.viser.robot_meshes import (
@@ -77,11 +76,6 @@ class ViserRenderModule(Module):
     # obstacle-memory overlay; /lidar (per-scan, transient) also works
     # if the latest sweep is what you want.
     pointcloud_overlay: In[PointCloud2]
-    # Per-object 3D bounding boxes published by ObjectPerception.
-    # Rendered as oriented boxes + floating labels; toggleable via
-    # the GUI.  When no publisher is connected the overlay just
-    # stays empty.
-    object_bboxes: In[ObjectBoundingBoxes]
     clicked_point: Out[PointStamped]
 
     def __init__(
@@ -157,16 +151,6 @@ class ViserRenderModule(Module):
         self._lidar_handle: Any = None
         self._lidar_visible: bool = True
         self._lidar_checkbox: Any = None
-        # Per-object 3D bbox overlay state.  We keep one box handle and
-        # one label handle per perceived object, keyed by sanitized name
-        # (perception2 publishes per-object stable names).  Re-published
-        # snapshots overwrite the existing handles in place; objects
-        # missing from a snapshot get their handles removed so the
-        # overlay matches the live store exactly.
-        self._object_bboxes_visible: bool = True
-        self._object_bboxes_checkbox: Any = None
-        self._object_box_handles: dict[str, Any] = {}
-        self._object_label_handles: dict[str, Any] = {}
 
     @rpc
     def start(self) -> None:
@@ -358,22 +342,6 @@ class ViserRenderModule(Module):
             if self._lidar_handle is not None:
                 self._lidar_handle.visible = self._lidar_visible
 
-        # Object bbox overlay toggle — also unconditional so users
-        # can see the toggle even before perception2 has detected
-        # anything yet.
-        self._object_bboxes_checkbox = self._server.gui.add_checkbox(
-            "Show object bboxes", initial_value=self._object_bboxes_visible
-        )
-
-        @self._object_bboxes_checkbox.on_update
-        def _on_object_bboxes_toggle(_: Any) -> None:
-            self._object_bboxes_visible = bool(self._object_bboxes_checkbox.value)
-            for handle in list(self._object_box_handles.values()) + list(
-                self._object_label_handles.values()
-            ):
-                if handle is not None:
-                    handle.visible = self._object_bboxes_visible
-
         # One frame per body; meshes are added as children so they
         # follow when the body frame moves.
         for body_id, body_name in enumerate(self._robot.body_names):
@@ -459,12 +427,6 @@ class ViserRenderModule(Module):
             self.register_disposable(Disposable(unsub))
         except Exception as e:
             logger.warning(f"Viser: lidar subscribe failed: {e}")
-
-        try:
-            unsub = self.object_bboxes.subscribe(self._on_object_bboxes)
-            self.register_disposable(Disposable(unsub))
-        except Exception as e:
-            logger.warning(f"Viser: object_bboxes subscribe failed: {e}")
 
         try:
             unsub = self.joint_state.subscribe(self._on_joint_state)
@@ -597,58 +559,6 @@ class ViserRenderModule(Module):
         except Exception as e:
             logger.debug(f"Viser lidar overlay update failed: {e}")
 
-    def _on_object_bboxes(self, msg: ObjectBoundingBoxes) -> None:
-        """Render per-object 3D boxes + floating labels.
-
-        Replaces existing handles in place via stable scene-tree node
-        names; objects missing from the snapshot get their handles
-        removed so the overlay matches the live store exactly.  Color
-        is derived from a hash of the class name so each label keeps
-        a consistent color across observations.
-        """
-        if self._server is None:
-            return
-        seen: set[str] = set()
-        for box in msg.boxes:
-            node_id = _sanitize_node_id(box.name)
-            seen.add(node_id)
-            color = _name_to_color(box.name)
-            box_path = f"/perception2/{node_id}/box"
-            label_path = f"/perception2/{node_id}/label"
-            try:
-                self._object_box_handles[node_id] = self._server.scene.add_box(
-                    box_path,
-                    color=color,
-                    dimensions=box.extent,
-                    wireframe=True,
-                    position=box.center,
-                    wxyz=box.orientation_wxyz,
-                    visible=self._object_bboxes_visible,
-                )
-                self._object_label_handles[node_id] = self._server.scene.add_label(
-                    label_path,
-                    text=f"{box.name} (x{box.n_obs})",
-                    position=(
-                        float(box.center[0]),
-                        float(box.center[1]),
-                        float(box.center[2]) + float(box.extent[2]) * 0.5 + 0.1,
-                    ),
-                    visible=self._object_bboxes_visible,
-                )
-            except Exception as e:
-                logger.debug(f"Viser object bbox render failed for {box.name}: {e}")
-        # Drop handles for objects no longer in the snapshot — keeps
-        # the overlay in sync with the live store after evictions.
-        stale = [k for k in self._object_box_handles if k not in seen]
-        for k in stale:
-            for d in (self._object_box_handles, self._object_label_handles):
-                handle = d.pop(k, None)
-                if handle is not None:
-                    try:
-                        handle.remove()
-                    except Exception as e:
-                        logger.debug(f"Viser object handle remove failed: {e}")
-
     def _on_joint_state(self, msg: JointState) -> None:
         names = list(msg.name)
         positions = list(msg.position)
@@ -717,34 +627,6 @@ class ViserRenderModule(Module):
 
 
 viser_render = ViserRenderModule.blueprint
-
-
-def _sanitize_node_id(name: str) -> str:
-    """Stable, viser-tree-safe identifier for a class name.
-
-    viser scene-tree segments are slash-delimited, so any embedded
-    slash (or other path-busting character) needs to go.  We also
-    lowercase to keep the identifier stable across detector
-    capitalization quirks.
-    """
-    out = []
-    for ch in name.strip().lower():
-        out.append(ch if ch.isalnum() or ch in ("_", "-") else "_")
-    cleaned = "".join(out).strip("_") or "object"
-    # Tag with hash so two distinct labels that sanitize to the same
-    # string still get unique scene-tree paths.
-    suffix = format(hash(name) & 0xFFFF, "04x")
-    return f"{cleaned}_{suffix}"
-
-
-def _name_to_color(name: str) -> tuple[int, int, int]:
-    """Deterministic RGB tuple from class-name hash, with a saturation
-    floor so labels stay legible against the splat backdrop."""
-    import colorsys
-
-    h = (hash(name) & 0xFFFF) / 0xFFFF
-    r, g, b = colorsys.hsv_to_rgb(h, 0.85, 0.95)
-    return (int(r * 255), int(g * 255), int(b * 255))
 
 
 __all__ = ["ViserRenderModule", "viser_render"]

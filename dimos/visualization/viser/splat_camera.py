@@ -977,7 +977,7 @@ class SplatCameraModule(Module):
                 rgb = self._composite_scene_meshes(rgb, cam_pos, cam_wxyz)
                 ts = time.time()
                 # Publish tf for the actual rendering pose so consumers
-                # of the published image (perception2 etc.) can do
+                # of the published image can do
                 # ``tf.get(image.frame_id, world_frame, ts)`` and get
                 # the *correct* world->optical transform — even when
                 # ``camera_spec`` differs from the MJCF camera pose
