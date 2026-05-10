@@ -391,7 +391,11 @@ class DimSimBridge(Module):
         if camera_fov is not None:
             args.extend(["--camera-fov", str(camera_fov)])
 
-        if os.environ.get("DIMSIM_HEADLESS", "").strip() in ("1", "true"):
+        # Headless is the default — the bridge owns the sim process and there's
+        # no human in front of it. Set DIMSIM_INTERACTIVE=1 to skip --headless
+        # so you can point your own browser at the sim's HTTP port.
+        interactive = os.environ.get("DIMSIM_INTERACTIVE", "").strip() in ("1", "true")
+        if not interactive:
             explicit_render = os.environ.get("DIMSIM_RENDER", "").strip()
             if explicit_render:
                 render = explicit_render
