@@ -87,6 +87,7 @@ class HostedTeleopModule(Module):
     right_controller_output: Out[PoseStamped]
     buttons: Out[Buttons]
     cmd_vel: Out[Twist]
+    cmd_vel_stamped: Out[TwistStamped]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -375,12 +376,12 @@ class HostedTeleopModule(Module):
             self._controllers[hand] = controller
 
     def _on_twist_bytes(self, data: bytes) -> None:
-        # Keyboard mode — no engagement gating. Wire format is TwistStamped
-        # (carries timestamp); strip the header and publish plain Twist on
-        # cmd_vel (matches GO2Connection.cmd_vel and most ROS-style bases).
+        # Keyboard mode — no engagement gating. Wire format is TwistStamped;
+        # publish on both cmd_vel (plain, for GO2 / standard consumers) and
+        # cmd_vel_stamped (with header, for recorders / latency analyzers).
         msg = TwistStamped.lcm_decode(data)
-        twist = Twist(linear=msg.linear, angular=msg.angular)
-        self.cmd_vel.publish(twist)
+        self.cmd_vel.publish(Twist(linear=msg.linear, angular=msg.angular))
+        self.cmd_vel_stamped.publish(msg)
 
     @staticmethod
     def _resolve_hand(frame_id: str) -> Hand:

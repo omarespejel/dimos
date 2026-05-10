@@ -118,8 +118,9 @@ class HostedTwistTeleopModule(HostedTeleopModule):
         msg = TwistStamped.lcm_decode(data)
         ls = self.config.linear_speed
         as_ = self.config.angular_speed
-        twist = Twist(
-            linear=Vector3(msg.linear.x * ls, msg.linear.y * ls, msg.linear.z * ls),
-            angular=Vector3(msg.angular.x * as_, msg.angular.y * as_, msg.angular.z * as_),
+        linear = Vector3(msg.linear.x * ls, msg.linear.y * ls, msg.linear.z * ls)
+        angular = Vector3(msg.angular.x * as_, msg.angular.y * as_, msg.angular.z * as_)
+        self.cmd_vel.publish(Twist(linear=linear, angular=angular))
+        self.cmd_vel_stamped.publish(
+            TwistStamped(ts=msg.ts, frame_id=msg.frame_id, linear=linear, angular=angular)
         )
-        self.cmd_vel.publish(twist)

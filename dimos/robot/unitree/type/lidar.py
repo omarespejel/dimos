@@ -100,7 +100,7 @@ def repair_stale_ts(default_period: float = 0.130) -> Callable[[Observable[T]], 
         if prev_good[0] is not None and item.ts <= prev_good[0]:
             old = item.ts
             item.ts = prev_good[0] + default_period
-            logger.warning("repair_stale_ts: stale stamp %.6f → %.6f", old, item.ts)
+            logger.debug("repair_stale_ts: stale stamp %.6f → %.6f", old, item.ts)
         prev_good[0] = item.ts
         return item
 
