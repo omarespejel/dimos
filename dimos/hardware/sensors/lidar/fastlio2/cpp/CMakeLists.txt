@@ -57,6 +57,9 @@ find_package(Eigen3 REQUIRED)
 # PCL (only components we need — avoid full PCL which drags in VTK via io)
 find_package(PCL 1.8 REQUIRED COMPONENTS common filters)
 
+# Sophus (used by faithful-reimpl IESKF / map_builder)
+find_package(Sophus REQUIRED)
+
 # yaml-cpp (FAST-LIO config parsing — standard YAML format)
 find_package(yaml-cpp REQUIRED)
 
@@ -71,8 +74,13 @@ set(LIVOX_SDK_INCLUDE_DIR ${LIVOX_SDK_PREFIX}/include)
 
 add_executable(fastlio2_native
   main.cpp
-  ${FASTLIO_DIR}/src/preprocess.cpp
-  ${FASTLIO_DIR}/include/ikd-Tree/ikd_Tree.cpp
+  ${FASTLIO_DIR}/src/utils.cpp
+  ${FASTLIO_DIR}/src/map_builder/commons.cpp
+  ${FASTLIO_DIR}/src/map_builder/ieskf.cpp
+  ${FASTLIO_DIR}/src/map_builder/ikd_Tree.cpp
+  ${FASTLIO_DIR}/src/map_builder/imu_processor.cpp
+  ${FASTLIO_DIR}/src/map_builder/lidar_processor.cpp
+  ${FASTLIO_DIR}/src/map_builder/map_builder.cpp
 )
 
 # Shared Livox common headers (livox_sdk_config.hpp etc.)
@@ -83,10 +91,12 @@ endif()
 target_include_directories(fastlio2_native PRIVATE
   ${FASTLIO_DIR}/include
   ${FASTLIO_DIR}/src
+  ${FASTLIO_DIR}/src/map_builder
   ${dimos_lcm_SOURCE_DIR}/generated/cpp_lcm_msgs
   ${LCM_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}
+  ${Sophus_INCLUDE_DIRS}
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${LIVOX_COMMON_DIR}
   ${LIVOX_SDK_INCLUDE_DIR}
@@ -96,6 +106,7 @@ target_link_libraries(fastlio2_native PRIVATE
   ${LCM_LIBRARIES}
   ${LIVOX_SDK}
   ${PCL_LIBRARIES}
+  Sophus::Sophus
   yaml-cpp::yaml-cpp
 )
 

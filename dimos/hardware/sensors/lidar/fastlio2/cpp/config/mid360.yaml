@@ -1,0 +1,38 @@
+# FAST-LIO2 (faithful-reimpl) config for Livox Mid-360.
+# Flat YAML schema consumed by FastLio::FastLio() in fast_lio.hpp.
+
+# Lidar pre-filter / range
+lidar_filter_num: 3
+lidar_min_range: 0.5
+lidar_max_range: 100.0
+
+# Voxel resolutions (m)
+scan_resolution: 0.15
+map_resolution: 0.3
+
+# Local map bookkeeping
+cube_len: 300.0
+det_range: 100.0
+move_thresh: 1.5
+
+# IMU noise / bias-walk
+na: 0.01
+ng: 0.01
+nba: 0.0001
+nbg: 0.0001
+imu_init_num: 20
+
+# IESKF
+near_search_num: 5
+ieskf_max_iter: 5
+gravity_align: true
+esti_il: false       # online IMU↔Lidar extrinsic estimation
+
+# Static IMU→Lidar extrinsic (Mid-360, carried over from prior mid360.json)
+t_il: [0.04165, 0.02326, -0.0284]
+r_il: [1.0, 0.0, 0.0,
+       0.0, 1.0, 0.0,
+       0.0, 0.0, 1.0]
+
+# Lidar point covariance inverse weight (higher = more lidar trust)
+lidar_cov_inv: 1000.0

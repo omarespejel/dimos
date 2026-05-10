@@ -129,7 +129,7 @@ using dimos::make_header;
 // Publish lidar (world-frame point cloud)
 // ---------------------------------------------------------------------------
 
-static void publish_lidar(PointCloudXYZI::Ptr cloud, double timestamp,
+static void publish_lidar(CloudType::Ptr cloud, double timestamp,
                           const std::string& topic = "") {
     const std::string& chan = topic.empty() ? g_lidar_topic : topic;
     if (!g_lcm || !cloud || cloud->empty() || chan.empty()) return;

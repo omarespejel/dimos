@@ -13,7 +13,7 @@
       flake = false;
     };
     fast-lio = {
-      url = "github:dimensionalOS/dimos-module-fastlio2/main";
+      url = "github:dimensionalOS/dimos-module-fastlio2/feat/faithful-reimpl";
       flake = false;
     };
     lcm-extended = {
@@ -81,6 +81,7 @@
             pkgs.pcl
             pkgs.yaml-cpp
             pkgs.boost
+            pkgs.sophus
             pkgs.llvmPackages.openmp
           ];
 
