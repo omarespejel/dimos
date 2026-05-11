@@ -100,7 +100,7 @@ def _quaternion_xyzw_close(a: np.ndarray, bx: float, by: float, bz: float, bw: f
 
 
 def _synthetic_flat_marker_bgr(marker_id: int = 0) -> np.ndarray:
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
     side_px = 200
     tile = np.zeros((side_px, side_px), dtype=np.uint8)
     cv2.aruco.generateImageMarker(dictionary, marker_id, side_px, tile)
@@ -143,7 +143,7 @@ def test_marker_tf_deploy_lcm_tf_integration() -> None:
 
     bgr = _synthetic_flat_marker_bgr(0)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
     det = cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
     corners, ids, _ = det.detectMarkers(gray)
     assert ids is not None and len(ids) >= 1

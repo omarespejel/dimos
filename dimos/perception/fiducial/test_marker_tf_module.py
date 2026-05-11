@@ -183,7 +183,7 @@ def test_estimate_marker_pose_roundtrip() -> None:
 
 
 def _synthetic_marker_bgr(marker_id: int = 0) -> np.ndarray:
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
     side_px = 220
     tile = np.zeros((side_px, side_px), dtype=np.uint8)
     cv2.aruco.generateImageMarker(dictionary, marker_id, side_px, tile)

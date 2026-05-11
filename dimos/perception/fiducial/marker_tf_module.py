@@ -14,6 +14,8 @@
 
 """ArUco marker detection with distorted-camera pose and TF publication.
 
+Default dictionary aligns with ``dimos apriltag`` family ``tag36h11``.
+
 Publishes ``world -> markers`` (identity) and ``markers -> marker_{id}`` so composed
 lookups match marker poses in ``world``. Requires ``CameraInfo`` (``plumb_bob`` or
 empty distortion supported best; refine intrinsics on hardware when needed).
@@ -152,15 +154,19 @@ def create_aruco_detector(dictionary_name: str) -> cv2.aruco.ArucoDetector:
 
 
 class MarkerTfModuleConfig(ModuleConfig):
-    """Configuration for :class:`MarkerTfModule`."""
+    """Configuration for :class:`MarkerTfModule`.
+
+    ``marker_length_m`` is the physical edge length of the printed square marker
+    in meters (required; no default).
+    """
 
     world_frame: str = "world"
     base_frame: str = "base_link"
     markers_frame: str = "markers"
     marker_namespace_prefix: str | None = None
-    aruco_dictionary: str = "DICT_4X4_50"
+    aruco_dictionary: str = "DICT_APRILTAG_36h11"
     marker_length_m: float = Field(
-        ..., gt=0.0, description="Physical marker edge length in meters."
+        ..., gt=0.0, description="Physical square marker edge length in meters."
     )
     max_freq: float = 15.0
     tf_lookup_tolerance: float = 0.5
