@@ -28,9 +28,10 @@ Sim (``--simulation``):
     MujocoSimModule (in-process MuJoCo + SHM) + sim_mujoco_g1 adapter.
     50 Hz tick (matches the rate the policy was trained at). No arming
     ramp, no dry-run, no servo_arms -- sim physics doesn't gravity-collapse
-    the arms between trajectories. Optional passive viewer
-    ``MujocoViewerModule`` (disabled by default; enable via
-    ``-o mujocoviewermodule.enabled=true``).
+    the arms between trajectories. Optional passive viewer runs in the
+    engine subprocess; flip on via ``-o mujocosimmodule.headless=false``
+    (which also flips ``engine_mode`` to ``"subprocess"`` so the viewer
+    lives on a main thread).
 
 Usage:
     dimos run unitree-g1-groot-wbc                 # real hardware
@@ -65,7 +66,6 @@ from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.msgs.sensor_msgs.MotorCommandArray import MotorCommandArray
 from dimos.robot.unitree.g1.wholebody_connection import G1WholeBodyConnection
 from dimos.simulation.engines.mujoco_sim_module import MujocoSimModule
-from dimos.simulation.engines.mujoco_viewer_module import MujocoViewerModule
 from dimos.utils.data import LfsPath
 from dimos.web.websocket_vis.websocket_vis_module import WebsocketVisModule
 
@@ -101,10 +101,6 @@ if global_config.simulation:
     # Sim physics holds the arms between trajectories on its own -- no
     # servo task needed.
     _arm_holder: TaskConfig | None = None
-    # Optional read-only viewer for "what is the engine doing right now".
-    _viewer = MujocoViewerModule.blueprint(
-        mjcf_path=str(_MJCF_PATH), enabled=False
-    )
 else:
     # --- Real-hw backend: DDS connection module + transport_lcm adapter ---
     _backend = G1WholeBodyConnection.blueprint(release_sport_mode=True)
@@ -127,7 +123,6 @@ else:
         default_positions=ARM_DEFAULT_POSE,
         auto_start=True,
     )
-    _viewer = None
 
 
 _coordinator = ControlCoordinator.blueprint(
@@ -185,10 +180,6 @@ _ws_vis = WebsocketVisModule.blueprint().transports(
     {("cmd_vel", Twist): LCMTransport("/g1/cmd_vel", Twist)}
 )
 
-_modules: list = [_backend, _coordinator, _ws_vis]
-if _viewer is not None:
-    _modules.append(_viewer)
-
-unitree_g1_groot_wbc = autoconnect(*_modules)
+unitree_g1_groot_wbc = autoconnect(_backend, _coordinator, _ws_vis)
 
 __all__ = ["unitree_g1_groot_wbc"]

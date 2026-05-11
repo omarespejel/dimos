@@ -475,123 +475,201 @@ class MujocoEngine(SimulationEngine):
         return float(self._model.cam_fovy[cam_id])
 
 
-def view_main(mjcf_path: str, *, render_hz: float = 60.0) -> None:
-    """Standalone passive-viewer entry point.
+def engine_main(
+    mjcf_path: str,
+    shm_key: str,
+    dof: int,
+    *,
+    headless: bool = True,
+    inject_legacy_assets: bool = True,
+    odom_topic: str = "/odom",
+    imu_topic: str = "/imu",
+    imu_gyro_sensor_names: tuple[str, ...] = (
+        "imu-pelvis-angular-velocity",
+        "imu-torso-angular-velocity",
+        "gyro_pelvis",
+        "imu_gyro",
+    ),
+    imu_accel_sensor_names: tuple[str, ...] = (
+        "imu-pelvis-linear-acceleration",
+        "imu-torso-linear-acceleration",
+        "accelerometer_pelvis",
+        "imu_accel",
+    ),
+) -> None:
+    """Standalone whole-body sim entry point.
 
-    Loads ``mjcf_path``, subscribes to ``/coordinator/joint_state`` +
-    ``/odom`` over LCM, and mirrors that state into a ``mujoco.viewer``
-    window without running physics. Used by ``MujocoViewerModule`` on
-    macOS where ``mujoco.viewer.launch_passive`` requires the main
-    thread (and so can't live inside a dimos worker).
+    Runs an in-process MuJoCo engine + the whole-body SHM bridge + (optionally)
+    a passive viewer, all on the main thread. ``MujocoSimModule`` spawns this
+    as a subprocess when ``engine_mode='subprocess'`` is set — that way MuJoCo
+    can render with ``viewer.launch_passive`` on macOS (which requires main
+    thread) while dimos workers remain free to be daemonic.
 
-    Previously this code lived in a separate
-    ``mujoco_view_subprocess.py`` module; folded back in here so we
-    have one MuJoCo file instead of three.
+    SHM layout matches ``ManipShmWriter`` so the same
+    ``WholeBodyAdapter`` (sim_mujoco_g1) reads commands + writes states from
+    the dimos side. The /odom + /imu LCM publishes mirror what
+    ``MujocoSimModule`` does in thread mode.
     """
-    import numpy as _np
+    import signal as _signal
 
     from dimos.core.transport import LCMTransport
     from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
-    from dimos.msgs.sensor_msgs.JointState import JointState
+    from dimos.msgs.geometry_msgs.Quaternion import Quaternion
+    from dimos.msgs.geometry_msgs.Vector3 import Vector3
+    from dimos.msgs.sensor_msgs.Imu import Imu
+    from dimos.simulation.engines.mujoco_shm import ManipShmWriter
+    from dimos.simulation.engines.wholebody_sim_hooks import WholeBodySimHooks
 
-    # dimos joint names look like ``g1/left_hip_pitch``; MJCF wants
-    # ``left_hip_pitch_joint``. Same translation rule as the viser
-    # viewer's robot_meshes helper.
-    def dimos_joint_to_mjcf(name: str) -> str:
-        parts = name.split("/", 1)
-        suffix = parts[1] if len(parts) > 1 else parts[0]
-        return f"{suffix}_joint"
+    # SHM writer that mirrors the in-process module's layout — the
+    # dimos-side adapter reads the same buffers either way.
+    shm = ManipShmWriter(shm_key)
 
-    # G1 GR00T MJCF references meshes by bare filename (menagerie
-    # convention); inject dimos-bundled mesh bytes by name so
-    # from_xml_string can find them. Falls back to from_xml_path for
-    # self-contained MJCFs.
-    try:
-        from dimos.simulation.mujoco.model import get_assets
-
-        with open(mjcf_path) as _f:
-            _xml = _f.read()
-        model = mujoco.MjModel.from_xml_string(_xml, assets=get_assets())
-    except Exception:
-        model = mujoco.MjModel.from_xml_path(mjcf_path)
-    data = mujoco.MjData(model)
-    mujoco.mj_forward(model, data)
-
-    name_to_qposadr: dict[str, int] = {}
-    for jid in range(model.njnt):
-        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, jid)
-        if not name:
-            continue
-        if model.jnt_type[jid] in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
-            name_to_qposadr[name] = int(model.jnt_qposadr[jid])
-
-    # Lock-protected latest state — LCM callbacks fire on a different
-    # thread than the viewer loop.
-    latest_lock = threading.Lock()
-    latest_joints: dict[str, float] = {}
-    latest_base_pos: _np.ndarray | None = None
-    latest_base_wxyz: _np.ndarray | None = None
-
-    def _on_joint_state(msg: JointState) -> None:
-        nonlocal latest_joints
+    # Engine + asset injection (mirrors MujocoSimModule.start()).
+    assets: dict[str, bytes] | None = None
+    if inject_legacy_assets:
         try:
-            with latest_lock:
-                for n, q in zip(list(msg.name), list(msg.position), strict=False):
-                    latest_joints[dimos_joint_to_mjcf(str(n))] = float(q)
-        except Exception:
-            pass
+            from dimos.simulation.mujoco.model import get_assets
 
-    def _on_odom(msg: PoseStamped) -> None:
-        nonlocal latest_base_pos, latest_base_wxyz
-        try:
-            with latest_lock:
-                latest_base_pos = _np.array(
-                    [msg.position.x, msg.position.y, msg.position.z], dtype=_np.float64
+            assets = get_assets()
+        except Exception as e:  # pragma: no cover - bare MJCFs don't need this
+            logger.warning(f"engine_main: asset injection skipped: {e}")
+    eng = MujocoEngine(
+        config_path=Path(mjcf_path),
+        headless=headless,
+        cameras=[],
+        assets=assets,
+    )
+
+    # Resolve IMU sensors + base-qpos slice once.
+    imu_gyro_slice = _find_sensor_slice_inline(eng.model, imu_gyro_sensor_names)
+    imu_accel_slice = _find_sensor_slice_inline(eng.model, imu_accel_sensor_names)
+    has_freejoint = bool(
+        eng.model.njnt > 0
+        and int(eng.model.jnt_type[0]) == int(mujoco.mjtJoint.mjJNT_FREE)
+    )
+
+    # SHM bridge — runs in the engine's sim loop.
+    hooks = WholeBodySimHooks(shm, dof=dof)
+
+    # LCM publishers (started lazily; .start() spawns the LCM thread).
+    odom_tx: LCMTransport[PoseStamped] = LCMTransport(odom_topic, PoseStamped)
+    odom_tx.start()
+    imu_tx: LCMTransport[Imu] = LCMTransport(imu_topic, Imu)
+    imu_tx.start()
+
+    def _on_after_step(engine: MujocoEngine) -> None:
+        """Composite post-step: SHM writes + LCM publishes."""
+        hooks.post_step(engine)
+
+        data = engine.data
+        ts = time.time()
+
+        # Base pose (qpos[0:7]) → /odom
+        if has_freejoint:
+            pos = data.qpos[0:3]
+            quat = data.qpos[3:7]  # (w, x, y, z) MuJoCo convention
+            odom_tx.publish(
+                PoseStamped(
+                    ts=ts,
+                    frame_id="world",
+                    position=Vector3(float(pos[0]), float(pos[1]), float(pos[2])),
+                    orientation=Quaternion(
+                        float(quat[1]), float(quat[2]), float(quat[3]), float(quat[0])
+                    ),
                 )
-                latest_base_wxyz = _np.array(
-                    [msg.orientation.w, msg.orientation.x, msg.orientation.y, msg.orientation.z],
-                    dtype=_np.float64,
-                )
-        except Exception:
-            pass
+            )
 
-    js_t: LCMTransport[JointState] = LCMTransport("/coordinator/joint_state", JointState)
-    js_t.start()
-    js_t.subscribe(_on_joint_state)
-    od_t: LCMTransport[PoseStamped] = LCMTransport("/odom", PoseStamped)
-    od_t.start()
-    od_t.subscribe(_on_odom)
+        # IMU sensors → SHM + /imu
+        if imu_gyro_slice is None and imu_accel_slice is None and not has_freejoint:
+            return
+        quat_tup = (
+            (
+                float(data.qpos[3]),
+                float(data.qpos[4]),
+                float(data.qpos[5]),
+                float(data.qpos[6]),
+            )
+            if has_freejoint
+            else (1.0, 0.0, 0.0, 0.0)
+        )
+        gyro_tup = (
+            tuple(float(v) for v in data.sensordata[imu_gyro_slice])
+            if imu_gyro_slice is not None
+            else (0.0, 0.0, 0.0)
+        )
+        accel_tup = (
+            tuple(float(v) for v in data.sensordata[imu_accel_slice])
+            if imu_accel_slice is not None
+            else (0.0, 0.0, 0.0)
+        )
+        shm.write_imu(quaternion=quat_tup, gyroscope=gyro_tup, accelerometer=accel_tup)
+        imu_tx.publish(
+            Imu(
+                ts=ts,
+                frame_id="pelvis",
+                orientation=Quaternion(quat_tup[1], quat_tup[2], quat_tup[3], quat_tup[0]),
+                angular_velocity=Vector3(*gyro_tup),
+                linear_acceleration=Vector3(*accel_tup),
+            )
+        )
 
-    has_freejoint = bool(model.njnt > 0 and model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE)
-    free_qposadr = int(model.jnt_qposadr[0]) if has_freejoint else -1
-    period = 1.0 / float(render_hz)
+    eng._on_before_step = hooks.pre_step  # type: ignore[attr-defined]
+    eng._on_after_step = _on_after_step  # type: ignore[attr-defined]
+
+    # Start the sim thread inside the engine — _sim_loop runs viewer +
+    # mj_step on the main thread (we ARE the main thread here).
+    if not eng.connect():
+        logger.error("engine_main: engine.connect() failed")
+        shm.cleanup()
+        odom_tx.stop()
+        imu_tx.stop()
+        raise SystemExit(1)
+    shm.signal_ready(num_joints=eng.num_joints)
+    logger.info(
+        "engine_main: ready",
+        mjcf=mjcf_path,
+        shm_key=shm_key,
+        dof=dof,
+        headless=headless,
+    )
+
+    # Wait for SIGTERM / SIGINT — engine's sim thread keeps stepping
+    # until eng.disconnect() flips its stop event.
+    stop_flag = threading.Event()
+
+    def _handle_sig(signum: int, frame: object) -> None:  # noqa: ANN001
+        logger.info(f"engine_main: signal {signum} received, stopping")
+        stop_flag.set()
+
+    _signal.signal(_signal.SIGINT, _handle_sig)
+    _signal.signal(_signal.SIGTERM, _handle_sig)
 
     try:
-        with viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=True) as v:
-            while v.is_running():
-                tick_start = time.perf_counter()
-                with latest_lock:
-                    joints = dict(latest_joints)
-                    base_pos = latest_base_pos
-                    base_wxyz = latest_base_wxyz
-                for name, q in joints.items():
-                    adr = name_to_qposadr.get(name)
-                    if adr is not None:
-                        data.qpos[adr] = q
-                if has_freejoint and base_pos is not None and base_wxyz is not None:
-                    data.qpos[free_qposadr : free_qposadr + 3] = base_pos
-                    data.qpos[free_qposadr + 3 : free_qposadr + 7] = base_wxyz
-                mujoco.mj_kinematics(model, data)
-                v.sync()
-                # Subtract iteration time so we hold render_hz under load.
-                sleep_for = period - (time.perf_counter() - tick_start)
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
+        while not stop_flag.is_set():
+            time.sleep(0.1)
     finally:
-        # Always tear down LCM subscribers even if the viewer crashes
-        # — leaking transport threads makes the next run flaky.
-        js_t.stop()
-        od_t.stop()
+        try:
+            eng.disconnect()
+        except Exception as e:
+            logger.warning(f"engine_main: disconnect raised: {e}")
+        try:
+            shm.signal_stop()
+            shm.cleanup()
+        except Exception as e:
+            logger.warning(f"engine_main: shm cleanup raised: {e}")
+        odom_tx.stop()
+        imu_tx.stop()
+
+
+def _find_sensor_slice_inline(
+    model: mujoco.MjModel, names: tuple[str, ...], dim: int = 3
+) -> slice | None:
+    for n in names:
+        sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, n)
+        if sid >= 0:
+            adr = int(model.sensor_adr[sid])
+            return slice(adr, adr + dim)
+    return None
 
 
 __all__ = [
@@ -599,17 +677,32 @@ __all__ = [
     "CameraFrame",
     "MujocoEngine",
     "StepHook",
-    "view_main",
+    "engine_main",
 ]
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    if len(sys.argv) != 2:
-        print(
-            "usage: python -m dimos.simulation.engines.mujoco_engine <mjcf>",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    view_main(sys.argv[1])
+    p = argparse.ArgumentParser(
+        description="Standalone MuJoCo whole-body sim subprocess.",
+        prog="python -m dimos.simulation.engines.mujoco_engine",
+    )
+    p.add_argument("mjcf", help="Path to MJCF XML")
+    p.add_argument("shm_key", help="SHM key (matches the dimos-side adapter)")
+    p.add_argument("dof", type=int, help="Number of motor DOFs")
+    p.add_argument("--view", action="store_true", help="Launch passive viewer")
+    p.add_argument("--no-asset-inject", action="store_true", help="Skip menagerie asset injection")
+    p.add_argument("--odom-topic", default="/odom")
+    p.add_argument("--imu-topic", default="/imu")
+    args = p.parse_args()
+
+    engine_main(
+        mjcf_path=args.mjcf,
+        shm_key=args.shm_key,
+        dof=args.dof,
+        headless=not args.view,
+        inject_legacy_assets=not args.no_asset_inject,
+        odom_topic=args.odom_topic,
+        imu_topic=args.imu_topic,
+    )
