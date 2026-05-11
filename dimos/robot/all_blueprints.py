@@ -134,6 +134,7 @@ all_modules = {
     "demo-robot": "dimos.agents.skills.demo_robot.DemoRobot",
     "detection2-d-module": "dimos.perception.detection.module2D.Detection2DModule",
     "detection3-d-module": "dimos.perception.detection.module3D.Detection3DModule",
+    "dim-sim-adapter": "dimos.robot.sim.adapter.DimSimAdapter",
     "dim-sim-bridge": "dimos.robot.sim.bridge.DimSimBridge",
     "dim-sim-tf": "dimos.robot.sim.tf_module.DimSimTF",
     "drone-camera-module": "dimos.robot.drone.camera_module.DroneCameraModule",

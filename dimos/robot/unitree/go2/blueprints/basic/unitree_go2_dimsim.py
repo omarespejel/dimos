@@ -23,9 +23,13 @@ from typing import Any
 
 from dimos.core.coordination.blueprints import autoconnect
 from dimos.core.global_config import global_config
+from dimos.core.transport import JpegLcmTransport
 from dimos.mapping.costmapper import CostMapper
 from dimos.mapping.voxels import VoxelGridMapper
+from dimos.msgs.sensor_msgs.Image import Image
+from dimos.navigation.movement_manager.movement_manager import MovementManager
 from dimos.navigation.replanning_a_star.module import ReplanningAStarPlanner
+from dimos.robot.sim.adapter import DimSimAdapter
 from dimos.robot.sim.bridge import DimSimBridge
 from dimos.robot.sim.jpeg_lcm import SimJpegLCM
 from dimos.visualization.vis_module import vis_module
@@ -92,8 +96,17 @@ rerun_config = {
     },
 }
 
+# DimSim publishes JPEG-encoded image bytes on /color_image and
+# /depth_image. JpegLcmTransport on the consumer side decodes them
+# transparently — no Python intermediary needed in the bridge.
+_image_transports = autoconnect().transports({
+    ("color_image", Image): JpegLcmTransport("/color_image", Image),
+    ("depth_image", Image): JpegLcmTransport("/depth_image", Image),
+})
+
 unitree_go2_dimsim = (
     autoconnect(
+        _image_transports,
         vis_module(
             viewer_backend=global_config.viewer,
             rerun_config=rerun_config,
@@ -102,11 +115,14 @@ unitree_go2_dimsim = (
             scene="apt",
             vehicle_height=0.3,
         ),
+        DimSimAdapter.blueprint(),
         VoxelGridMapper.blueprint(voxel_size=0.1),
         CostMapper.blueprint(),
         ReplanningAStarPlanner.blueprint(),
+        # Relays planner.nav_cmd_vel → bridge.cmd_vel.
+        MovementManager.blueprint(),
     )
-    .global_config(n_workers=6, robot_model="unitree_go2", simulation=True)
+    .global_config(n_workers=8, robot_model="unitree_go2", simulation=True)
 )
 
 __all__ = ["unitree_go2_dimsim"]

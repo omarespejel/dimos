@@ -12,26 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DimSim bridge module with Unity-compatible interface.
+"""DimSim bridge — NativeModule wrapper around the browser-based simulator.
 
-Launches the DimSim browser-based simulator as a managed subprocess,
-subscribes to its LCM sensor output, and exposes the same stream
-interface as UnityBridgeModule — making it a drop-in replacement for
-nav/planning tests on macOS and ARM Linux.
+Architecture:
+    DimSim subprocess (deno + headless Chromium + Rapier3D) publishes on
+    LCM channels. NativeModule's lifecycle manages the subprocess; this
+    bridge exposes In/Out ports and remaps DimSim's internal channels to
+    the blueprint-resolved port topics.
 
-Data flow:
-    DimSim subprocess → LCM (odom, lidar, images) → DimSimBridge Out ports
-    DimSimBridge In[cmd_vel] → LCM → DimSim subprocess
-
-Uses --topic-remap (jeff-hykin/DimSim fork) to namespace LCM channels,
-enabling multiple simultaneous instances.
+    Ports whose native type matches DimSim's output (lidar PointCloud2,
+    cmd_vel Twist) pass through directly via DimSim's --topic-remap flag.
+    Ports that need type conversion (odom PoseStamped → Odometry,
+    color_image JPEG → Image, synthesized CameraInfo) are handled by a
+    separate ``DimSimAdapter`` module — see ``dimos/robot/sim/adapter.py``.
 
 Usage::
 
-    from dimos.robot.sim.bridge import sim_bridge
     from dimos.core.coordination.blueprints import autoconnect
+    from dimos.robot.sim.bridge import DimSimBridge
+    from dimos.robot.sim.adapter import DimSimAdapter
 
-    autoconnect(sim_bridge(scene="apt"), some_consumer()).build().loop()
+    autoconnect(
+        DimSimBridge.blueprint(scene="apt", vehicle_height=0.3),
+        DimSimAdapter.blueprint(camera_fov=46),
+        consumer(),
+    ).build().loop()
 """
 
 from __future__ import annotations
@@ -39,29 +44,17 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
-import signal
 import shutil
 import subprocess
-import threading
-import time
 from typing import Any
 
-import lcm as lcmlib
 from pydantic import Field
-from reactivex.disposable import Disposable
 
-from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
-from dimos.core.module import Module, ModuleConfig
+from dimos.core.native_module import NativeModule, NativeModuleConfig
 from dimos.core.stream import In, Out
-from dimos.msgs.geometry_msgs.Pose import Pose
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
-from dimos.msgs.geometry_msgs.Quaternion import Quaternion
-from dimos.msgs.geometry_msgs.Transform import Transform
 from dimos.msgs.geometry_msgs.Twist import Twist
-from dimos.msgs.geometry_msgs.Vector3 import Vector3
-from dimos.msgs.nav_msgs.Odometry import Odometry
-from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.utils.logging_config import setup_logger
@@ -71,10 +64,14 @@ logger = setup_logger()
 _GITHUB_REPO = "jeff-hykin/DimSim"
 _RELEASES_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
 
+# Camera defaults (DimSim: 640x288, configurable FOV)
+_CAM_W = 640
+_CAM_H = 288
+_DEFAULT_FOV_DEG = int(os.environ.get("DIMSIM_CAMERA_FOV", "46"))
+
 
 def _detect_gpu() -> bool:
     """Check if a GPU is available for headless rendering."""
-    # Check for NVIDIA GPU via nvidia-smi
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -87,79 +84,48 @@ def _detect_gpu() -> bool:
     return False
 
 
-# Camera defaults (DimSim: 640x288, configurable FOV)
-_CAM_W = 640
-_CAM_H = 288
-_DEFAULT_FOV_DEG = int(os.environ.get("DIMSIM_CAMERA_FOV", "46"))
-
-
 def _dimsim_bin() -> Path:
     return Path.home() / ".dimsim" / "bin" / "dimsim"
 
 
 def _deno_home_bin() -> Path:
-    """Default deno binary location when installed via curl installer."""
-    return Path.home() / ".deno" / "bin"
+    return Path.home() / ".deno" / "bin" / "deno"
 
 
 def _ensure_deno() -> str:
-    """Find or install Deno. Returns the path to the deno binary.
+    """Locate or install deno."""
+    deno = shutil.which("deno")
+    if deno:
+        return deno
+    home_deno = _deno_home_bin()
+    if home_deno.exists():
+        deno_dir = str(home_deno.parent)
+        current_path = os.environ.get("PATH", "")
+        if deno_dir not in current_path.split(os.pathsep):
+            os.environ["PATH"] = deno_dir + os.pathsep + current_path
+        return str(home_deno)
 
-    If deno is not on PATH or at ~/.deno/bin/deno, installs it using the
-    official curl installer and adds ~/.deno/bin to PATH for this process.
-    """
-    # Check PATH first
-    found = shutil.which("deno")
-    if found:
-        return found
+    logger.info("Installing deno to ~/.deno/bin/...")
+    result = subprocess.run(
+        ["curl", "-fsSL", "https://deno.land/install.sh"],
+        capture_output=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to download installer: {result.stderr.decode()}")
+    install = subprocess.run(
+        ["sh", "-s", "--", "-y"],
+        input=result.stdout,
+        env={**os.environ, "DENO_INSTALL": str(Path.home() / ".deno")},
+        capture_output=True, timeout=120,
+    )
+    if install.returncode != 0:
+        raise RuntimeError(f"Installer failed: {install.stderr.decode()}")
 
-    # Check default install location
-    deno_bin = _deno_home_bin() / "deno"
-    if deno_bin.exists():
-        # Add to PATH so subprocess calls find it too
-        _add_deno_to_path()
-        return str(deno_bin)
-
-    # Install via curl
-    logger.info("Deno not found — installing via official installer…")
-    try:
-        result = subprocess.run(
-            ["curl", "-fsSL", "https://deno.land/install.sh"],
-            capture_output=True, timeout=30,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to download installer: {result.stderr.decode()}")
-
-        install = subprocess.run(
-            ["sh"],
-            input=result.stdout,
-            capture_output=True, timeout=120,
-        )
-        if install.returncode != 0:
-            raise RuntimeError(f"Installer failed: {install.stderr.decode()}")
-
-        logger.info("Deno installed successfully.")
-    except Exception as e:
-        raise FileNotFoundError(
-            f"Could not install Deno automatically: {e}. "
-            "Install manually: curl -fsSL https://deno.land/install.sh | sh"
-        ) from e
-
-    _add_deno_to_path()
-
-    deno_path = str(deno_bin)
-    if not deno_bin.exists():
-        # Try finding it on the now-updated PATH
-        deno_path = shutil.which("deno") or deno_path
-    return deno_path
-
-
-def _add_deno_to_path() -> None:
-    """Add ~/.deno/bin to this process's PATH if not already there."""
-    deno_dir = str(_deno_home_bin())
+    deno_dir = str(home_deno.parent)
     current_path = os.environ.get("PATH", "")
     if deno_dir not in current_path.split(os.pathsep):
         os.environ["PATH"] = deno_dir + os.pathsep + current_path
+    return str(home_deno)
 
 
 def _find_local_cli() -> Path | None:
@@ -194,31 +160,33 @@ def _find_local_cli() -> Path | None:
     return home_cli if home_cli.exists() else None
 
 
-def _make_camera_info(fov_deg: int | None = None) -> CameraInfo:
-    """Build CameraInfo for DimSim's virtual camera."""
-    fov = fov_deg or _DEFAULT_FOV_DEG
-    fx = (_CAM_W / 2) / math.tan(math.radians(fov / 2))
-    fy = fx
-    cx, cy = _CAM_W / 2.0, _CAM_H / 2.0
-
-    return CameraInfo(
-        frame_id="camera_optical",
-        height=_CAM_H,
-        width=_CAM_W,
-        distortion_model="plumb_bob",
-        D=[0.0, 0.0, 0.0, 0.0, 0.0],
-        K=[fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0],
-        R=[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        P=[fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0],
-    )
+# DimSim's pub/sub uses these internal channel names. Port names below
+# are picked to match these so the default LCM topic resolution lands on
+# the same channels — no --topic-remap needed for the typical blueprint.
+# If a blueprint explicitly remaps a port, the override mechanism below
+# generates a --topic-remap entry for it.
+_PORT_TO_INTERNAL: dict[str, str] = {
+    "cmd_vel": "/cmd_vel",
+    "odom": "/odom",
+    "lidar": "/lidar",
+    "color_image": "/color_image",
+    "depth_image": "/depth_image",
+}
 
 
-class DimSimBridgeConfig(ModuleConfig):
-    """Configuration for the DimSim bridge."""
+class DimSimBridgeConfig(NativeModuleConfig):
+    """Configuration for the DimSim native bridge.
+
+    All fields except ``local`` map to DimSim CLI flags. ``cli_name_override``
+    handles snake_case → kebab-case translation; ``cli_exclude`` drops fields
+    that don't correspond to a DimSim flag.
+    """
+
+    # NativeModuleConfig requires `executable`; it's filled in by resolve().
+    executable: str = ""
 
     scene: str = "apt"
     port: int = 8090
-    local: bool = False
 
     # Sensor publish rates (ms). None = DimSim defaults.
     image_rate_ms: int | None = None
@@ -228,37 +196,63 @@ class DimSimBridgeConfig(ModuleConfig):
     enable_depth: bool = True
     camera_fov: int | None = None
 
-    # Sim parameters (matching UnityBridgeConfig interface)
+    # Pinhole-camera intrinsics consumers care about (forwarded to the
+    # DimSimAdapter that synthesizes CameraInfo).
     vehicle_height: float = 0.75
 
-    # Topic namespace prefix for multi-instance isolation
-    topic_prefix: str = ""
+    # Source mode: True = run from ~/repos/DimSim source via deno, else
+    # installed binary or auto-install.
+    local: bool = False
 
-    # LCM URL override
+    # LCM URL override (passed through env, not CLI; informational here).
     lcm_url: str = ""
 
+    cli_name_override: dict[str, str] = Field(default_factory=lambda: {
+        "image_rate_ms": "image-rate",
+        "lidar_rate_ms": "lidar-rate",
+        "odom_rate_ms": "odom-rate",
+        "camera_fov": "camera-fov",
+    })
 
-class DimSimBridge(Module):
-    """Browser-based 3D simulator with Unity-compatible stream interface.
+    # Fields that aren't DimSim CLI flags — exclude from to_cli_args().
+    cli_exclude: frozenset[str] = frozenset({
+        "local",
+        "vehicle_height",
+        "lcm_url",
+        "enable_depth",  # mapped to --no-depth manually
+        "scene",         # passed positionally
+        "port",          # passed positionally
+    })
 
-    Ports (matching UnityBridgeModule):
-        cmd_vel (In[Twist]): Velocity commands.
-        terrain_map (In[PointCloud2]): Terrain for Z adjustment (accepted for compat).
-        odometry (Out[Odometry]): Vehicle state (converted from PoseStamped).
-        registered_scan (Out[PointCloud2]): Lidar pointcloud.
-        color_image (Out[Image]): RGB camera.
-        camera_info (Out[CameraInfo]): Camera intrinsics.
+
+class DimSimBridge(NativeModule):
+    """NativeModule wrapper around the DimSim simulator subprocess.
+
+    Outputs publish raw DimSim message types (PoseStamped odom, JPEG-encoded
+    images). Consumers that need standard nav-stack types should compose
+    with ``DimSimAdapter``, which decodes JPEG and converts PoseStamped to
+    Odometry with synthesized velocity.
+
+    Ports (named to match DimSim's native LCM channels so default topic
+    resolution lands on the right wire — no remapping needed unless a
+    blueprint explicitly assigns a different topic):
+        cmd_vel (In[Twist]): velocity commands.
+        odom (Out[PoseStamped]): raw pose from DimSim's physics step.
+        lidar (Out[PointCloud2]): lidar pointcloud.
+        color_image (Out[Image]): RGB camera frame; wire format is JPEG, so
+            subscribers must use ``JpegLcmTransport`` (set in the blueprint
+            via ``.transports({...})``).
+        depth_image (Out[Image]): depth frame (if enabled); also JPEG.
     """
 
     config: DimSimBridgeConfig
 
-    # Unity-compatible ports
     cmd_vel: In[Twist]
-    terrain_map: In[PointCloud2]
-    odometry: Out[Odometry]
-    registered_scan: Out[PointCloud2]
+    odom: Out[PoseStamped]
+    lidar: Out[PointCloud2]
+    # JPEG-encoded on the wire; consumers use JpegLcmTransport to decode.
     color_image: Out[Image]
-    camera_info: Out[CameraInfo]
+    depth_image: Out[Image]
 
     @staticmethod
     def rerun_blueprint() -> Any:
@@ -303,128 +297,35 @@ class DimSimBridge(Module):
     def rerun_suppress_camera_info(_: Any) -> None:
         return None
 
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._running = threading.Event()
-        self._process: subprocess.Popen | None = None  # type: ignore[type-arg]
-        self._lcm: lcmlib.LCM | None = None
-        self._lcm_thread: threading.Thread | None = None
-        self._caminfo_thread: threading.Thread | None = None
-
-        # For velocity estimation (PoseStamped → Odometry)
-        self._prev_odom_time: float | None = None
-        self._prev_x = 0.0
-        self._prev_y = 0.0
-        self._prev_yaw = 0.0
-
-        # Build remapped topic names
-        p = self.config.topic_prefix
-        self._topic_odom = f"{p}/odom#geometry_msgs.PoseStamped"
-        self._topic_lidar = f"{p}/lidar#sensor_msgs.PointCloud2"
-        self._topic_color = f"{p}/color_image#sensor_msgs.Image"
-        self._topic_cmd_vel = f"{p}/cmd_vel#geometry_msgs.Twist"
-
     @rpc
     def start(self) -> None:
-        if os.environ.get("DIMSIM_CONNECT_ONLY", "").strip() in ("1", "true"):
-            logger.info("DIMSIM_CONNECT_ONLY: skipping subprocess, connecting to existing server")
-        else:
-            self._ensure_installed()
-            threading.Thread(target=self._launch_subprocess, daemon=True).start()
-
+        # Resolve the executable + interpreter prefix dynamically. Stash
+        # the result on the config so NativeModule.start() can use them.
+        exe, prefix_args = self._resolve_executable()
+        self.config.executable = exe
+        self.config.extra_args = self._build_extra_args(prefix_args)
         super().start()
-        self.register_disposable(Disposable(self.cmd_vel.subscribe(self._on_cmd_vel)))
 
-        # Touch self.tf here to force its lazy LCMTF construction on the
-        # start thread. The first access happens in _on_lcm_odom otherwise,
-        # which runs in the LCM recv thread of self._lcm — creating a second
-        # lcm.LCM instance inside another LCM's recv callback fails silently
-        # to publish, so transforms never reach other workers' TF buffers.
-        # (Worked before only because ReplanningAStarPlanner reads pose from
-        # the Odometry message and doesn't TF-lookup; nav_stack does.)
-        self.tf  # noqa: B018  -- intentional eager init
+    def _build_extra_args(self, prefix_args: list[str]) -> list[str]:
+        """Build the CLI args that follow the executable.
 
-        # Start LCM listener for sensor data from subprocess
-        lcm_url = self.config.lcm_url or os.environ.get(
-            "LCM_DEFAULT_URL", "udpm://239.255.76.67:7667?ttl=0"
-        )
-        self._lcm = lcmlib.LCM(lcm_url)
-        self._lcm.subscribe(self._topic_odom, self._on_lcm_odom)
-        self._lcm.subscribe(self._topic_lidar, self._on_lcm_lidar)
-        self._lcm.subscribe(self._topic_color, self._on_lcm_color_image)
-
-        self._running.set()
-        self._lcm_thread = threading.Thread(target=self._lcm_loop, daemon=True)
-        self._lcm_thread.start()
-
-        # Publish camera_info immediately + at 1 Hz
-        self.camera_info.publish(_make_camera_info(self.config.camera_fov))
-        self._caminfo_thread = threading.Thread(target=self._caminfo_loop, daemon=True)
-        self._caminfo_thread.start()
-
-        logger.info("DimSimBridge started")
-
-    @rpc
-    def stop(self) -> None:
-        self._running.clear()
-        if self._lcm_thread:
-            self._lcm_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-        if self._caminfo_thread:
-            self._caminfo_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-        proc = self._process
-        self._process = None
-        if proc is not None and proc.poll() is None:
-            logger.info(f"Stopping DimSim (pid={proc.pid})")
-            proc.send_signal(signal.SIGTERM)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                logger.warning(f"DimSim pid={proc.pid} did not exit, killing")
-                proc.kill()
-        super().stop()
-
-    @rpc
-    def move(self, twist: Twist, duration: float = 0.0) -> bool:
-        """Send movement command (UnityBridgeModule compat)."""
-        if duration > 0:
-            stop = Twist(linear=Vector3(0, 0, 0), angular=Vector3(0, 0, 0))
-            deadline = time.monotonic() + duration
-            while time.monotonic() < deadline:
-                self._publish_cmd_vel(twist)
-                time.sleep(0.05)
-            self._publish_cmd_vel(stop)
-        else:
-            self._publish_cmd_vel(twist)
-        return True
-
-    # -- Subprocess management -------------------------------------------------
-
-    def _build_cli_args(self) -> list[str]:
+        Combines:
+          - prefix_args (for `deno run ...` when using local source)
+          - DimSim subcommand + positional config (`dev --scene X --port N`)
+          - headless/render flags (default headless; DIMSIM_INTERACTIVE=1 opts out)
+          - --topic-remap mapping DimSim's internal channels onto the
+            blueprint-resolved port topics
+          - rate/depth/fov flags via NativeModuleConfig.to_cli_args()
+        """
         cfg = self.config
+        args = list(prefix_args)
+
         scene = os.environ.get("DIMSIM_SCENE", "").strip() or cfg.scene
-        args = ["dev", "--scene", scene, "--port", str(cfg.port)]
+        args.extend(["dev", "--scene", scene, "--port", str(cfg.port)])
 
-        image_rate = os.environ.get("DIMSIM_IMAGE_RATE", "").strip() or cfg.image_rate_ms
-        lidar_rate = os.environ.get("DIMSIM_LIDAR_RATE", "").strip() or cfg.lidar_rate_ms
-        odom_rate = os.environ.get("DIMSIM_ODOM_RATE", "").strip() or cfg.odom_rate_ms
-        if image_rate is not None:
-            args.extend(["--image-rate", str(image_rate)])
-        if lidar_rate is not None:
-            args.extend(["--lidar-rate", str(lidar_rate)])
-        if odom_rate is not None:
-            args.extend(["--odom-rate", str(odom_rate)])
-
-        no_depth = os.environ.get("DIMSIM_DISABLE_DEPTH", "").strip() in ("1", "true")
-        if no_depth or not cfg.enable_depth:
+        if not cfg.enable_depth or os.environ.get("DIMSIM_DISABLE_DEPTH", "").strip() in ("1", "true"):
             args.append("--no-depth")
 
-        camera_fov = os.environ.get("DIMSIM_CAMERA_FOV", "").strip() or cfg.camera_fov
-        if camera_fov is not None:
-            args.extend(["--camera-fov", str(camera_fov)])
-
-        # Headless is the default — the bridge owns the sim process and there's
-        # no human in front of it. Set DIMSIM_INTERACTIVE=1 to skip --headless
-        # so you can point your own browser at the sim's HTTP port.
         interactive = os.environ.get("DIMSIM_INTERACTIVE", "").strip() in ("1", "true")
         if not interactive:
             explicit_render = os.environ.get("DIMSIM_RENDER", "").strip()
@@ -442,19 +343,42 @@ class DimSimBridge(Module):
         if channels:
             args.extend(["--channels", channels])
 
-        # Topic remapping
-        if cfg.topic_prefix:
-            remap_pairs = [
-                f"/odom={cfg.topic_prefix}/odom",
-                f"/lidar={cfg.topic_prefix}/lidar",
-                f"/color_image={cfg.topic_prefix}/color_image",
-                f"/depth_image={cfg.topic_prefix}/depth_image",
-                f"/cmd_vel={cfg.topic_prefix}/cmd_vel",
-                f"/camera_info={cfg.topic_prefix}/camera_info",
-            ]
+        # Pass through blueprint-resolved port topics via --topic-remap so
+        # DimSim publishes/subscribes on the same channels the rest of the
+        # blueprint uses. DimSim auto-appends the `#type.Name` suffix to its
+        # internal channel before LCM publish, so the remap value must be
+        # the BARE topic — otherwise the suffix would be doubled.
+        remap_pairs = []
+        for port_name, internal_ch in _PORT_TO_INTERNAL.items():
+            topic = self._port_topic(port_name)
+            if topic is None:
+                continue
+            bare_topic = topic.split("#", 1)[0]
+            if bare_topic != internal_ch:
+                remap_pairs.append(f"{internal_ch}={bare_topic}")
+        if remap_pairs:
             args.extend(["--topic-remap", ",".join(remap_pairs)])
 
         return args
+
+    def _port_topic(self, port_name: str) -> str | None:
+        """Read the blueprint-resolved LCM channel for a port (or None)."""
+        stream = getattr(self, port_name, None)
+        if stream is None:
+            return None
+        transport = getattr(stream, "_transport", None)
+        if transport is None:
+            return None
+        topic = getattr(transport, "topic", None)
+        return str(topic) if topic is not None else None
+
+    def _collect_topics(self) -> dict[str, str]:
+        """Suppress NativeModule's default per-port `--<name> <topic>` args.
+
+        DimSim's CLI doesn't recognize them — topic routing is handled via
+        --topic-remap in :meth:`_build_extra_args` instead.
+        """
+        return {}
 
     def _resolve_executable(self) -> tuple[str, list[str]]:
         use_local = self.config.local or os.environ.get("DIMSIM_LOCAL", "").strip() in ("1", "true")
@@ -467,6 +391,9 @@ class DimSimBridge(Module):
                 )
             logger.info(f"Using local DimSim: {cli_ts}")
             return _ensure_deno(), ["run", "--allow-all", "--unstable-net", str(cli_ts)]
+
+        # Not local: ensure binary is installed/up-to-date before resolving.
+        self._ensure_installed()
 
         dimsim = _dimsim_bin()
         if dimsim.exists():
@@ -482,9 +409,6 @@ class DimSimBridge(Module):
 
     def _ensure_installed(self) -> None:
         """Download binary + setup + scene install if needed."""
-        if self.config.local or os.environ.get("DIMSIM_LOCAL", "").strip() in ("1", "true"):
-            return
-
         import json
         import platform
         import stat
@@ -548,7 +472,6 @@ class DimSimBridge(Module):
                         if system == "darwin":
                             subprocess.run(["xattr", "-c", str(dimsim)], capture_output=True)
 
-                        # Sanity check: min size (compiled binaries are >1MB) + smoketest
                         file_size = dimsim.stat().st_size
                         if file_size < 1_000_000:
                             dimsim.unlink()
@@ -585,7 +508,6 @@ class DimSimBridge(Module):
         if not dimsim_path:
             raise FileNotFoundError("dimsim not found")
 
-        # Symlink to ~/.local/bin
         local_bin = Path.home() / ".local" / "bin"
         local_bin.mkdir(parents=True, exist_ok=True)
         symlink = local_bin / "dimsim"
@@ -602,146 +524,6 @@ class DimSimBridge(Module):
         subprocess.run([dimsim_path, "setup"], check=True)
         logger.info(f"Checking scene '{scene}'...")
         subprocess.run([dimsim_path, "scene", "install", scene], check=True)
-
-    def _launch_subprocess(self) -> None:
-        try:
-            exe, prefix_args = self._resolve_executable()
-        except FileNotFoundError as e:
-            logger.error(str(e))
-            return
-
-        cli_args = self._build_cli_args()
-        cmd = [exe, *prefix_args, *cli_args]
-        logger.info(f"Launching DimSim: {' '.join(cmd)}")
-
-        self._process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={**os.environ},
-        )
-
-        def _drain() -> None:
-            proc = self._process
-            if proc and proc.stderr:
-                for line in proc.stderr:
-                    if self._running.is_set():
-                        logger.debug(f"[dimsim] {line.decode(errors='replace').rstrip()}")
-
-        threading.Thread(target=_drain, daemon=True).start()
-
-    # -- LCM listener ----------------------------------------------------------
-
-    def _lcm_loop(self) -> None:
-        while self._running.is_set():
-            try:
-                if self._lcm:
-                    self._lcm.handle_timeout(100)
-            except Exception as e:
-                logger.debug(f"LCM handle error: {e}")
-
-    def _on_lcm_odom(self, channel: str, data: bytes) -> None:
-        """Convert PoseStamped → Odometry and publish + TF."""
-        try:
-            ps = PoseStamped.lcm_decode(data)
-        except Exception as e:
-            logger.debug(f"Odom decode error: {e}")
-            return
-
-        now = time.time()
-        x, y, z = ps.x, ps.y, ps.z
-        orient = ps.orientation
-        qx, qy, qz, qw = orient.x, orient.y, orient.z, orient.w
-
-        yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-
-        # Estimate body-frame velocity from position deltas
-        vx = vy = vyaw = 0.0
-        if self._prev_odom_time is not None:
-            dt = now - self._prev_odom_time
-            if dt > 0.001:
-                dx = x - self._prev_x
-                dy = y - self._prev_y
-                cos_yaw = math.cos(yaw)
-                sin_yaw = math.sin(yaw)
-                vx = (dx * cos_yaw + dy * sin_yaw) / dt
-                vy = (-dx * sin_yaw + dy * cos_yaw) / dt
-                dyaw = yaw - self._prev_yaw
-                while dyaw > math.pi:
-                    dyaw -= 2 * math.pi
-                while dyaw < -math.pi:
-                    dyaw += 2 * math.pi
-                vyaw = dyaw / dt
-
-        self._prev_odom_time = now
-        self._prev_x = x
-        self._prev_y = y
-        self._prev_yaw = yaw
-
-        # Build Odometry with proper Pose and Twist objects
-        pose = Pose()
-        pose.position = Vector3(x, y, z)
-        pose.orientation = Quaternion(qx, qy, qz, qw)
-        odom_twist = Twist()
-        odom_twist.linear = Vector3(vx, vy, 0.0)
-        odom_twist.angular = Vector3(0.0, 0.0, vyaw)
-        self.odometry.publish(
-            Odometry(
-                ts=ps.ts,
-                frame_id="world",
-                child_frame_id="base_link",
-                pose=pose,
-                twist=odom_twist,
-            )
-        )
-
-        # TF: world -> base_link -> sensor
-        self.tf.publish(
-            Transform(
-                ts=ps.ts, parent_frame_id="world", child_frame_id="base_link",
-                translation=Vector3(x, y, z),
-                rotation=Quaternion(qx, qy, qz, qw),
-            )
-        )
-        self.tf.publish(
-            Transform(
-                ts=ps.ts, parent_frame_id="base_link", child_frame_id="sensor",
-                translation=Vector3(0.3, 0.0, 0.0),
-                rotation=Quaternion(0.0, 0.0, 0.0, 1.0),
-            )
-        )
-
-    def _on_lcm_lidar(self, channel: str, data: bytes) -> None:
-        try:
-            self.registered_scan.publish(PointCloud2.lcm_decode(data))
-        except Exception as e:
-            logger.debug(f"Lidar decode error: {e}")
-
-    def _on_lcm_color_image(self, channel: str, data: bytes) -> None:
-        try:
-            # DimSim sends JPEG-encoded images
-            self.color_image.publish(Image.lcm_jpeg_decode(data))
-        except Exception as e:
-            logger.debug(f"Image decode error: {e}")
-
-    # -- cmd_vel → LCM ----------------------------------------------------------
-
-    def _on_cmd_vel(self, twist: Twist) -> None:
-        self._publish_cmd_vel(twist)
-
-    def _publish_cmd_vel(self, twist: Twist) -> None:
-        if self._lcm:
-            try:
-                self._lcm.publish(self._topic_cmd_vel, twist.lcm_encode())
-            except Exception:
-                pass
-
-    # -- Camera info -------------------------------------------------------------
-
-    def _caminfo_loop(self) -> None:
-        while self._running.is_set():
-            self.camera_info.publish(_make_camera_info(self.config.camera_fov))
-            time.sleep(1.0)
 
 
 sim_bridge = DimSimBridge.blueprint
