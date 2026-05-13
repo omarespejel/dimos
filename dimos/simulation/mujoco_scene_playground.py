@@ -25,7 +25,7 @@ from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 from dimos.core.coordination.blueprints import Blueprint, autoconnect
 from dimos.core.transport import LCMTransport
 from dimos.mapping.costmapper import CostMapper
-from dimos.mapping.pointcloud_map_module import PointCloudMapModule
+from dimos.mapping.voxels import VoxelGridMapper
 from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
@@ -171,9 +171,8 @@ mujoco_scene_playground = autoconnect(
         not in {"", "0"},
     ),
     MovementManager.blueprint(),
-    PointCloudMapModule.blueprint(
+    VoxelGridMapper.blueprint(
         voxel_size=_env_float("DIMOS_GLOBAL_MAP_VOXEL_SIZE", 0.05),
-        publish_interval=_env_float("DIMOS_GLOBAL_MAP_PUBLISH_INTERVAL", 0.5),
     ),
     CostMapper.blueprint(),
     ReplanningAStarPlanner.blueprint(),

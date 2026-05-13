@@ -41,6 +41,7 @@ logger = setup_logger()
 # without this you can (basically) click into infinity in rerun (not good for the planner)
 MAX_CLICK_HORIZONTAL_M = 500.0
 MAX_CLICK_VERTICAL_M = 50.0
+TELEOP_EPS = 1e-6
 
 
 class MovementManagerConfig(ModuleConfig):
@@ -120,11 +121,26 @@ class MovementManager(Module):
             self.cmd_vel.publish(msg)
 
     def _on_teleop(self, msg: Twist) -> None:
-        with self._lock:
-            self._teleop_active = True
-            self._last_teleop_time = time.monotonic()
+        is_zero = (
+            abs(msg.linear.x) < TELEOP_EPS
+            and abs(msg.linear.y) < TELEOP_EPS
+            and abs(msg.linear.z) < TELEOP_EPS
+            and abs(msg.angular.x) < TELEOP_EPS
+            and abs(msg.angular.y) < TELEOP_EPS
+            and abs(msg.angular.z) < TELEOP_EPS
+        )
 
-        self._cancel_goal()
+        with self._lock:
+            was_active = self._teleop_active
+            if is_zero:
+                if not was_active:
+                    return
+            else:
+                self._teleop_active = True
+                self._last_teleop_time = time.monotonic()
+
+        if not is_zero and not was_active:
+            self._cancel_goal()
 
         scale = self.config.tele_cmd_vel_scaling
         scaled = Twist(

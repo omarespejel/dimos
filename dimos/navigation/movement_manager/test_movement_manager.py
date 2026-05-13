@@ -103,6 +103,29 @@ def test_nav_resumes_after_cooldown(manager_and_captured):
     assert len(captured.cmd_vel) == cmd_count_before + 1
 
 
+def test_idle_teleop_does_not_cancel_nav(manager_and_captured):
+    """Idle command-center updates should not spam stop_movement."""
+    manager, captured = manager_and_captured
+
+    manager._on_teleop(_twist())
+    manager._on_teleop(_twist())
+
+    assert captured.stop_movement == []
+    assert captured.cmd_vel == []
+
+
+def test_continuous_teleop_cancels_once(manager_and_captured):
+    """Holding WASD should not repeatedly cancel an already-cancelled goal."""
+    manager, captured = manager_and_captured
+
+    manager._on_teleop(_twist(lx=0.3))
+    manager._on_teleop(_twist(lx=0.3))
+    manager._on_teleop(_twist())
+
+    assert len(captured.stop_movement) == 1
+    assert len(captured.cmd_vel) == 3
+
+
 def test_valid_click_publishes_goal(manager_and_captured):
     """A valid click should publish to both goal and way_point."""
     manager, captured = manager_and_captured

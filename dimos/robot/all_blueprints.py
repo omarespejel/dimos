@@ -180,7 +180,6 @@ all_modules = {
     "pgo": "dimos.navigation.nav_stack.modules.pgo.pgo.PGO",
     "phone-teleop-module": "dimos.teleop.phone.phone_teleop_module.PhoneTeleopModule",
     "pick-and-place-module": "dimos.manipulation.pick_and_place_module.PickAndPlaceModule",
-    "point-cloud-map-module": "dimos.mapping.pointcloud_map_module.PointCloudMapModule",
     "quest-teleop-module": "dimos.teleop.quest.quest_teleop_module.QuestTeleopModule",
     "real-sense-camera": "dimos.hardware.sensors.camera.realsense.camera.RealSenseCamera",
     "receiver-module": "dimos.utils.demo_image_encoding.ReceiverModule",
