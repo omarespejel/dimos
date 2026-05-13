@@ -331,6 +331,7 @@ def cli_main() -> None:
 
     if view:
         import mujoco.viewer  # type: ignore[import-untyped]
+
         viewer: Any = mujoco.viewer
 
         # ``launch`` runs MuJoCo's interactive viewer with its own
