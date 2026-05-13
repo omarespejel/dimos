@@ -67,3 +67,25 @@ sudo apt-get install -y libgl1 libegl1
 ```
 
 Nix users (`nix develop`) don't need this — the flake provides `libGL`, `libGLU`, and `mesa`.
+
+## CycloneDDS on systems with ROS 2 Jazzy
+
+If `cyclonedds` is installed (via the `dds` extra, or transitively through `unitree-dds`) and you see:
+
+```
+ImportError: libddsc.so.0: cannot open shared object file: No such file or directory
+```
+
+…on a box that has ROS 2 Jazzy installed, the `cyclonedds._clayer` C extension is resolving its `libddsc.so.0` SONAME against `/opt/ros/jazzy/lib/libddsc.so`, but the actual `.so.0` lives in the multiarch dir `/opt/ros/jazzy/lib/x86_64-linux-gnu/` which isn't on the loader path.
+
+Either source the ROS environment before running:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+```
+
+…or set `LD_LIBRARY_PATH` directly:
+
+```bash
+export LD_LIBRARY_PATH=/opt/ros/jazzy/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+```
