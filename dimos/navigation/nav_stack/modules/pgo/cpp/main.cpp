@@ -264,6 +264,12 @@ int main(int argc, char** argv)
     config.loop_submap_half_range = mod.arg_int("loop_submap_half_range", 5);
     config.submap_resolution = mod.arg_float("submap_resolution", 0.1f);
     config.min_loop_detect_duration = mod.arg_float("min_loop_detect_duration", 5.0f);
+    config.use_scan_context = mod.arg_bool("use_scan_context", true);
+    config.sc_n_rings = mod.arg_int("sc_n_rings", 20);
+    config.sc_n_sectors = mod.arg_int("sc_n_sectors", 60);
+    config.sc_max_range_m = mod.arg_float("sc_max_range_m", 80.0f);
+    config.sc_top_k = mod.arg_int("sc_top_k", 10);
+    config.sc_match_threshold = mod.arg_float("sc_match_threshold", 0.4f);
 
     // Node-level config
     std::string world_frame = mod.arg("world_frame", "map");
