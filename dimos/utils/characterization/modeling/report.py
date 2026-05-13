@@ -1,3 +1,17 @@
+# Copyright 2026 Dimensional Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Copyright 2025-2026 Dimensional Inc.
 # Licensed under the Apache License, Version 2.0.
 
@@ -23,8 +37,8 @@ import numpy as np
 from dimos.utils.characterization.modeling.aggregate import GroupFit
 from dimos.utils.characterization.modeling.per_run import RunFit
 
-
 # --------------------------------------------------------------------------- markdown
+
 
 def render_markdown(
     *,
@@ -44,12 +58,12 @@ def render_markdown(
     lines.append(f"- Total runs: {len(run_fits)}")
     skipped = sum(1 for r in run_fits if r.skip_reason is not None)
     failed_fit = sum(
-        1 for r in run_fits
+        1
+        for r in run_fits
         if r.skip_reason is None and (r.params is None or not r.params.converged)
     )
     degenerate = sum(
-        1 for r in run_fits
-        if r.params is not None and r.params.converged and r.params.degenerate
+        1 for r in run_fits if r.params is not None and r.params.converged and r.params.degenerate
     )
     lines.append(f"- Skipped (non-step / unparseable): {skipped}")
     lines.append(f"- Failed fit: {failed_fit}")
@@ -70,7 +84,9 @@ def render_markdown(
             n = stats.get("n_groups")
             lines.append(f"- **{p}** = {mean}  (95% CI [{lo}, {hi}]; n_groups={n})")
         if ch.get("direction_asymmetric"):
-            lines.append("- Direction asymmetric — forward and reverse fits disagree at one or more amplitudes.")
+            lines.append(
+                "- Direction asymmetric — forward and reverse fits disagree at one or more amplitudes."
+            )
         else:
             lines.append("- Forward / reverse pooled (CIs overlapped at every amplitude).")
         lin = ch.get("linear_in_amplitude") or {}
@@ -87,9 +103,13 @@ def render_markdown(
     # Per-cell table.
     lines.append("## Per-cell results")
     lines.append("")
-    lines.append("| recipe | channel | amp | direction | K (95% CI) | τ (95% CI) | L (95% CI) | kept / input | rejected (2σ) |")
+    lines.append(
+        "| recipe | channel | amp | direction | K (95% CI) | tau (95% CI) | L (95% CI) | kept / input | rejected (2sigma) |"
+    )
     lines.append("|---|---|---|---|---|---|---|---|---|")
-    for g in sorted(group_fits, key=lambda gg: (gg.key.get("channel") or "", gg.key.get("amplitude") or 0)):
+    for g in sorted(
+        group_fits, key=lambda gg: (gg.key.get("channel") or "", gg.key.get("amplitude") or 0)
+    ):
         recipe = g.key.get("recipe", "?")
         ch = g.key.get("channel", "?")
         amp = _fmt(g.key.get("amplitude"))
@@ -108,8 +128,10 @@ def render_markdown(
     lines.append("## Pooling decisions")
     lines.append("")
     for channel, ch in sorted(summary.get("channels", {}).items()):
-        lines.append(f"- `{channel}`: direction_asymmetric={ch.get('direction_asymmetric')}, "
-                     f"linear_in_amplitude={ch.get('linear_in_amplitude')}")
+        lines.append(
+            f"- `{channel}`: direction_asymmetric={ch.get('direction_asymmetric')}, "
+            f"linear_in_amplitude={ch.get('linear_in_amplitude')}"
+        )
     lines.append("")
 
     # Diagnostics.
@@ -143,7 +165,9 @@ def render_markdown(
         if rvf.get("channels"):
             lines.append("### Rise vs fall comparison")
             lines.append("")
-            lines.append("| channel | param | rise mean | fall mean | ratio fall/rise | CI overlap | verdict |")
+            lines.append(
+                "| channel | param | rise mean | fall mean | ratio fall/rise | CI overlap | verdict |"
+            )
             lines.append("|---|---|---|---|---|---|---|")
             for channel, cv in sorted(rvf["channels"].items()):
                 for p in ("K", "tau", "L"):
@@ -186,6 +210,7 @@ def _fmt_param_cell(stats: dict[str, Any] | None) -> str:
 
 # --------------------------------------------------------------------------- plots
 
+
 def write_plots(
     *,
     plots_dir: Path,
@@ -204,6 +229,7 @@ def write_plots(
 
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except Exception:
@@ -250,8 +276,13 @@ def _safe(s: Any) -> str:
 
 
 def _plot_overlay(
-    path: Path, recipe: str, fits: list[RunFit], group: GroupFit | None, plt,
-    *, edge: str = "rise",
+    path: Path,
+    recipe: str,
+    fits: list[RunFit],
+    group: GroupFit | None,
+    plt,
+    *,
+    edge: str = "rise",
 ) -> None:
     """Per-recipe overlay: measured trace + group-mean FOPDT model + RMSE bars.
 
@@ -260,7 +291,7 @@ def _plot_overlay(
     and ``extra_down`` so we share one plotting function for both phases.
     """
     from dimos.utils.characterization.modeling.fopdt import fopdt_step_response
-    from dimos.utils.characterization.scripts.analyze_run import (
+    from dimos.utils.characterization.scripts.analyze import (
         _channel_arrays,
         load_run,
     )
@@ -307,7 +338,9 @@ def _plot_overlay(
             ax_main.plot(
                 meas_ts[mask] - edge_t,
                 meas_arr[mask] - baseline,
-                color="#888", alpha=0.35, linewidth=0.8,
+                color="#888",
+                alpha=0.35,
+                linewidth=0.8,
                 label=("measured (per-repeat)" if plotted_meas == 0 else None),
             )
             plotted_meas += 1
@@ -317,7 +350,9 @@ def _plot_overlay(
         t_grid = np.linspace(-0.3, t_max, 400)
         y_model = fopdt_step_response(t_grid, K_mean, tau_mean, L_mean, u_step)
         ax_main.plot(t_grid, y_model, color="#000", linewidth=2.0, label="FOPDT (group mean)")
-        ax_main.axhline(K_mean * u_step, color="#888", linestyle="--", linewidth=0.6, label="K·u_step")
+        ax_main.axhline(
+            K_mean * u_step, color="#888", linestyle="--", linewidth=0.6, label="K·u_step"
+        )
 
     for rf in fits:
         edge_params = rf.params if edge == "rise" else rf.params_down
@@ -328,7 +363,10 @@ def _plot_overlay(
         t_grid = np.linspace(0.0, t_max, 400)
         y = fopdt_step_response(t_grid, edge_params.K, edge_params.tau, edge_params.L, u)
         ax_main.plot(
-            t_grid, y, alpha=0.35, linewidth=0.6,
+            t_grid,
+            y,
+            alpha=0.35,
+            linewidth=0.6,
             color=("#1f77b4" if (rf.amplitude or 0) > 0 else "#d62728"),
         )
 
@@ -339,14 +377,12 @@ def _plot_overlay(
             title += f", u_step={u_step}"
         title += ")"
     ax_main.set_title(title)
-    ax_main.set_xlabel(f"t − {'step_t' if edge == 'rise' else 'active_end_t'} [s]")
-    ax_main.set_ylabel(f"meas_{channel or '?'} − baseline")
+    ax_main.set_xlabel(f"t - {'step_t' if edge == 'rise' else 'active_end_t'} [s]")
+    ax_main.set_ylabel(f"meas_{channel or '?'} - baseline")
     ax_main.legend(loc="best", fontsize=8)
     ax_main.grid(True, alpha=0.3)
 
-    edge_params_list = [
-        rf.params if edge == "rise" else rf.params_down for rf in fits
-    ]
+    edge_params_list = [rf.params if edge == "rise" else rf.params_down for rf in fits]
     rmses = [p.rmse for p in edge_params_list if p is not None and np.isfinite(p.rmse)]
     if rmses:
         ax_resid.bar(range(len(rmses)), rmses, color="#888")
@@ -359,16 +395,18 @@ def _plot_overlay(
     plt.close(fig)
 
 
-def _plot_params_vs_amp(
-    path: Path, channel: str, channel_summary: dict[str, Any], plt
-) -> None:
+def _plot_params_vs_amp(path: Path, channel: str, channel_summary: dict[str, Any], plt) -> None:
     """Per-channel K/τ/L vs |amplitude| with CI error bars."""
     entries = channel_summary.get("per_amplitude", []) or []
     if not entries:
         return
     fig, axes = plt.subplots(1, 3, figsize=(11, 3.2))
-    for ax, p in zip(axes, ("K", "tau", "L")):
-        for direction, color in (("forward", "#1f77b4"), ("reverse", "#d62728"), ("pooled", "#000")):
+    for ax, p in zip(axes, ("K", "tau", "L"), strict=False):
+        for direction, color in (
+            ("forward", "#1f77b4"),
+            ("reverse", "#d62728"),
+            ("pooled", "#000"),
+        ):
             xs = []
             ys = []
             yerr_lo = []

@@ -136,7 +136,7 @@ def _render_step(run: LoadedRun) -> tuple[str, dict[str, Any]]:
     from dimos.utils.characterization.scripts.analyze import step_metrics
 
     channel = _dominant_channel(run)
-    cmd_arr, meas_arr = _channel_arrays(run, channel)
+    cmd_arr, meas_raw, meas_arr = _channel_arrays_dual(run, channel)
     info = _CHANNEL_INFO[channel]
     meas_ts = run.meas_ts_rel
 
@@ -150,11 +150,21 @@ def _render_step(run: LoadedRun) -> tuple[str, dict[str, Any]]:
         )
     )
     if meas_ts.size:
+        # Raw (no Hampel) — light gray, so you can see what the filter caught
+        plot.add(
+            Series(
+                ts=meas_ts.tolist(),
+                values=meas_raw.tolist(),
+                label=f"meas_{channel} raw",
+                color="#bbbbbb",
+            )
+        )
+        # Hampel-filtered — main color (this is what the FOPDT fit uses)
         plot.add(
             Series(
                 ts=meas_ts.tolist(),
                 values=meas_arr.tolist(),
-                label=f"meas_{channel} [{info['unit']}]",
+                label=f"meas_{channel} (Hampel) [{info['unit']}]",
                 color=info["meas"],
             )
         )
@@ -164,11 +174,14 @@ def _render_step(run: LoadedRun) -> tuple[str, dict[str, Any]]:
     step_t = float(run.cmd_ts_rel[nonzero[0]]) if nonzero.size else 0.0
     active_end_t = step_t + float(run.metadata["recipe"]["duration_s"])
 
+    n_replaced = int(np.sum(np.abs(meas_raw - meas_arr) > 1e-9)) if meas_ts.size else 0
     metrics: dict[str, Any] = {
         "channel": channel,
         "step_t": step_t,
         "target": target,
         "active_end_t": active_end_t,
+        "hampel_replaced": n_replaced,
+        "hampel_total": int(meas_arr.size),
     }
     if meas_ts.size >= 3:
         m = step_metrics(meas_ts, meas_arr, step_t=step_t, target=target, active_end_t=active_end_t)
@@ -271,7 +284,11 @@ def _dominant_channel(run: LoadedRun) -> str:
 
 
 def _channel_arrays(run: LoadedRun, channel: str) -> tuple[np.ndarray, np.ndarray]:
-    """Return (cmd_array, meas_array) for the requested channel."""
+    """Return (cmd_array, meas_array) for the requested channel.
+
+    ``meas_array`` is the *Hampel-filtered* velocity (current default
+    pipeline). For raw vs filtered diagnostics see ``_channel_arrays_dual``.
+    """
     vx_meas, vy_meas, wz_meas = _reconstruct_or_empty(run)
     if channel == "vx":
         return run.cmd_vx, vx_meas
@@ -280,7 +297,25 @@ def _channel_arrays(run: LoadedRun, channel: str) -> tuple[np.ndarray, np.ndarra
     return run.cmd_wz, wz_meas
 
 
-def _reconstruct_or_empty(run: LoadedRun) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _channel_arrays_dual(run: LoadedRun, channel: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (cmd, meas_raw, meas_filtered).
+
+    ``meas_raw`` is the velocity reconstruction with Hampel disabled; the
+    filtered version uses default ``hampel_n_sigma=3.0``. Diff between
+    the two = samples the Hampel filter replaced.
+    """
+    vx_h, vy_h, wz_h = _reconstruct_or_empty(run, hampel_n_sigma=3.0)
+    vx_r, vy_r, wz_r = _reconstruct_or_empty(run, hampel_n_sigma=float("inf"))
+    if channel == "vx":
+        return run.cmd_vx, vx_r, vx_h
+    if channel == "vy":
+        return run.cmd_vy, vy_r, vy_h
+    return run.cmd_wz, wz_r, wz_h
+
+
+def _reconstruct_or_empty(
+    run: LoadedRun, *, hampel_n_sigma: float = 3.0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Body vx/vy/wz arrays aligned to ``run.meas_ts_wall``, or empty arrays if no odom."""
     from dimos.utils.characterization.scripts.analyze import reconstruct_body_velocities
 
@@ -295,7 +330,9 @@ def _reconstruct_or_empty(run: LoadedRun) -> tuple[np.ndarray, np.ndarray, np.nd
     y_s = run.meas_y[order]
     yaw_s = run.meas_yaw[order]
     keep = np.concatenate([[True], np.diff(ts_s) > 0])
-    return reconstruct_body_velocities(ts_s[keep], x_s[keep], y_s[keep], yaw_s[keep])
+    return reconstruct_body_velocities(
+        ts_s[keep], x_s[keep], y_s[keep], yaw_s[keep], hampel_n_sigma=hampel_n_sigma
+    )
 
 
 __all__ = ["render_overlay", "render_run"]

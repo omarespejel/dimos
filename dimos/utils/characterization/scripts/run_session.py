@@ -146,6 +146,13 @@ def main(argv: list[str] | None = None) -> int:
         help="go2 (real/mujoco) or mock (no-robot plumbing test)",
     )
     parser.add_argument("--simulation", action="store_true", help="Launch mujoco sim for go2")
+    parser.add_argument(
+        "--rage",
+        action="store_true",
+        help="Real-Go2 only: enable rage mode at connection start (StandUp -> "
+        "BalanceStand -> enable_rage_mode). Characterizes a different plant - "
+        "tag your --notes accordingly so the rage dataset stays distinct.",
+    )
     parser.add_argument("--randomize", action="store_true", help="Shuffle the expanded plan")
     parser.add_argument("--rng-seed", type=int, default=None, help="Seed for --randomize")
     parser.add_argument("--dry-run", action="store_true", help="Print plan then exit")
@@ -197,7 +204,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print()
-    print(f"bringing up {args.backend} coordinator{' [sim]' if args.simulation else ''}...")
+    rage_tag = " [RAGE]" if args.rage else ""
+    print(
+        f"bringing up {args.backend} coordinator{' [sim]' if args.simulation else ''}{rage_tag}..."
+    )
     with SessionManager.build(
         plan,
         output_root=args.out_dir,
@@ -206,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         include_teleop=(not args.no_teleop) and args.backend == "go2",
         warmup_s=args.warmup_s,
         operator=operator,
+        rage=args.rage,
     ) as mgr:
         try:
             mgr.start_coordinator()

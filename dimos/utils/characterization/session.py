@@ -213,6 +213,7 @@ def build_session_blueprint(
     *,
     backend: str = "go2",
     include_teleop: bool = True,
+    rage: bool = False,
 ) -> Blueprint:
     """Compose the session blueprint: coordinator + recorder (+ optional teleop).
 
@@ -223,18 +224,28 @@ def build_session_blueprint(
     ``KeyboardTeleop`` module (runs in its own worker process, so
     pygame rendering doesn't contend with the control tick loop). It's
     configured with ``publish_only_when_active=True`` so its output
-    stream is silent when no motion key is held — otherwise its 50Hz
+    stream is silent when no motion key is held - otherwise its 50Hz
     zero-Twist stream would fight with the recipe runner's commands on
     ``/cmd_vel``.
+
+    When ``rage`` is True (go2 backend only), patches the GO2Connection
+    blueprint atom to ``mode="rage"`` so the connection's start path
+    runs StandUp -> BalanceStand -> enable_rage_mode after connect, and
+    bumps the teleop linear/angular speeds to match.
     """
     if backend == "go2":
         from dimos.robot.unitree.go2.blueprints.basic.unitree_go2_coordinator import (
             unitree_go2_coordinator as base,
         )
     elif backend == "mock":
+        if rage:
+            raise ValueError("--rage is only valid with --backend go2")
         from dimos.control.blueprints.mobile import coordinator_mock_twist_base as base
     else:
         raise ValueError(f"unknown backend: {backend!r}")
+
+    if rage:
+        base = _patch_go2_mode(base, mode="rage")
 
     transports: dict[tuple[str, type], Any] = {
         ("commanded", Twist): LCMTransport("/cmd_vel", Twist),
@@ -243,14 +254,47 @@ def build_session_blueprint(
         transports[("measured", PoseStamped)] = LCMTransport("/go2/odom", PoseStamped)
 
     atoms = [CharacterizationRecorder.blueprint(db_path=str(db_path))]
-    remappings: list[tuple[Any, str, str]] = []
 
     if include_teleop:
         from dimos.robot.unitree.keyboard_teleop import KeyboardTeleop
 
-        atoms.append(KeyboardTeleop.blueprint(publish_only_when_active=True))
+        teleop_kwargs: dict[str, Any] = {"publish_only_when_active": True}
+        if rage:
+            teleop_kwargs["linear_speed"] = 1.25
+            teleop_kwargs["angular_speed"] = 1.2
+        atoms.append(KeyboardTeleop.blueprint(**teleop_kwargs))
 
     return autoconnect(base, *atoms).transports(transports)
+
+
+def _patch_go2_mode(bp: Blueprint, *, mode: str) -> Blueprint:
+    """Return a copy of ``bp`` with the GO2Connection atom's kwargs updated
+    to include ``mode=<mode>`` (e.g. "rage").
+
+    The stock ``unitree_go2_coordinator`` calls ``GO2Connection.blueprint()``
+    with no kwargs (mode defaults to DEFAULT). We need rage without
+    duplicating the whole blueprint, so we mutate the atom's kwargs.
+    """
+    from dataclasses import replace
+
+    from dimos.robot.unitree.go2.connection import GO2Connection
+
+    new_atoms = []
+    touched = False
+    for atom in bp.blueprints:
+        if atom.module is GO2Connection:
+            new_kwargs = dict(atom.kwargs)
+            new_kwargs["mode"] = mode
+            new_atoms.append(replace(atom, kwargs=new_kwargs))
+            touched = True
+        else:
+            new_atoms.append(atom)
+    if not touched:
+        logger.warning(
+            "Mode patch: no GO2Connection atom found in blueprint, skipping (mode=%s)", mode
+        )
+        return bp
+    return replace(bp, blueprints=tuple(new_atoms))
 
 
 # ---------------------------------------------------------------------- per-recipe runner
@@ -484,6 +528,7 @@ class SessionManager:
         include_teleop: bool,
         warmup_s: float,
         operator: OperatorMetadata,
+        rage: bool = False,
     ) -> None:
         self.session_id = session_id
         self.session_dir = session_dir
@@ -495,6 +540,7 @@ class SessionManager:
         self.include_teleop = include_teleop
         self.warmup_s = warmup_s
         self.operator = operator
+        self.rage = rage
 
         self._coord: ModuleCoordinator | None = None
         self._recipe_session: CharacterizationSession | None = None
@@ -515,6 +561,7 @@ class SessionManager:
         warmup_s: float = 4.0,
         operator: OperatorMetadata | None = None,
         session_id: str | None = None,
+        rage: bool = False,
     ) -> SessionManager:
         sid = session_id or _session_id()
         out_root = Path(output_root).expanduser().resolve()
@@ -530,6 +577,7 @@ class SessionManager:
             include_teleop=include_teleop,
             warmup_s=warmup_s,
             operator=operator or OperatorMetadata(),
+            rage=rage,
         )
 
     def __enter__(self) -> SessionManager:
@@ -551,6 +599,7 @@ class SessionManager:
             self.session_db,
             backend=self.backend,
             include_teleop=self.include_teleop,
+            rage=self.rage,
         )
         self._write_session_head(status="booting")
         logger.info(
@@ -637,6 +686,7 @@ class SessionManager:
             "session_dir": str(self.session_dir),
             "backend": self.backend,
             "simulation": self.simulation,
+            "rage": self.rage,
             "warmup_s": self.warmup_s,
             "operator": self.operator.as_dict(),
             "status": status,

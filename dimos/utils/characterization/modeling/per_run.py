@@ -1,3 +1,17 @@
+# Copyright 2026 Dimensional Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Copyright 2025-2026 Dimensional Inc.
 # Licensed under the Apache License, Version 2.0.
 
@@ -21,9 +35,9 @@ e.g. ``e1_vx_+1.0`` or ``e2_wz_-0.3``. Step recipes only — runs whose
 
 from __future__ import annotations
 
-import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
@@ -36,18 +50,18 @@ _RECIPE_RE = re.compile(r"^e\d+_(vx|vy|wz)_([+-]?\d+(?:\.\d+)?)$")
 @dataclass
 class RunFit:
     run_id: str
-    run_dir: str                  # absolute path to the run directory
+    run_dir: str  # absolute path to the run directory
     recipe: str
     channel: str | None
-    amplitude: float | None       # signed; e.g. +1.0 or -0.3
-    direction: str | None         # "forward" if amplitude > 0 else "reverse"
-    mode: str                     # "default" or "rage", from session.json
-    split: str | None             # "train" if direction=="forward" else "validate"
-    params: FopdtParams | None    # rise fit (cmd 0 → amplitude)
-    params_down: FopdtParams | None = None   # fall fit (cmd amplitude → 0)
+    amplitude: float | None  # signed; e.g. +1.0 or -0.3
+    direction: str | None  # "forward" if amplitude > 0 else "reverse"
+    mode: str  # "default" or "rage", from session.json
+    split: str | None  # "train" if direction=="forward" else "validate"
+    params: FopdtParams | None  # rise fit (cmd 0 → amplitude)
+    params_down: FopdtParams | None = None  # fall fit (cmd amplitude → 0)
     skip_reason: str | None = None
-    extra: dict[str, Any] = field(default_factory=dict)         # rise fit metadata
-    extra_down: dict[str, Any] = field(default_factory=dict)    # fall fit metadata
+    extra: dict[str, Any] = field(default_factory=dict)  # rise fit metadata
+    extra_down: dict[str, Any] = field(default_factory=dict)  # fall fit metadata
 
     def asdict(self) -> dict[str, Any]:
         return asdict(self)
@@ -71,8 +85,9 @@ def _detect_channel_and_amplitude(run) -> tuple[str, float] | None:
     """Fallback: read channel and signed amplitude directly from the cmd
     arrays. Used when the recipe name doesn't match the regex (e.g. E8).
     """
-    from dimos.utils.characterization.scripts.analyze_run import _dominant_channel
     import numpy as np
+
+    from dimos.utils.characterization.scripts.analyze import _dominant_channel
 
     channel = _dominant_channel(run)
     cmd = {"vx": run.cmd_vx, "vy": run.cmd_vy, "wz": run.cmd_wz}[channel]
@@ -96,7 +111,7 @@ def fit_run(run_dir: Path, *, mode: str) -> RunFit:
     short. Fit failures land as ``params.converged == False`` with a
     populated ``params.reason``.
     """
-    from dimos.utils.characterization.scripts.analyze_run import (
+    from dimos.utils.characterization.scripts.analyze import (
         _channel_arrays,
         load_run,
     )
@@ -108,9 +123,15 @@ def fit_run(run_dir: Path, *, mode: str) -> RunFit:
         run = load_run(run_dir)
     except Exception as e:
         return RunFit(
-            run_id=run_id, run_dir=str(run_dir), recipe="<unknown>",
-            channel=None, amplitude=None, direction=None,
-            mode=mode, split=None, params=None,
+            run_id=run_id,
+            run_dir=str(run_dir),
+            recipe="<unknown>",
+            channel=None,
+            amplitude=None,
+            direction=None,
+            mode=mode,
+            split=None,
+            params=None,
             skip_reason=f"load_run failed: {type(e).__name__}: {e}",
         )
 
@@ -118,9 +139,15 @@ def fit_run(run_dir: Path, *, mode: str) -> RunFit:
     test_type = run.metadata["recipe"]["test_type"]
     if test_type != "step":
         return RunFit(
-            run_id=run_id, run_dir=str(run_dir), recipe=recipe,
-            channel=None, amplitude=None, direction=None,
-            mode=mode, split=None, params=None,
+            run_id=run_id,
+            run_dir=str(run_dir),
+            recipe=recipe,
+            channel=None,
+            amplitude=None,
+            direction=None,
+            mode=mode,
+            split=None,
+            params=None,
             skip_reason=f"not a step recipe (test_type={test_type})",
         )
 
@@ -131,9 +158,15 @@ def fit_run(run_dir: Path, *, mode: str) -> RunFit:
         parsed = _detect_channel_and_amplitude(run)
     if parsed is None:
         return RunFit(
-            run_id=run_id, run_dir=str(run_dir), recipe=recipe,
-            channel=None, amplitude=None, direction=None,
-            mode=mode, split=None, params=None,
+            run_id=run_id,
+            run_dir=str(run_dir),
+            recipe=recipe,
+            channel=None,
+            amplitude=None,
+            direction=None,
+            mode=mode,
+            split=None,
+            params=None,
             skip_reason=f"could not infer channel/amplitude for recipe {recipe!r}",
         )
     channel, amplitude = parsed
@@ -146,8 +179,14 @@ def fit_run(run_dir: Path, *, mode: str) -> RunFit:
 
     if meas_ts_rel.size < 4:
         return RunFit(
-            run_id=run_id, run_dir=str(run_dir), recipe=recipe, channel=channel,
-            amplitude=amplitude, direction=direction, mode=mode, split=split,
+            run_id=run_id,
+            run_dir=str(run_dir),
+            recipe=recipe,
+            channel=channel,
+            amplitude=amplitude,
+            direction=direction,
+            mode=mode,
+            split=split,
             params=None,
             skip_reason="fewer than 4 measured samples",
         )
@@ -156,8 +195,14 @@ def fit_run(run_dir: Path, *, mode: str) -> RunFit:
     nonzero = np.flatnonzero(np.abs(cmd_arr) > 1e-6)
     if nonzero.size == 0:
         return RunFit(
-            run_id=run_id, run_dir=str(run_dir), recipe=recipe, channel=channel,
-            amplitude=amplitude, direction=direction, mode=mode, split=split,
+            run_id=run_id,
+            run_dir=str(run_dir),
+            recipe=recipe,
+            channel=channel,
+            amplitude=amplitude,
+            direction=direction,
+            mode=mode,
+            split=split,
             params=None,
             skip_reason="no nonzero command on parsed channel",
         )
@@ -177,8 +222,14 @@ def fit_run(run_dir: Path, *, mode: str) -> RunFit:
     fit_mask = (meas_ts_rel >= step_t) & (meas_ts_rel <= active_end_t)
     if int(fit_mask.sum()) < 4:
         return RunFit(
-            run_id=run_id, run_dir=str(run_dir), recipe=recipe, channel=channel,
-            amplitude=amplitude, direction=direction, mode=mode, split=split,
+            run_id=run_id,
+            run_dir=str(run_dir),
+            recipe=recipe,
+            channel=channel,
+            amplitude=amplitude,
+            direction=direction,
+            mode=mode,
+            split=split,
             params=None,
             skip_reason=f"fewer than 4 samples in fit window ({int(fit_mask.sum())})",
         )
@@ -189,7 +240,9 @@ def fit_run(run_dir: Path, *, mode: str) -> RunFit:
     noise_std = _noise_std_for_channel(run.metadata.get("noise_floor"), channel)
 
     params = fit_fopdt(
-        t_fit, y_fit, u_step=amplitude,
+        t_fit,
+        y_fit,
+        u_step=amplitude,
         noise_std=noise_std,
         fit_window_s=(0.0, float(t_fit[-1])),
     )
@@ -224,7 +277,9 @@ def fit_run(run_dir: Path, *, mode: str) -> RunFit:
         t_fall = meas_ts_rel[fall_mask] - active_end_t
         y_fall = meas_arr[fall_mask] - baseline_down
         params_down = fit_fopdt(
-            t_fall, y_fall, u_step=-amplitude,
+            t_fall,
+            y_fall,
+            u_step=-amplitude,
             noise_std=noise_std,
             fit_window_s=(0.0, float(t_fall[-1])),
         )
@@ -236,8 +291,14 @@ def fit_run(run_dir: Path, *, mode: str) -> RunFit:
         }
 
     return RunFit(
-        run_id=run_id, run_dir=str(run_dir), recipe=recipe, channel=channel,
-        amplitude=amplitude, direction=direction, mode=mode, split=split,
+        run_id=run_id,
+        run_dir=str(run_dir),
+        recipe=recipe,
+        channel=channel,
+        amplitude=amplitude,
+        direction=direction,
+        mode=mode,
+        split=split,
         params=params,
         params_down=params_down,
         skip_reason=None,
@@ -252,10 +313,8 @@ def fit_run(run_dir: Path, *, mode: str) -> RunFit:
     )
 
 
-def _noise_std_for_channel(
-    noise_floor: dict[str, Any] | None, channel: str
-) -> float | None:
-    """Pull per-channel σ from ``run.json["noise_floor"]``. Returns None when missing."""
+def _noise_std_for_channel(noise_floor: dict[str, Any] | None, channel: str) -> float | None:
+    """Pull per-channel sigma from ``run.json["noise_floor"]``. Returns None when missing."""
     if not noise_floor or "_unavailable" in noise_floor:
         return None
     entry = noise_floor.get(channel)
@@ -285,16 +344,23 @@ def select_edge(run_fits: list[RunFit], edge: str) -> list[RunFit]:
         raise ValueError(f"edge must be 'rise' or 'fall', got {edge!r}")
     out: list[RunFit] = []
     for rf in run_fits:
-        out.append(RunFit(
-            run_id=rf.run_id, run_dir=rf.run_dir, recipe=rf.recipe,
-            channel=rf.channel, amplitude=rf.amplitude, direction=rf.direction,
-            mode=rf.mode, split=rf.split,
-            params=rf.params_down,
-            params_down=None,
-            skip_reason=rf.skip_reason,
-            extra=rf.extra_down or {},
-            extra_down={},
-        ))
+        out.append(
+            RunFit(
+                run_id=rf.run_id,
+                run_dir=rf.run_dir,
+                recipe=rf.recipe,
+                channel=rf.channel,
+                amplitude=rf.amplitude,
+                direction=rf.direction,
+                mode=rf.mode,
+                split=rf.split,
+                params=rf.params_down,
+                params_down=None,
+                skip_reason=rf.skip_reason,
+                extra=rf.extra_down or {},
+                extra_down={},
+            )
+        )
     return out
 
 

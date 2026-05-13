@@ -49,6 +49,38 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------- velocity reconstruction
 
 
+def _hampel_filter(values: np.ndarray, window: int = 11, n_sigma: float = 3.0) -> np.ndarray:
+    """Rolling-median + MAD outlier rejection (Hampel filter).
+
+    For each sample, compute the median over a centered window and the
+    median absolute deviation. If ``|x_i - median| > n_sigma * 1.4826 *
+    MAD``, replace ``x_i`` with the local median. The ``1.4826`` factor
+    converts MAD to a Gaussian-sigma-equivalent.
+
+    Designed for legged-robot pose data where leg impacts inject occasional
+    one- or two-sample spikes that downstream Savitzky-Golay smoothing
+    would otherwise smear into a wider artifact.
+
+    Returns a copy; original is not modified. ``window`` should be odd.
+    """
+    n = len(values)
+    if n < window or window < 3:
+        return values
+    half = window // 2
+    out = values.copy()
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        win = values[lo:hi]
+        med = np.median(win)
+        mad = np.median(np.abs(win - med))
+        if mad == 0:
+            continue
+        if abs(values[i] - med) > n_sigma * 1.4826 * mad:
+            out[i] = med
+    return out
+
+
 def reconstruct_body_velocities(
     ts: np.ndarray,
     x: np.ndarray,
@@ -57,16 +89,31 @@ def reconstruct_body_velocities(
     *,
     window: int = 5,
     order: int = 2,
+    hampel_window: int = 11,
+    hampel_n_sigma: float = 3.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return body-frame ``(vx, vy, wz)`` sampled at the odom timestamps.
 
+    Pipeline (legged-robot tuned):
+      1. Savitzky-Golay smoothing on (x, y, yaw_unwrapped) — preserves
+         macroscopic motion, attenuates high-freq noise.
+      2. Central difference (np.gradient, non-uniform-ts safe).
+      3. Rotate world-frame (dx/dt, dy/dt) into body-frame (vx, vy).
+      4. Hampel filter on the *velocity* — rejects leg-impact spikes.
+         Tiny mm-scale pose jitter → huge m/s velocity impulse after
+         differentiation; Hampel on the derivative catches them while
+         pose-level Hampel can't.
+
     ``ts`` must be strictly increasing. For fewer than ``window`` samples
-    this falls back to raw central differences without filtering.
+    the polynomial smoother is bypassed but the Hampel pass still runs.
+
+    Pass ``hampel_n_sigma=float('inf')`` to disable outlier rejection.
     """
     from scipy.signal import savgol_filter
 
     yaw_u = np.unwrap(yaw)
 
+    # 1. Polynomial smoothing on pose
     if len(ts) >= window and window % 2 == 1 and order < window:
         xf = savgol_filter(x, window, order)
         yf = savgol_filter(y, window, order)
@@ -74,15 +121,22 @@ def reconstruct_body_velocities(
     else:
         xf, yf, yf_yaw = x, y, yaw_u
 
-    # Central difference wrt ts; np.gradient handles non-uniform spacing.
+    # 2. Central difference
     dx = np.gradient(xf, ts)
     dy = np.gradient(yf, ts)
     dyaw = np.gradient(yf_yaw, ts)
 
+    # 3. World → body
     cos_y = np.cos(yf_yaw)
     sin_y = np.sin(yf_yaw)
     vx = cos_y * dx + sin_y * dy
     vy = -sin_y * dx + cos_y * dy
+
+    # 4. Spike rejection on the velocity (where leg impacts actually appear)
+    vx = _hampel_filter(vx, hampel_window, hampel_n_sigma)
+    vy = _hampel_filter(vy, hampel_window, hampel_n_sigma)
+    dyaw = _hampel_filter(dyaw, hampel_window, hampel_n_sigma)
+
     return vx, vy, dyaw
 
 
@@ -240,6 +294,45 @@ def load_run(run_dir: Path) -> LoadedRun:
         meas_y=np.asarray(meas_y, dtype=float),
         meas_yaw=np.asarray(meas_yaw, dtype=float),
     )
+
+
+# ---------------------------------------------------------------------- helpers used by modeling
+
+
+def _reconstruct_or_empty(run: LoadedRun) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Body vx/vy/wz aligned to ``run.meas_ts_wall`` — empty arrays if no odom."""
+    if run.meas_ts_wall.size < 3:
+        empty = np.zeros(0, dtype=float)
+        return empty, empty, empty
+    ts = run.meas_ts_wall
+    order = np.argsort(ts, kind="stable")
+    ts_s = ts[order]
+    keep = np.concatenate([[True], np.diff(ts_s) > 0])
+    return reconstruct_body_velocities(
+        ts_s[keep], run.meas_x[order][keep], run.meas_y[order][keep], run.meas_yaw[order][keep]
+    )
+
+
+def _channel_arrays(run: LoadedRun, channel: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(cmd_array, meas_array)`` for the requested channel."""
+    vx_meas, vy_meas, wz_meas = _reconstruct_or_empty(run)
+    if channel == "vx":
+        return run.cmd_vx, vx_meas
+    if channel == "vy":
+        return run.cmd_vy, vy_meas
+    return run.cmd_wz, wz_meas
+
+
+def _dominant_channel(run: LoadedRun) -> str:
+    """Pick the channel with the largest commanded amplitude — so an E2
+    wz-step run is recognised as wz, not vx.
+    """
+    amps = {
+        "vx": float(np.max(np.abs(run.cmd_vx))) if run.cmd_vx.size else 0.0,
+        "vy": float(np.max(np.abs(run.cmd_vy))) if run.cmd_vy.size else 0.0,
+        "wz": float(np.max(np.abs(run.cmd_wz))) if run.cmd_wz.size else 0.0,
+    }
+    return max(amps, key=lambda k: amps[k]) if any(amps.values()) else "vx"
 
 
 # ---------------------------------------------------------------------- step metrics
