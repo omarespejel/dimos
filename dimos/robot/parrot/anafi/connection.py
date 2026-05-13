@@ -56,7 +56,7 @@ class AnafiConnectionConfig(ModuleConfig):
     camera_frame_id: str = "camera_optical"
 
 
-_ANAFI_INTRINSICS = (905.0, 905.0, 640.0, 360.0)
+_ANAFI_INTRINSICS = (933.0, 933.0, 640.0, 360.0)
 _ANAFI_RESOLUTION = (1280, 720)
 
 
@@ -85,8 +85,13 @@ class AnafiConnectionModule(Module[AnafiConnectionConfig], Camera):
     telemetry: Out[Any]
 
     connection: AnafiConnectionProtocol | None = None
+    _camera_info: CameraInfo
     _latest_video_frame: Image | None = None
     _latest_telemetry: dict[str, Any] | None = None
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._camera_info = _camera_info_static(self.config)
 
     @rpc
     def start(self) -> None:
@@ -179,6 +184,11 @@ class AnafiConnectionModule(Module[AnafiConnectionConfig], Camera):
         return self._latest_video_frame
 
     @rpc
+    def get_camera_info(self) -> CameraInfo:
+        """Return the static ``CameraInfo`` used for the front camera stream."""
+        return self._camera_info
+
+    @rpc
     def get_telemetry(self) -> dict[str, Any] | None:
         """Return the most recent raw telemetry batch from pyparrot."""
         return self._latest_telemetry
@@ -186,6 +196,7 @@ class AnafiConnectionModule(Module[AnafiConnectionConfig], Camera):
     def _on_video(self, frame: Image) -> None:
         self._latest_video_frame = frame
         self.video.publish(frame)
+        self.camera_info.publish(self._camera_info.with_ts(frame.ts))
 
     def _on_telemetry(self, t: dict[str, Any]) -> None:
         self._latest_telemetry = t
