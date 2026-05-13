@@ -275,7 +275,7 @@ drone = [
 
 parrot = [
     "dimos[base]",
-    "pyparrot-sdk>=1.5.24",
+    "pyparrot-sdk>=1.5.25",
 ]
 
 dds = [

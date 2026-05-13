@@ -2439,7 +2439,7 @@ requires-dist = [
     { name = "pydantic-settings", marker = "extra == 'docker'", specifier = ">=2.11.0,<3" },
     { name = "pygame", marker = "extra == 'sim'", specifier = ">=2.6.1" },
     { name = "pymavlink", marker = "extra == 'drone'" },
-    { name = "pyparrot-sdk", marker = "extra == 'parrot'", specifier = ">=1.5.24" },
+    { name = "pyparrot-sdk", marker = "extra == 'parrot'", specifier = ">=1.5.25" },
     { name = "pyrealsense2", marker = "sys_platform != 'darwin' and extra == 'manipulation'" },
     { name = "python-dotenv" },
     { name = "python-multipart", marker = "extra == 'misc'", specifier = ">=0.0.27" },
@@ -8555,15 +8555,15 @@ wheels = [
 
 [[package]]
 name = "pyparrot-sdk"
-version = "1.5.24"
+version = "1.5.25"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "untangle" },
     { name = "zeroconf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8c/38/46a42c871bef15f8ec12e7502216a1058158b3a49cac1ba724d215df64d6/pyparrot_sdk-1.5.24.tar.gz", hash = "sha256:7734bb5bda5aaf9d924f7ae5cd25869e54cef1f9d2591493d3ea8a224b437122", size = 600430, upload-time = "2026-05-13T00:17:31.809Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7f/c5/0df02a305a2d741765487bda86d4d9b090773700c313dde70f2946bb2684/pyparrot_sdk-1.5.25.tar.gz", hash = "sha256:dd180ca401fe8a6f1155c25cd8354fff03619d092c46c531f4f234e1c2673894", size = 600531, upload-time = "2026-05-13T21:02:45.059Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/77/76/085e2c7f8b26b769b71b68304f0ee8f8b080e4bfebee296864944ba4bc78/pyparrot_sdk-1.5.24-py3-none-any.whl", hash = "sha256:2a4db8b1f4ce7085269bcd288dca61f2a0e41731b3ec8230ebf7f089e0c2b943", size = 639203, upload-time = "2026-05-13T00:17:33.534Z" },
+    { url = "https://files.pythonhosted.org/packages/70/ed/7004502d6af90bfe77d8a6267c0e285b7ceb6a440888a64d64944ce61182/pyparrot_sdk-1.5.25-py3-none-any.whl", hash = "sha256:6879ee184a9675c7b6af759b3daa898216089043c71c858e0a5a2e5ac565c066", size = 639339, upload-time = "2026-05-13T21:02:47.181Z" },
 ]
 
 [[package]]
