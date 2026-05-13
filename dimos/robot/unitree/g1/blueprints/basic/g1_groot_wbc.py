@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MuJoCo scene playground with optional mesh collision."""
+"""G1 GROOT WBC target backed by MuJoCo during development."""
 
 from __future__ import annotations
 
@@ -136,7 +136,7 @@ if _scene_mesh_path and _scene_mesh_collision:
             exc,
         )
 
-mujoco_scene_playground = autoconnect(
+g1_groot_wbc = autoconnect(
     MujocoSimModule.blueprint(
         address=_sim_mjcf_path,
         meshdir=_mjcf_meshdir,
@@ -183,4 +183,4 @@ mujoco_scene_playground = autoconnect(
     }
 )
 
-__all__ = ["mujoco_scene_playground"]
+__all__ = ["g1_groot_wbc"]
