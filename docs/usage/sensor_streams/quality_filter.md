@@ -40,7 +40,7 @@ print("Selected:", [r["id"] for r in result])
 print("Qualities:", [r["quality"] for r in result])
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Selected: [2]
 Qualities: [0.9]
@@ -74,7 +74,7 @@ print("Sharpness scores:")
 show_frames(input_frames)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Loaded 20 frames from Go2 camera
 Frame resolution: 1280x720
@@ -105,7 +105,7 @@ print(f"Output: {len(sharp_frames)} frame(s) (selected sharpest per window)")
 show_frames(sharp_frames)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Output: 3 frame(s) (selected sharpest per window)
   Frame 0: 0.351
@@ -167,14 +167,14 @@ Visualizing which frames were selected (green border = selected as sharpest in w
 plot_mosaic(input_frames, sharp_frames, '{output}')
 ```
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/frame_mosaic.jpg)
 
 ```python skip session=qb output=assets/sharpness_graph.svg
 plot_sharpness(input_frames, sharp_frames, '{output}')
 ```
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/sharpness_graph.svg)
 
 Let's request a higher frequency.
@@ -189,7 +189,7 @@ print(f"Output: {len(sharp_frames)} frame(s) (selected sharpest per window)")
 show_frames(sharp_frames)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Output: 6 frame(s) (selected sharpest per window)
   Frame 0: 0.351
@@ -204,7 +204,7 @@ Output: 6 frame(s) (selected sharpest per window)
 plot_mosaic(input_frames, sharp_frames, '{output}')
 ```
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/frame_mosaic2.jpg)
 
 
@@ -212,7 +212,7 @@ plot_mosaic(input_frames, sharp_frames, '{output}')
 plot_sharpness(input_frames, sharp_frames, '{output}')
 ```
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/sharpness_graph2.svg)
 
 As we can see the system is trying to strike a balance between requested frequency and quality that's available
@@ -261,7 +261,7 @@ print(f"Mean gradient magnitude: {magnitude.mean():.2f}")
 print(f"Normalized sharpness:    {img.sharpness:.3f}")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Mean gradient magnitude: 230.00
 Normalized sharpness:    0.332
@@ -287,7 +287,7 @@ result = rx.of(*detections).pipe(
 print(f"Selected: {result[0]['name']} (conf: {result[0]['confidence']})")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Selected: dog (conf: 0.95)
 ```

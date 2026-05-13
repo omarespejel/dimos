@@ -19,7 +19,7 @@ source.subscribe(lambda x: received.append(x))
 print("received:", received)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 received: [0, 1, 2, 3, 4]
 ```
@@ -43,7 +43,7 @@ observable.subscribe(lambda x: result.append(x))
 print("transformed:", result)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 transformed: [6, 8]
 ```
@@ -58,7 +58,7 @@ rx.of(1, 2, 3).pipe(
 ).subscribe(print)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 item_1
 item_2
@@ -74,7 +74,7 @@ rx.of(1, 2, 3, 4, 5).pipe(
 ).subscribe(print)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 2
 4
@@ -89,7 +89,7 @@ rx.of(1, 2, 3, 4, 5).pipe(
 ).subscribe(print)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 1
 2
@@ -106,7 +106,7 @@ rx.of(1, 2).pipe(
 ).subscribe(print)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 1
 10
@@ -133,7 +133,7 @@ results = rx.interval(0.05).pipe(
 print("sample() got:", results)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 sample() got: [2, 6, 9]
 ```
@@ -151,7 +151,7 @@ results = rx.interval(0.05).pipe(
 print("throttle_first() got:", results)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 throttle_first() got: [0, 3, 6, 9]
 ```
@@ -169,7 +169,7 @@ print("sample: latest value at each tick")
 print("throttle_first: first value, then block")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 sample: latest value at each tick
 throttle_first: first value, then block
@@ -228,7 +228,7 @@ Handler: box "callback" rad 5px fit wid 170% ht 170%
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/observable_flow.svg)
 
 
@@ -244,7 +244,7 @@ rx.of(1, 2, 3).subscribe(
 )
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 value: 1
 value: 2
@@ -268,7 +268,7 @@ subscription.dispose()  # Stop receiving values, clean up resources
 print("disposed")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 disposed
 ```
@@ -305,7 +305,7 @@ time.sleep(0.25)
 module.stop()
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 got 0
 got 1
@@ -360,7 +360,7 @@ sub.dispose()
 print("callbacks after dispose:", len(sensor._callbacks))
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 received: ['reading_1', 'reading_2']
 callbacks after dispose: 0
@@ -398,7 +398,7 @@ sub.dispose()
 print("callbacks after dispose:", len(pubsub._callbacks))
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 received: ['msg_1', 'msg_2']
 callbacks after dispose: 0
@@ -425,7 +425,7 @@ obs.subscribe(
 print("results:", results)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 cleaned up
 results: ['first', 'second', 'DONE']
@@ -451,7 +451,7 @@ time.sleep(0.2)
 print(f"received {len(received)} items before dispose")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 received 2 items before dispose
 ```
@@ -474,7 +474,7 @@ disposables.dispose()
 print("after dispose:", disposables.is_disposed)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 subscriptions: 2
 after dispose: True

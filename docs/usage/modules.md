@@ -22,7 +22,7 @@ from dimos.robot.unitree.go2.blueprints.smart.unitree_go2 import unitree_go2
 
 to_svg(unitree_go2, "assets/go2_nav.svg")
 ```
-<!--Result:-->
+{/* Result: */}
 ![output](assets/go2_nav.svg)
 
 ## Camera Module
@@ -43,7 +43,7 @@ from dimos.hardware.sensors.camera.module import CameraModule
 print(CameraModule.io())
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 ┌┴─────────────┐
 │ CameraModule │
@@ -85,7 +85,7 @@ time.sleep(0.5)
 camera.stop()
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Out color_image[Image] @ CameraModule
 Image(shape=(480, 640, 3), format=RGB, dtype=uint8, dev=cpu, ts=2025-12-31 15:54:16)
@@ -110,7 +110,7 @@ from dimos.perception.detection.module2D import Detection2DModule, Config
 print(Detection2DModule.io())
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
  ├─ color_image: Image
 ┌┴──────────────────┐
@@ -130,7 +130,7 @@ print(Detection2DModule.io())
  ├─ RPC stop() -> None
 ```
 
-<!-- TODO: add easy way to print config -->
+{/* TODO: add easy way to print config */}
 
 Looks like the detector just needs an image input and outputs some sort of detection and annotation messages. Let's connect it to a camera.
 
@@ -379,7 +379,7 @@ from dimos.robot.unitree_webrtc.unitree_go2_blueprints import agentic
 to_svg(agentic, "assets/go2_agentic.svg")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/go2_agentic.svg)
 
 

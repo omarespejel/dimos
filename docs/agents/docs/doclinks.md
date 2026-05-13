@@ -4,13 +4,13 @@ Full documentation if needed: [`utils/docs/doclinks.md`](/dimos/utils/docs/docli
 
 ## Syntax
 
-<!-- doclinks-ignore-start -->
+{/* doclinks-ignore-start */}
 | Pattern     | Example                                             |
 |-------------|-----------------------------------------------------|
 | Code file   | `[`service/spec.py`]()` → resolves path             |
 | With symbol | `Configurable` in `[`spec.py`]()` → adds `#L<line>` |
 | Doc link    | `[Configuration](.md)` → resolves to doc            |
-<!-- doclinks-ignore-end -->
+{/* doclinks-ignore-end */}
 
 ## Usage
 

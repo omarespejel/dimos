@@ -42,7 +42,7 @@ text "target here" small italic at (GR.s.x, GR.s.y - 0.25in)
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/transforms_tree.svg)
 
 
@@ -92,7 +92,7 @@ camera_transform = Transform(
 print(camera_transform)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 base_link -> camera_link
   Translation: → Vector Vector([0.5 0.  0.3])
@@ -133,7 +133,7 @@ t_inverse = -t1
 print(f"Inverse: {t_inverse.frame_id} -> {t_inverse.child_frame_id}")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Composed: base_link -> end_effector
 Translation: (1.0, 0.5, 0.0)
@@ -159,7 +159,7 @@ print("4x4 transformation matrix:")
 print(matrix)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 4x4 transformation matrix:
 [[1. 0. 0. 1.]
@@ -196,7 +196,7 @@ sensor2 = MySensorModule(frame_id_prefix="robot1")
 print(f"With prefix: {sensor2.frame_id}")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Default frame_id: sensor_link
 With prefix: robot1/sensor_link
@@ -332,7 +332,7 @@ if __name__ == "__main__":
 
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 16:21:45.203 [inf][ation/worker_manager_python.py] Worker pool started. n_workers=2
 16:21:45.445 [inf][/coordination/python_worker.py] Deployed module. module=RobotBaseModule module_id=0 worker_id=0
@@ -422,7 +422,7 @@ text "CameraModule" italic at ((CL.x + CO.x)/2, CL.s.y - 0.25in)
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/transforms_modules.svg)
 
 
@@ -460,7 +460,7 @@ print(f"Buffer has {len(tf.buffers)} transform pair(s)")
 print(tf)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Latest transform: x=4.0
 Buffer has 1 transform pair(s)

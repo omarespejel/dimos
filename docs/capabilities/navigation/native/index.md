@@ -37,7 +37,7 @@ text "Twist" italic at (M4.x, Nav.s.y - 0.45in)
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/go2nav_dataflow.svg)
 ## Pipeline Steps
 
@@ -177,5 +177,5 @@ unitree_go2 = autoconnect(
 
 to_svg(unitree_go2, "assets/go2_blueprint.svg")
 ```
-<!--Result:-->
+{/* Result: */}
 ![output](assets/go2_blueprint.svg)

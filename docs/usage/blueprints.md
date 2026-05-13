@@ -254,7 +254,7 @@ from dimos.robot.cli.dimos import arg_help
 print(arg_help(base_blueprint.config(), base_blueprint))
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
     module1:
       * module1.default_rpc_timeout: float (default: 120.0)
@@ -386,7 +386,7 @@ module_coordinator = ModuleCoordinator.build(SomeSkill.blueprint())
 module_coordinator.stop()
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 16:30:00.119 [inf][dination/module_coordinator.py] Building the blueprint
 16:30:00.133 [inf][dination/module_coordinator.py] Starting the modules

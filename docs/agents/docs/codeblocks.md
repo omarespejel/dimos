@@ -54,7 +54,7 @@ Execute code blocks in markdown files and insert the results.
 echo "cwd: $(pwd)"
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 cwd: /work
 ```
@@ -66,7 +66,7 @@ a = "hello world"
 print(a)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 hello world
 ```
@@ -77,7 +77,7 @@ Sessions preserve state between code blocks:
 print(a, "again")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 hello world again
 ```
@@ -89,7 +89,7 @@ console.log("Hello from Node.js");
 console.log(`Node version: ${process.version}`);
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Hello from Node.js
 Node version: v22.21.1
@@ -112,7 +112,7 @@ plt.grid(alpha=0.3)
 plt.savefig('{output}', transparent=True)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/matplotlib-demo.svg)
 
 ### Pikchr
@@ -155,7 +155,7 @@ arrow from X to Out.w
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/pikchr-demo.svg)
 
 ### Asymptote
@@ -183,7 +183,7 @@ xaxis("$x$",BottomTop,LeftTicks,p=white);
 yaxis("$dP/dx$",LeftRight,RightTicks(trailingzero),p=white);
 ```
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/histogram.svg)
 
 ### Graphviz
@@ -193,7 +193,7 @@ A -> B -> C
 A -> C
 ```
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/graph.svg)
 
 ### OpenSCAD
@@ -203,7 +203,7 @@ cube([10, 10, 10]);
 sphere(r=7);
 ```
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/cube-sphere.png)
 
 ### Diagon
@@ -214,7 +214,7 @@ ASCII art diagrams:
 1 + 1/2 + sum(i,0,10)
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
         10
         ___
@@ -229,7 +229,7 @@ A -> B -> C
 A -> C
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 ┌───┐
 │A  │

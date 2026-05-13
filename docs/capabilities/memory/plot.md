@@ -135,7 +135,7 @@ plot.add(plantness_similarity,
 plot.to_svg("assets/plot_plantness.svg")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Stream("color_image_embedded") | vector_search() | order_by(ts)
 Stream("materialize")
@@ -241,7 +241,7 @@ m = mosaic(semantic_peaks.map_data(lambda obs: moondream.query_detections(obs.da
 m.data.save("assets/plants_auto.png")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 14:59:33.042 [inf][dimos/mapping/voxels.py       ] VoxelGrid using device: CUDA:0
 t=  14.1s score=0.224 prominence=0.031

@@ -33,7 +33,7 @@ except (TypeError, ValidationError) as e:
 
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Config(x=3, hello='world')
 Config(x=3, hello='override')
@@ -76,7 +76,7 @@ myModule = MyModule(frame_id="frame_id_override", device="CPU")
 
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Config(
     rpc_transport=<class 'dimos.protocol.rpc.pubsubrpc.LCMRPC'>,

@@ -43,7 +43,8 @@ python -m pytest -svm tool -k "not bytes" dimos/protocol/pubsub/benchmark/test_b
 
 ## Abstraction layers
 
-<details><summary>Pikchr</summary>
+<details>
+<summary>Pikchr</summary>
 
 ```pikchr output=../assets/abstraction_layers.svg fold
 color = white
@@ -70,7 +71,7 @@ text "pub/sub API" at P.s + (0, -0.2in)
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](../assets/abstraction_layers.svg)
 
 We’ll go through these layers top-down.
@@ -179,7 +180,7 @@ if __name__ == "__main__":
     dimos.stop()
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 02:57:31.428 [inf][ation/worker_manager_python.py] Worker pool started. n_workers=2
 02:57:31.761 [inf][/coordination/python_worker.py] Deployed module. module=TickerCameraModule module_id=0 worker_id=0
@@ -255,7 +256,7 @@ print(inspect.getsource(PubSub.publish))
 print(inspect.getsource(PubSub.subscribe))
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
     @abstractmethod
     def publish(self, topic: TopicT, message: MsgT) -> None:
@@ -297,7 +298,7 @@ print(f"Received velocity: x={received[0].x}, y={received[0].y}, z={received[0].
 lcm.stop()
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Received velocity: x=1.0, y=0.0, z=0.5
 ```
@@ -323,7 +324,7 @@ print(f"Received: {received}")
 shm.stop()
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Received: [{'data': [1, 2, 3]}]
 ```
@@ -358,7 +359,7 @@ print(f"Received: {received}")
 dds.stop()
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Received: [SensorReading(value=22.5)]
 ```
@@ -386,7 +387,7 @@ for msg in received:
 unsubscribe()
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Received 2 messages:
   {'temperature': 22.5}

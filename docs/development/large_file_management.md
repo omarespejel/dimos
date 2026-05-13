@@ -13,7 +13,7 @@ print(f"Path: {data_path}")
 print(f"Exists: {data_path.exists()}")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Path: /home/lesh/coding/dimos/data/cafe.jpg
 Exists: True
@@ -21,7 +21,8 @@ Exists: True
 
 ## How It Works
 
-<details><summary>Pikchr</summary>
+<details>
+<summary>Pikchr</summary>
 
 ```pikchr fold output=assets/get_data_flow.svg
 color = white
@@ -46,7 +47,7 @@ F: box "Return path" rad 5px fit wid 170% ht 170%
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/get_data_flow.svg)
 
 1. Checks if `data/{name}` already exists locally
@@ -66,7 +67,7 @@ image = Image.from_file(get_data("cafe.jpg"))
 print(f"Image shape: {image.data.shape}")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Image shape: (771, 1024, 3)
 ```
@@ -81,7 +82,7 @@ checkpoint = model_dir / "yolo11n.pt"
 print(f"Checkpoint: {checkpoint.name} ({checkpoint.stat().st_size // 1024}KB)")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Checkpoint: yolo11n.pt (5482KB)
 ```
@@ -98,7 +99,7 @@ print(f"Replay {replay} loaded from: {data_dir.name}")
 print(replay.find_closest_seek(1))
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Replay <dimos.utils.testing.replay.TimedSensorReplay object at 0x7fdc24c708f0> loaded from: unitree_office_walk
 {'type': 'msg', 'topic': 'rt/utlidar/voxel_map_compressed', 'data': {'stamp': 1751591000.0, 'frame_id': 'odom', 'resolution': 0.05, 'src_size': 77824, 'origin': [-3.625, -3.275, -0.575], 'width': [128, 128, 38], 'data': {'points': array([[ 2.725, -1.025, -0.575],
@@ -120,7 +121,7 @@ pointcloud = read_pointcloud(get_data("apartment") / "sum.ply")
 print(f"Loaded pointcloud with {len(pointcloud.points)} points")
 ```
 
-<!--Result:-->
+{/* Result: */}
 ```
 Loaded pointcloud with 63672 points
 ```
@@ -129,7 +130,8 @@ Loaded pointcloud with 63672 points
 
 Data files live in `data/` at the repo root. Large files are stored in `data/.lfs/` as `.tar.gz` archives tracked by Git LFS.
 
-<details><summary>Diagram</summary>
+<details>
+<summary>Diagram</summary>
 
 ```diagon fold mode=Tree
 data/
@@ -143,7 +145,7 @@ data/
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ```
 data/
  ├──cafe.jpg

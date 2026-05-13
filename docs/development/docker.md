@@ -4,7 +4,8 @@ Dimos uses parallel Docker image hierarchies for ROS and non-ROS builds, allowin
 
 ## Image Hierarchy
 
-<details><summary>Pikchr</summary>
+<details>
+<summary>Pikchr</summary>
 
 ```pikchr fold output=assets/docker-hierarchy.svg
 color = white
@@ -40,7 +41,7 @@ text "same dockerfiles" at (D.e.x + 1.2in, D.e.y + 0.4in)
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/docker-hierarchy.svg)
 
 

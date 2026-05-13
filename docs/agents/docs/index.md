@@ -75,7 +75,7 @@ C: box "Step 3" rad 5px fit wid 170% ht 170%
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/pikchr_basic.svg)
 
 ## Box sizing
@@ -99,7 +99,7 @@ C: box "two lines" "of text" rad 5px fit wid 170% ht 170%
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/pikchr_sizing.svg)
 
 The pattern `fit wid 170% ht 170%` means: auto-size to text, then scale width by 170% and height by 170%.
@@ -120,7 +120,7 @@ B: box "Step 2" rad 5px fit wid 170% ht 170%
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/pikchr_explicit.svg)
 
 ## Common settings
@@ -156,7 +156,7 @@ D: box "Path B" rad 5px fit wid 170% ht 170%
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/pikchr_branch.svg)
 
 **Tip:** For tree/hierarchy diagrams, prefer left-to-right layout (root on left, children branching right). This reads more naturally and avoids awkward vertical stacking.
@@ -176,7 +176,7 @@ text "label below" at (A.x, A.y - 0.4in)
 
 </details>
 
-<!--Result:-->
+{/* Result: */}
 ![output](assets/pikchr_labels.svg)
 
 ## Reference
