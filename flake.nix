@@ -84,6 +84,7 @@
           { vals.pkg=pkgs.portaudio;                 flags={ldLibraryGroup=true; packageConfGroup=true;}; }
           { vals.pkg=pkgs.ffmpeg_6;                  flags={}; }
           { vals.pkg=pkgs.ffmpeg_6.dev;              flags={}; }
+          { vals.pkg=pkgs.vlc;                       flags.ldLibraryGroup=true; onlyIf=pkgs.stdenv.isLinux; }
 
           ### Graphics / X11 stack
           { vals.pkg=pkgs.libGL;              flags.ldLibraryGroup=true; onlyIf=pkgs.stdenv.isLinux; }
