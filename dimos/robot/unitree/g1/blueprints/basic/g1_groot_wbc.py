@@ -144,8 +144,9 @@ g1_groot_wbc = autoconnect(
         dof=_dof,
         camera_name=os.environ.get("DIMOS_MUJOCO_CAMERA", "head_color"),
         enable_color=False,
-        enable_depth=True,
+        enable_depth=_enable_depth_cloud,
         enable_pointcloud=(not _disable_lidar) or _enable_depth_cloud,
+        pointcloud_fps=_env_float("DIMOS_POINTCLOUD_FPS", 2.0),
         lidar_camera_names=(
             []
             if _disable_lidar
@@ -156,6 +157,7 @@ g1_groot_wbc = autoconnect(
         lidar_voxel_size=_env_float("DIMOS_LIDAR_VOXEL_SIZE", 0.05),
         enable_kinematic_base_control=os.environ.get("DIMOS_KINEMATIC_BASE_CONTROL", "1")
         not in {"", "0"},
+        enable_kinematic_joint_hold=_env_bool("DIMOS_MUJOCO_KINEMATIC_JOINT_HOLD", True),
     ),
     MovementManager.blueprint(),
     VoxelGridMapper.blueprint(

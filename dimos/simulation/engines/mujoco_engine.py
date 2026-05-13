@@ -458,6 +458,24 @@ class MujocoEngine(SimulationEngine):
             for i, mapping in enumerate(self._joint_mappings):
                 self._joint_position_targets[i] = self._current_position(mapping)
 
+    def enforce_position_targets(self) -> None:
+        """Pin modeled joints to their current position targets.
+
+        This is a development stub for stacks that do not yet run a real
+        whole-body controller. It leaves the floating base alone, but prevents
+        contact impulses from folding the articulated joints.
+        """
+        with self._lock:
+            for i, mapping in enumerate(self._joint_mappings):
+                target = self._joint_position_targets[i]
+                if mapping.qpos_adr is not None:
+                    self._data.qpos[mapping.qpos_adr] = target
+                    self._joint_positions[i] = target
+                if mapping.dof_adr is not None:
+                    self._data.qvel[mapping.dof_adr] = 0.0
+                    self._joint_velocities[i] = 0.0
+            mujoco.mj_forward(self._model, self._data)
+
     @property
     def has_root_freejoint(self) -> bool:
         return self._root_free_qpos_adr is not None

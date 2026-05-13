@@ -54,14 +54,20 @@ _GEOM_LINE = (
     '      <geom name="{name}" type="mesh" mesh="{mesh}" '
     'contype="1" conaffinity="1" group="3" rgba="0.6 0.6 0.6 1"/>'
 )
+_BOX_GEOM_LINE = (
+    '      <geom name="{name}" type="box" pos="{pos}" quat="{quat}" size="{size}" '
+    'contype="1" conaffinity="1" group="3" rgba="0.6 0.6 0.6 1"/>'
+)
 _DEGENERATE_EPS = 1e-3
 _SHELL_VOLUME_M3 = 2.0
 _CACHE_KEY_LEN = 12
-_CACHE_SCHEMA_VERSION = "rank3-hulls-v1"
+_CACHE_SCHEMA_VERSION = "thin-box-fallback-v1"
 _VHACD_MAX_HULLS = 64
 _VHACD_RESOLUTION = 200_000
-_MIN_HULL_ASPECT_RATIO = 0.05
 _MIN_HULL_EXTENT_M = 5e-3
+_FALLBACK_BOX_THICKNESS_M = 0.03
+_MIN_FALLBACK_BOX_EXTENT_M = 0.25
+_MIN_FALLBACK_BOX_AREA_M2 = 0.05
 
 
 @dataclass
@@ -72,6 +78,7 @@ class _BakeArtifacts:
     skipped_degenerate: int
     n_hulls: int
     n_decomposed: int
+    n_box_fallbacks: int
 
 
 def bake_scene_mjcf(
@@ -128,14 +135,15 @@ def bake_scene_mjcf(
     logger.info(f"bake_scene_mjcf: {len(prims)} prims to bake")
 
     artifacts = _bake_collision_hulls(prims, cache_dir)
-    if not artifacts.asset_lines:
+    if not artifacts.asset_lines and not artifacts.geom_lines:
         raise RuntimeError(
             "bake_scene_mjcf: every hull came out degenerate; nothing left to collide against"
         )
     logger.info(
         f"bake_scene_mjcf: baked {artifacts.n_hulls} convex hulls from {len(prims)} prims "
         f"({artifacts.total_tris} tris total), VHACD-decomposed {artifacts.n_decomposed} "
-        f"shell prims, skipped {artifacts.skipped_degenerate} degenerate hulls"
+        f"shell prims, added {artifacts.n_box_fallbacks} thin box fallbacks, "
+        f"skipped {artifacts.skipped_degenerate} degenerate hulls"
     )
 
     _write_wrapper(
@@ -181,6 +189,7 @@ def _bake_collision_hulls(prims: list[Any], cache_dir: Path) -> _BakeArtifacts:
     skipped_degenerate = 0
     n_hulls = 0
     n_decomposed = 0
+    n_box_fallbacks = 0
     logger.info(f"bake_scene_mjcf: per-prim convex-hulling {len(prims)} prims (one-time)")
     for prim in prims:
         tm = trimesh.Trimesh(
@@ -191,7 +200,16 @@ def _bake_collision_hulls(prims: list[Any], cache_dir: Path) -> _BakeArtifacts:
         try:
             single_hull = tm.convex_hull
         except Exception as e:
-            logger.warning(f"  convex_hull failed for {prim.name}: {e}; skipping")
+            box_line = _fallback_box_geom(f"{prim.name}_box", prim.vertices)
+            if box_line is None:
+                logger.warning(f"  convex_hull failed for {prim.name}: {e}; skipping")
+                skipped_degenerate += 1
+            else:
+                logger.warning(
+                    f"  convex_hull failed for {prim.name}: {e}; using thin box fallback"
+                )
+                geom_lines.append(box_line)
+                n_box_fallbacks += 1
             continue
 
         hulls, decomposed = _collision_hulls(tm, single_hull, prim.name)
@@ -202,7 +220,12 @@ def _bake_collision_hulls(prims: list[Any], cache_dir: Path) -> _BakeArtifacts:
             v = np.asarray(hull.vertices, dtype=np.float32)
             f = np.asarray(hull.faces, dtype=np.int32)
             if not _valid_hull(v, f):
-                skipped_degenerate += 1
+                box_line = _fallback_box_geom(f"{prim.name}_h{j:03d}_box", v)
+                if box_line is None:
+                    skipped_degenerate += 1
+                else:
+                    geom_lines.append(box_line)
+                    n_box_fallbacks += 1
                 continue
 
             asset_name = f"{prim.name}_h{j:03d}"
@@ -221,6 +244,7 @@ def _bake_collision_hulls(prims: list[Any], cache_dir: Path) -> _BakeArtifacts:
         skipped_degenerate=skipped_degenerate,
         n_hulls=n_hulls,
         n_decomposed=n_decomposed,
+        n_box_fallbacks=n_box_fallbacks,
     )
 
 
@@ -253,9 +277,6 @@ def _valid_hull(v: np.ndarray, f: np.ndarray) -> bool:
     if (extent < _DEGENERATE_EPS).any():
         return False
     min_ext = float(extent.min())
-    max_ext = float(extent.max())
-    if max_ext > 0 and (min_ext / max_ext) < _MIN_HULL_ASPECT_RATIO:
-        return False
     if min_ext < _MIN_HULL_EXTENT_M:
         return False
     centered = v.astype(np.float64) - v.astype(np.float64).mean(axis=0)
@@ -268,6 +289,62 @@ def _valid_hull(v: np.ndarray, f: np.ndarray) -> bool:
     except (QhullError, ValueError):
         return False
     return True
+
+
+def _fallback_box_geom(name: str, vertices: np.ndarray) -> str | None:
+    finite = vertices[np.isfinite(vertices).all(axis=1)].astype(np.float64)
+    if len(finite) < 3:
+        return None
+    aabb_extent = finite.max(axis=0) - finite.min(axis=0)
+    sorted_extents = np.sort(aabb_extent)
+    if sorted_extents[-1] < _MIN_FALLBACK_BOX_EXTENT_M:
+        return None
+    if sorted_extents[-1] * sorted_extents[-2] < _MIN_FALLBACK_BOX_AREA_M2:
+        return None
+
+    center, rotation, extent = _oriented_box(finite)
+    extent = np.maximum(extent, _FALLBACK_BOX_THICKNESS_M)
+    half_size = 0.5 * extent
+    quat = _rotation_matrix_to_wxyz(rotation)
+    return _BOX_GEOM_LINE.format(
+        name=name,
+        pos=_fmt_vec(center),
+        quat=_fmt_vec(quat),
+        size=_fmt_vec(half_size),
+    )
+
+
+def _oriented_box(vertices: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    try:
+        import trimesh
+
+        tm = trimesh.Trimesh(vertices=vertices, faces=np.empty((0, 3), dtype=np.int32))
+        obb = tm.bounding_box_oriented
+        transform = np.asarray(obb.primitive.transform, dtype=np.float64)
+        extent = np.asarray(obb.primitive.extents, dtype=np.float64)
+        rotation = transform[:3, :3]
+        center = transform[:3, 3]
+        if np.linalg.det(rotation) < 0:
+            rotation[:, 0] *= -1.0
+        if np.isfinite(center).all() and np.isfinite(rotation).all() and np.isfinite(extent).all():
+            return center, rotation, np.abs(extent)
+    except Exception:
+        pass
+
+    lo = vertices.min(axis=0)
+    hi = vertices.max(axis=0)
+    return (lo + hi) * 0.5, np.eye(3), hi - lo
+
+
+def _rotation_matrix_to_wxyz(rotation: np.ndarray) -> np.ndarray:
+    from scipy.spatial.transform import Rotation
+
+    xyzw = Rotation.from_matrix(rotation).as_quat()
+    return np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]], dtype=np.float64)
+
+
+def _fmt_vec(values: np.ndarray) -> str:
+    return " ".join(f"{float(v):.9g}" for v in values)
 
 
 def _write_hull_obj(obj_file: Path, vertices: np.ndarray, faces: np.ndarray) -> None:

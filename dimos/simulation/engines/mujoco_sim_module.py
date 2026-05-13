@@ -110,6 +110,7 @@ class MujocoSimModuleConfig(ModuleConfig, DepthCameraConfig):
     lidar_camera_height: int = 360
     lidar_voxel_size: float = 0.05
     enable_kinematic_base_control: bool = False
+    enable_kinematic_joint_hold: bool = False
 
 
 class MujocoSimModule(
@@ -403,6 +404,8 @@ class MujocoSimModule(
 
     def _after_step(self, engine: MujocoEngine) -> None:
         self._apply_cmd_vel(engine)
+        if self.config.enable_kinematic_joint_hold:
+            engine.enforce_position_targets()
         self._publish_state(engine)
 
     def _publish_state(self, engine: MujocoEngine) -> None:
