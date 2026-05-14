@@ -387,6 +387,208 @@ class ScenePrimMesh:
     """``(M, 3)`` int32 vertex indices."""
 
 
+def _usd_matrix_to_numpy(matrix: Any) -> np.ndarray:
+    """Convert a USD row-major transform into column-vector numpy form."""
+    return np.asarray(matrix, dtype=np.float64).T
+
+
+def _transform_points(points: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    points_h = np.hstack([points, np.ones((len(points), 1), dtype=np.float64)])
+    return np.asarray((matrix @ points_h.T).T[:, :3], dtype=np.float64)
+
+
+def _triangulated_usd_mesh(usd_mesh: Any) -> tuple[np.ndarray, np.ndarray] | None:
+    pts_attr = usd_mesh.GetPointsAttr().Get()
+    if pts_attr is None or len(pts_attr) == 0:
+        return None
+
+    face_verts_attr = usd_mesh.GetFaceVertexIndicesAttr().Get()
+    face_counts_attr = usd_mesh.GetFaceVertexCountsAttr().Get()
+    if face_verts_attr is None or face_counts_attr is None:
+        return None
+
+    pts = np.asarray(pts_attr, dtype=np.float64)
+    face_verts = np.asarray(face_verts_attr, dtype=np.int32)
+    face_counts = np.asarray(face_counts_attr, dtype=np.int32)
+
+    tris: list[tuple[int, int, int]] = []
+    cursor = 0
+    for n in face_counts:
+        if n < 3:
+            cursor += int(n)
+            continue
+        for k in range(1, int(n) - 1):
+            tris.append(
+                (
+                    int(face_verts[cursor]),
+                    int(face_verts[cursor + k]),
+                    int(face_verts[cursor + k + 1]),
+                )
+            )
+        cursor += int(n)
+
+    if not tris:
+        return None
+    return pts, np.asarray(tris, dtype=np.int32)
+
+
+def _aligned_scene_points(
+    pts_stage: np.ndarray,
+    *,
+    rotation: np.ndarray,
+    scale: float,
+    translation: np.ndarray,
+) -> np.ndarray:
+    return np.asarray((rotation @ (scale * pts_stage).T).T + translation, dtype=np.float64)
+
+
+def _clean_scene_name(raw: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in raw)
+
+
+def _path_has_prefix(path: Any, prefix: Any) -> bool:
+    try:
+        return bool(path.HasPrefix(prefix))
+    except AttributeError:
+        path_str = str(path)
+        prefix_str = str(prefix).rstrip("/")
+        return path_str == prefix_str or path_str.startswith(prefix_str + "/")
+
+
+def _point_instancer_prototype_paths(stage: Any, UsdGeom: Any) -> tuple[Any, ...]:
+    paths: list[Any] = []
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdGeom.PointInstancer):
+            continue
+        paths.extend(UsdGeom.PointInstancer(prim).GetPrototypesRel().GetTargets())
+    return tuple(paths)
+
+
+def _is_point_instancer_prototype_mesh(prim: Any, prototype_paths: tuple[Any, ...]) -> bool:
+    path = prim.GetPath()
+    return any(_path_has_prefix(path, proto_path) for proto_path in prototype_paths)
+
+
+def _collect_prototype_meshes(
+    proto_prim: Any,
+    *,
+    Usd: Any,
+    UsdGeom: Any,
+) -> list[tuple[str, np.ndarray, np.ndarray]]:
+    """Return prototype mesh triangles in prototype-root coordinates."""
+    time = Usd.TimeCode.Default()
+    xform_cache = UsdGeom.XformCache(time)
+    proto_world = _usd_matrix_to_numpy(xform_cache.GetLocalToWorldTransform(proto_prim))
+    proto_world_inv = np.linalg.inv(proto_world)
+
+    meshes: list[tuple[str, np.ndarray, np.ndarray]] = []
+    for mesh_prim in Usd.PrimRange(proto_prim):
+        if not mesh_prim.IsA(UsdGeom.Mesh):
+            continue
+        triangulated = _triangulated_usd_mesh(UsdGeom.Mesh(mesh_prim))
+        if triangulated is None:
+            continue
+        pts, tris = triangulated
+        mesh_world = _usd_matrix_to_numpy(xform_cache.GetLocalToWorldTransform(mesh_prim))
+        pts_proto = _transform_points(pts, proto_world_inv @ mesh_world)
+        mesh_path = str(mesh_prim.GetPath()).lstrip("/")
+        meshes.append((_clean_scene_name(mesh_path), pts_proto, tris))
+    return meshes
+
+
+def _compute_point_instance_transforms(instancer: Any, *, Usd: Any, UsdGeom: Any) -> list[Any]:
+    time = Usd.TimeCode.Default()
+    try:
+        return list(
+            instancer.ComputeInstanceTransformsAtTime(
+                time,
+                time,
+                UsdGeom.PointInstancer.ExcludeProtoXform,
+            )
+        )
+    except TypeError:
+        return list(instancer.ComputeInstanceTransformsAtTime(time, time))
+
+
+def _expand_point_instancer(
+    prim: Any,
+    *,
+    Usd: Any,
+    UsdGeom: Any,
+    rotation: np.ndarray,
+    scale: float,
+    translation: np.ndarray,
+    start_index: int,
+) -> list[ScenePrimMesh]:
+    instancer = UsdGeom.PointInstancer(prim)
+    proto_targets = list(instancer.GetPrototypesRel().GetTargets())
+    proto_indices_attr = instancer.GetProtoIndicesAttr().Get()
+    if not proto_targets or proto_indices_attr is None:
+        return []
+
+    proto_indices = list(proto_indices_attr)
+    instance_transforms = _compute_point_instance_transforms(
+        instancer,
+        Usd=Usd,
+        UsdGeom=UsdGeom,
+    )
+    if not instance_transforms:
+        return []
+
+    time = Usd.TimeCode.Default()
+    xform_cache = UsdGeom.XformCache(time)
+    instancer_world = _usd_matrix_to_numpy(xform_cache.GetLocalToWorldTransform(prim))
+
+    prototype_cache: dict[str, list[tuple[str, np.ndarray, np.ndarray]]] = {}
+    prims: list[ScenePrimMesh] = []
+    instancer_name = _clean_scene_name(str(prim.GetPath()).lstrip("/"))
+
+    for instance_index, instance_transform in enumerate(instance_transforms):
+        if instance_index >= len(proto_indices):
+            continue
+        proto_index = int(proto_indices[instance_index])
+        if proto_index < 0 or proto_index >= len(proto_targets):
+            continue
+
+        proto_path = proto_targets[proto_index]
+        proto_prim = prim.GetStage().GetPrimAtPath(proto_path)
+        if not proto_prim or not proto_prim.IsValid():
+            continue
+
+        proto_key = str(proto_path)
+        if proto_key not in prototype_cache:
+            prototype_cache[proto_key] = _collect_prototype_meshes(
+                proto_prim,
+                Usd=Usd,
+                UsdGeom=UsdGeom,
+            )
+        prototype_meshes = prototype_cache[proto_key]
+        if not prototype_meshes:
+            continue
+
+        instance_matrix = _usd_matrix_to_numpy(instance_transform)
+        mesh_to_stage = instancer_world @ instance_matrix
+        for mesh_name, pts_proto, tris in prototype_meshes:
+            pts_stage = _transform_points(pts_proto, mesh_to_stage)
+            pts_world = _aligned_scene_points(
+                pts_stage,
+                rotation=rotation,
+                scale=scale,
+                translation=translation,
+            )
+            prims.append(
+                ScenePrimMesh(
+                    name=(
+                        f"{instancer_name}_i{instance_index:05d}_"
+                        f"{mesh_name}__{start_index + len(prims)}"
+                    ),
+                    vertices=pts_world.astype(np.float32),
+                    triangles=tris,
+                )
+            )
+    return prims
+
+
 def _load_glb_prims(path: Path, alignment: SceneMeshAlignment) -> list[ScenePrimMesh]:
     """Enumerate per-instance prims from a glTF/GLB.
 
@@ -458,13 +660,18 @@ def load_scene_prims(
     path: str | Path,
     alignment: SceneMeshAlignment | None = None,
 ) -> list[ScenePrimMesh]:
-    """Load a USD/USDZ scene as one ``ScenePrimMesh`` per Mesh prim.
+    """Load a USD/USDZ scene as one ``ScenePrimMesh`` per placed Mesh prim.
 
     Per-prim splitting is what MuJoCo wants for non-trivial scenes:
     each prim's convex hull approximates the prim well, while the
     convex hull of the *whole* scene is its bounding box.  Falls back
     to a single ScenePrimMesh for non-USD inputs (a single ``.obj`` or
     ``.glb`` doesn't carry per-part semantics in our loader).
+
+    USD ``PointInstancer`` prims are expanded into their concrete
+    placements.  Prototype meshes under the instancer's ``Prototypes``
+    scope are skipped during ordinary traversal so they are not also
+    baked at their authoring origin.
 
     Same alignment rules as ``load_scene_mesh``.
     """
@@ -499,53 +706,50 @@ def load_scene_prims(
     T = np.asarray(align.translation, dtype=np.float64)
     s = float(align.scale)
 
+    prototype_paths = _point_instancer_prototype_paths(stage, UsdGeom)
     prims: list[ScenePrimMesh] = []
     for prim in stage.Traverse():
+        if prim.IsA(UsdGeom.PointInstancer):
+            prims.extend(
+                _expand_point_instancer(
+                    prim,
+                    Usd=Usd,
+                    UsdGeom=UsdGeom,
+                    rotation=R,
+                    scale=s,
+                    translation=T,
+                    start_index=len(prims),
+                )
+            )
+            continue
+
         if not prim.IsA(UsdGeom.Mesh):
             continue
-        usd_mesh = UsdGeom.Mesh(prim)
-        pts_attr = usd_mesh.GetPointsAttr().Get()
-        if pts_attr is None or len(pts_attr) == 0:
+        if _is_point_instancer_prototype_mesh(prim, prototype_paths):
             continue
-        pts = np.asarray(pts_attr, dtype=np.float64)
-        face_verts = np.asarray(usd_mesh.GetFaceVertexIndicesAttr().Get(), dtype=np.int32)
-        face_counts = np.asarray(usd_mesh.GetFaceVertexCountsAttr().Get(), dtype=np.int32)
+
+        triangulated = _triangulated_usd_mesh(UsdGeom.Mesh(prim))
+        if triangulated is None:
+            continue
+        pts, tris = triangulated
 
         # Local → stage-root via the USD prim's accumulated transform.
         xform = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-        m = np.asarray(xform, dtype=np.float64).T
-        pts_h = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float64)])
-        pts_stage = (m @ pts_h.T).T[:, :3]
+        pts_stage = _transform_points(pts, _usd_matrix_to_numpy(xform))
 
         # Stage-root → dimos world via SceneMeshAlignment (scale → rot → trans).
-        pts_world = (R @ (s * pts_stage).T).T + T
-
-        # Triangulate any quads / n-gons (vertex indices are local to this prim now).
-        tris: list[tuple[int, int, int]] = []
-        cursor = 0
-        for n in face_counts:
-            for k in range(1, n - 1):
-                tris.append(
-                    (
-                        int(face_verts[cursor]),
-                        int(face_verts[cursor + k]),
-                        int(face_verts[cursor + k + 1]),
-                    )
-                )
-            cursor += n
-        if not tris:
-            continue
+        pts_world = _aligned_scene_points(pts_stage, rotation=R, scale=s, translation=T)
 
         # MJCF asset names: strip the leading slash, swap remaining
         # path separators / dots for underscores.  USD prim paths can
         # collide on the same leaf; suffix the index so each is unique.
         raw = str(prim.GetPath()).lstrip("/")
-        clean = "".join(c if c.isalnum() else "_" for c in raw)
+        clean = _clean_scene_name(raw)
         prims.append(
             ScenePrimMesh(
                 name=f"{clean}__{len(prims)}",
                 vertices=pts_world.astype(np.float32),
-                triangles=np.asarray(tris, dtype=np.int32),
+                triangles=tris,
             )
         )
 

@@ -179,7 +179,7 @@ _CACHE_KEY_LEN = 12
 # affect MJCF emission (new geom kinds, rewritten visual policy, etc.).
 # This is only a local cache salt; it is not a persisted file format
 # contract and old cache directories can safely stay on disk.
-_CACHE_SCHEMA_VERSION = "dispatcher-v7"
+_CACHE_SCHEMA_VERSION = "dispatcher-v8-point-instancer"
 
 
 @dataclass
