@@ -257,6 +257,7 @@ sim = [
     "trimesh",
     "usd-core>=24.0",
     "vhacdx",
+    "coacd>=1.0.11", # CoACD decomposer for scene_mesh_to_mjcf bake
 ]
 
 navigation = [

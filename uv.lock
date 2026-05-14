@@ -1139,6 +1139,21 @@ wheels = [
 ]
 
 [[package]]
+name = "coacd"
+version = "1.0.11"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1d/3b/434beab9e1754ca0ae3a619b383243dd85aa65d03a4dc7333c8296c97a92/coacd-1.0.11-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:adbc58259a721cc5ede24cc8c2671a95e75a8a52dc1ee4d953d80d236b192da9", size = 3299264, upload-time = "2026-05-04T19:23:36.183Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/a7/06f63baa29198f681ba60848e3271cc625eddd61cd4e59071f56ffce9362/coacd-1.0.11-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e376fadb22790444c7253f0cee9104a1af01ec965488c1318e84e3b2dbf1e2a3", size = 2573832, upload-time = "2026-05-04T19:23:38.008Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/b4/057c78f7b16b87871cfcecc6febe70522e77a2a33f8788960377152c224d/coacd-1.0.11-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a60f700a52e5b40462e508c14bb756cd63ce7e6a95ff72ae0b1592be1dbb0106", size = 2640170, upload-time = "2026-05-04T19:23:39.322Z" },
+    { url = "https://files.pythonhosted.org/packages/00/83/c50472ce98175fddd86d4aba861fea89f30350a5487880b3a81d34915a85/coacd-1.0.11-cp39-abi3-win_amd64.whl", hash = "sha256:4de22f70d1a3fa8c44698c8006a223fe5fb0ee84b76adecf3726cf2003e9145f", size = 1465079, upload-time = "2026-05-04T19:23:41.604Z" },
+]
+
+[[package]]
 name = "coal"
 version = "3.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1890,6 +1905,7 @@ all = [
     { name = "anthropic" },
     { name = "catkin-pkg" },
     { name = "cerebras-cloud-sdk" },
+    { name = "coacd" },
     { name = "ctransformers" },
     { name = "ctransformers", extra = ["cuda"], marker = "sys_platform != 'darwin'" },
     { name = "cupy-cuda12x", marker = "platform_machine == 'x86_64'" },
@@ -2109,6 +2125,7 @@ psql = [
     { name = "psycopg2-binary" },
 ]
 sim = [
+    { name = "coacd" },
     { name = "mujoco" },
     { name = "playground" },
     { name = "pygame" },
@@ -2332,6 +2349,7 @@ requires-dist = [
     { name = "bleak", specifier = ">=3.0.2" },
     { name = "catkin-pkg", marker = "extra == 'misc'" },
     { name = "cerebras-cloud-sdk", marker = "extra == 'misc'" },
+    { name = "coacd", marker = "extra == 'sim'", specifier = ">=1.0.11" },
     { name = "colorlog", specifier = "==6.9.0" },
     { name = "cryptography", specifier = ">=46.0.5" },
     { name = "ctransformers", marker = "extra == 'cpu'", specifier = "==0.2.27" },
