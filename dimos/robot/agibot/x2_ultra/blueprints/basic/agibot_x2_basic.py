@@ -26,9 +26,11 @@ agibot_x2_basic = (
         agibot_x2_primitive,
         X2Connection.blueprint(),
     )
-    .remappings([
-        (WebsocketVisModule, "tele_cmd_vel", "cmd_vel"),
-    ])
+    .remappings(
+        [
+            (WebsocketVisModule, "tele_cmd_vel", "cmd_vel"),
+        ]
+    )
     .global_config(n_workers=4, robot_model="agibot_x2_ultra")
 )
 

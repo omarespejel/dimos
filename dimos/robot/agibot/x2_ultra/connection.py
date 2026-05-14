@@ -33,7 +33,7 @@ from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.Imu import Imu
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
-from dimos.spec.perception import Camera, DepthCamera, IMU, Lidar, Pointcloud
+from dimos.spec.perception import IMU, Camera, Lidar, Pointcloud
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
@@ -102,8 +102,10 @@ def _clamp_velocity(value: float, min_mag: float, max_mag: float) -> float:
     """Apply SDK dead zone: zero if near zero, clamp to [min, max] magnitude otherwise."""
     if abs(value) < 0.005:
         return 0.0
-    return float(np.clip(value, -max_mag, max_mag)) if abs(value) >= min_mag else (
-        min_mag * np.sign(value)
+    return (
+        float(np.clip(value, -max_mag, max_mag))
+        if abs(value) >= min_mag
+        else (min_mag * np.sign(value))
     )
 
 
@@ -164,9 +166,9 @@ def _ros_pointcloud2_to_dimos(msg: Any) -> PointCloud2:
 
     # Interpret entire buffer as float32 then stride-index each field
     raw_f32 = np.frombuffer(bytes(msg.data), dtype=np.float32)
-    xs = raw_f32[x_off // 4::step_f32][:n_points]
-    ys = raw_f32[y_off // 4::step_f32][:n_points]
-    zs = raw_f32[z_off // 4::step_f32][:n_points]
+    xs = raw_f32[x_off // 4 :: step_f32][:n_points]
+    ys = raw_f32[y_off // 4 :: step_f32][:n_points]
+    zs = raw_f32[z_off // 4 :: step_f32][:n_points]
 
     pts = np.column_stack([xs, ys, zs]).astype(np.float64)
     mask = np.isfinite(pts).all(axis=1)
@@ -273,8 +275,10 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
 
     def _start_ros(self) -> None:
         try:
-            import rclpy
             import os
+
+            import rclpy
+
             os.environ.setdefault("ROS_DOMAIN_ID", str(self.config.ros_domain_id))
             if not rclpy.ok():
                 rclpy.init()
@@ -282,8 +286,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
             logger.error("X2Connection: failed to init rclpy: %s", e)
             raise
 
-        from rclpy.node import Node
-        from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+        from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 
         sensor_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -326,6 +329,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         )
 
         from rclpy.qos import QoSDurabilityPolicy
+
         cam_info_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -339,7 +343,6 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
             cam_info_qos,
         )
 
-        from rclpy.qos import qos_profile_system_default
         VelMsg = self._import_msg("aimdk_msgs.msg", "McLocomotionVelocity")
         self._vel_publisher = node.create_publisher(VelMsg, _TOPIC_VELOCITY, 10)
 
@@ -353,6 +356,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
 
     def _ros_spin(self) -> None:
         import rclpy
+
         try:
             rclpy.spin(self._ros_node)
         except Exception as e:
@@ -362,6 +366,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         if self._ros_node is not None:
             try:
                 import rclpy
+
                 self._ros_node.destroy_node()
                 if rclpy.ok():
                     rclpy.shutdown()
@@ -389,7 +394,9 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         start = time.time()
         while not client.service_is_ready():
             if time.time() - start > svc_timeout:
-                logger.error("X2Connection: input source service not available after %.0fs", svc_timeout)
+                logger.error(
+                    "X2Connection: input source service not available after %.0fs", svc_timeout
+                )
                 return
             logger.info("X2Connection: waiting for input source service...")
             time.sleep(1.0)
@@ -485,9 +492,8 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         """Send a zero-velocity command to stop the robot."""
         from dimos.msgs.geometry_msgs.Twist import Twist as DimTwist
         from dimos.msgs.geometry_msgs.Vector3 import Vector3 as DimVec3
-        return self.move(
-            DimTwist(linear=DimVec3(0.0, 0.0, 0.0), angular=DimVec3(0.0, 0.0, 0.0))
-        )
+
+        return self.move(DimTwist(linear=DimVec3(0.0, 0.0, 0.0), angular=DimVec3(0.0, 0.0, 0.0)))
 
     @skill
     def observe(self) -> Image | None:
@@ -503,4 +509,5 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
     @staticmethod
     def _import_msg(module: str, cls: str) -> Any:
         import importlib
+
         return getattr(importlib.import_module(module), cls)
