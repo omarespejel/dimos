@@ -34,7 +34,7 @@ from typing import Any
 
 import mujoco
 import numpy as np
-import open3d as o3d
+import open3d as o3d  # type: ignore[import-untyped]
 from pydantic import Field
 import reactivex as rx
 from reactivex.disposable import Disposable

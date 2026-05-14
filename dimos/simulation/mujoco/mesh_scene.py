@@ -101,7 +101,7 @@ def _color_from_displaycolor(
     isn't authored with a value (Sketchfab USDZ exports typically declare
     the primvar but leave it empty — colors live on the bound material).
     """
-    from pxr import UsdGeom  # type: ignore[import-untyped]
+    from pxr import UsdGeom  # type: ignore[import-not-found, import-untyped]
 
     pv = UsdGeom.PrimvarsAPI(mesh.GetPrim()).GetPrimvar("displayColor")
     if not pv or not pv.HasValue():
@@ -144,7 +144,7 @@ def _color_from_material(
     Results are cached per material path so we don't re-walk the shader graph
     for every prim that shares a material.
     """
-    from pxr import UsdShade  # type: ignore[import-untyped]
+    from pxr import UsdShade  # type: ignore[import-not-found, import-untyped]
 
     mat_api = UsdShade.MaterialBindingAPI(prim)
     bound = mat_api.ComputeBoundMaterial()[0]
@@ -161,7 +161,7 @@ def _color_from_material(
 
 def _resolve_diffuse_color(material: Any) -> np.ndarray | None:
     """Pull a literal ``diffuseColor`` out of a UsdShade material's surface shader."""
-    from pxr import UsdShade  # type: ignore[import-untyped]
+    from pxr import UsdShade  # type: ignore[import-not-found, import-untyped]
 
     surface = material.ComputeSurfaceSource("")[0]
     if not surface:
@@ -193,7 +193,7 @@ def _load_usd_mesh(path: Path) -> o3d.geometry.TriangleMesh:
     exports without having to chase materials/textures.
     """
     try:
-        from pxr import Usd, UsdGeom  # type: ignore[import-untyped]
+        from pxr import Usd, UsdGeom  # type: ignore[import-not-found, import-untyped]
     except ImportError as e:
         raise ImportError("loading .usdz/.usd requires usd-core: `uv pip install usd-core`") from e
 
@@ -487,7 +487,7 @@ def load_scene_prims(
         ]
 
     try:
-        from pxr import Usd, UsdGeom  # type: ignore[import-untyped]
+        from pxr import Usd, UsdGeom  # type: ignore[import-not-found, import-untyped]
     except ImportError as e:
         raise ImportError("loading .usdz/.usd requires usd-core: `uv pip install usd-core`") from e
 
