@@ -69,7 +69,7 @@ class AnafiConnectionModule(Module[AnafiConnectionConfig], Camera):
 
     cmd_vel: In[Twist]
     odom: Out[PoseStamped]
-    video: Out[Image]
+    color_image: Out[Image]
     camera_info: Out[CameraInfo]
     telemetry: Out[Any]
 
@@ -104,7 +104,7 @@ class AnafiConnectionModule(Module[AnafiConnectionConfig], Camera):
             return
 
         self.register_disposable(self.connection.odom_stream().subscribe(self.odom.publish))
-        self.register_disposable(self.connection.video_stream().subscribe(self._on_video))
+        self.register_disposable(self.connection.video_stream().subscribe(self._on_color_image))
         self.register_disposable(self.connection.telemetry_stream().subscribe(self._on_telemetry))
         self.register_disposable(Disposable(self.cmd_vel.subscribe(self.move)))
 
@@ -182,9 +182,9 @@ class AnafiConnectionModule(Module[AnafiConnectionConfig], Camera):
         """Return the most recent raw telemetry batch from pyparrot."""
         return self._latest_telemetry
 
-    def _on_video(self, frame: Image) -> None:
+    def _on_color_image(self, frame: Image) -> None:
         self._latest_video_frame = frame
-        self.video.publish(frame)
+        self.color_image.publish(frame)
         self.camera_info.publish(self._camera_info.with_ts(frame.ts))
 
     def _on_telemetry(self, t: dict[str, Any]) -> None:
