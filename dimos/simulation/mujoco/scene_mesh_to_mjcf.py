@@ -141,7 +141,7 @@ def bake_scene_mjcf(
     cache_dir = root / cache_key
     wrapper_path = cache_dir / "wrapper.xml"
 
-    if _cache_hit(wrapper_path, cache_dir):
+    if _cache_hit(wrapper_path):
         logger.info(f"bake_scene_mjcf: cache hit at {cache_dir}")
         return wrapper_path
 
@@ -201,8 +201,8 @@ def _cache_key(
     return h.hexdigest()[:_CACHE_KEY_LEN]
 
 
-def _cache_hit(wrapper_path: Path, cache_dir: Path) -> bool:
-    return wrapper_path.exists() and any(cache_dir.glob("*.obj"))
+def _cache_hit(wrapper_path: Path) -> bool:
+    return wrapper_path.exists()
 
 
 def _bake_collision_hulls(

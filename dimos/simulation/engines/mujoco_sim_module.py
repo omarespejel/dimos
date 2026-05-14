@@ -254,8 +254,9 @@ class MujocoSimModule(
             )
 
         lidar_scene_option = mujoco.MjvOption()
+        geomgroup = lidar_scene_option.geomgroup  # type: ignore[attr-defined]
         for group_id, enabled in enumerate(_LIDAR_GEOM_GROUPS):
-            lidar_scene_option.geomgroup[group_id] = enabled
+            geomgroup[group_id] = enabled
         for lidar_name in self.config.lidar_camera_names:
             if lidar_name == self.config.camera_name and self._primary_camera_needed:
                 continue

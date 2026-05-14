@@ -92,24 +92,13 @@ _scene_mesh_scale = _env_float(
     "DIMOS_SCENE_MESH_SCALE",
     0.05 if _scene_mesh_path_override else 2.0,
 )
-_scene_mesh_y_up = (
-    os.environ.get(
-        "DIMOS_SCENE_MESH_Y_UP",
-        "1" if _scene_mesh_path_override else "0",
-    )
-    != "0"
-)
+_scene_mesh_y_up = _env_bool("DIMOS_SCENE_MESH_Y_UP", bool(_scene_mesh_path_override))
 _scene_mesh_rotation = _env_xyz("DIMOS_SCENE_MESH_ROTATION_ZYX_DEG", (0.0, 0.0, 0.0))
 _scene_mesh_translation = _env_xyz("DIMOS_SCENE_MESH_TRANSLATION", (0.0, 0.0, 0.0))
-_scene_mesh_collision = os.environ.get("DIMOS_SCENE_MESH_COLLISION", "1") not in {"", "0"}
+_scene_mesh_collision = _env_bool("DIMOS_SCENE_MESH_COLLISION", True)
 _scene_mesh_visual = _env_bool("DIMOS_SCENE_MESH_VISUAL", False)
-_enable_depth_cloud = os.environ.get("DIMOS_ENABLE_DEPTH_CLOUD", "0").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_disable_lidar = os.environ.get("DIMOS_DISABLE_LIDAR", "0") not in {"", "0"}
+_enable_depth_cloud = _env_bool("DIMOS_ENABLE_DEPTH_CLOUD", False)
+_disable_lidar = _env_bool("DIMOS_DISABLE_LIDAR", False)
 
 _sim_mjcf_path = _mjcf_path
 if _scene_mesh_path and _scene_mesh_collision:
@@ -156,8 +145,7 @@ g1_groot_wbc = autoconnect(
         lidar_camera_width=int(os.environ.get("DIMOS_LIDAR_CAMERA_WIDTH", "640")),
         lidar_camera_height=int(os.environ.get("DIMOS_LIDAR_CAMERA_HEIGHT", "360")),
         lidar_voxel_size=_env_float("DIMOS_LIDAR_VOXEL_SIZE", 0.05),
-        enable_kinematic_base_control=os.environ.get("DIMOS_KINEMATIC_BASE_CONTROL", "1")
-        not in {"", "0"},
+        enable_kinematic_base_control=_env_bool("DIMOS_KINEMATIC_BASE_CONTROL", True),
         enable_kinematic_joint_hold=_env_bool("DIMOS_MUJOCO_KINEMATIC_JOINT_HOLD", True),
     ),
     VoxelGridMapper.blueprint(

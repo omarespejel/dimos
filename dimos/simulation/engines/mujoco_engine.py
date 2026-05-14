@@ -107,8 +107,9 @@ class MujocoEngine(SimulationEngine):
         self._control_frequency = 1.0 / timestep if timestep > 0.0 else 100.0
         self._root_free_qpos_adr: int | None = None
         self._root_free_qvel_adr: int | None = None
+        free_joint = int(mujoco.mjtJoint.mjJNT_FREE)  # type: ignore[attr-defined]
         for joint_id in range(self._model.njnt):
-            if self._model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
+            if self._model.jnt_type[joint_id] == free_joint:
                 self._root_free_qpos_adr = int(self._model.jnt_qposadr[joint_id])
                 self._root_free_qvel_adr = int(self._model.jnt_dofadr[joint_id])
                 break
