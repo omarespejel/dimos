@@ -88,6 +88,10 @@ class RtabMapConfig(NativeModuleConfig):
     # Input scans arrive in the world (map) frame; the binary undoes the
     # current odom transform so rtabmap sees body-frame scans.
     unregister_input: bool = True
+    # Drop scans whose timestamp differs from the latest odometry's by more
+    # than this many seconds — guards against rtabmap getting stale/fresh
+    # mismatched pairs.
+    scan_odom_max_dt: float = 0.2
 
 
 class RtabMap(NativeModule):

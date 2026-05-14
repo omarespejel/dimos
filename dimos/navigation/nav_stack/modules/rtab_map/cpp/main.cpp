@@ -117,6 +117,8 @@ public:
         const lcm::ReceiveBuffer*,
         const std::string&,
         const sensor_msgs::PointCloud2* msg) {
+        const double scan_ts = msg->header.stamp.sec + msg->header.stamp.nsec / 1e9;
+
         rtabmap::Transform odom_pose;
         double odom_ts = 0.0;
         {
@@ -126,11 +128,21 @@ public:
             odom_ts = latest_odom_ts_;
         }
 
+        // Drop scans that are temporally far from the latest odom — rtabmap's
+        // ICP is sensitive to scan/odom misalignment and pairing a stale odom
+        // with a fresh scan produces silently-bad corrections.
+        if (scan_ts > 0.0 && std::abs(scan_ts - odom_ts) > scan_odom_max_dt_) {
+            return;
+        }
+
         ScanFrame frame;
         frame.cloud_body = CloudType::Ptr(new CloudType);
         smartnav::to_pcl(*msg, *frame.cloud_body);
         frame.odom_pose = odom_pose;
-        frame.timestamp = odom_ts;
+        // Use the scan's own timestamp — downstream consumers tag
+        // corrected_odometry with this, and the scan stamp is what they
+        // actually want to align against.
+        frame.timestamp = scan_ts > 0.0 ? scan_ts : odom_ts;
 
         if (unregister_input_) {
             // Input is world-frame; convert to body for rtabmap (it expects
@@ -155,6 +167,7 @@ public:
     }
 
     bool unregister_input_ = true;
+    double scan_odom_max_dt_ = 0.2;  // seconds
 
 private:
     std::mutex buffer_mutex_;
@@ -269,6 +282,7 @@ int main(int argc, char** argv) {
 
     Handlers handlers;
     handlers.unregister_input_ = mod.arg_bool("unregister_input", true);
+    handlers.scan_odom_max_dt_ = std::stod(mod.arg("scan_odom_max_dt", "0.2"));
     lcm.subscribe(odom_topic, &Handlers::on_odometry, &handlers);
     lcm.subscribe(scan_topic, &Handlers::on_registered_scan, &handlers);
 
