@@ -36,13 +36,13 @@ using SectorKey = Eigen::VectorXf;    // length n_sectors
 
 // Build the polar-max-z descriptor for a body-frame scan. Points
 // outside ``max_range_m`` or with negative ring index are ignored.
-Descriptor make_descriptor(const CloudType& cloud, const Config& cfg);
+Descriptor make_descriptor(const CloudType& cloud, const Config& config);
 
 // Mean per row — the coarse feature used for kd-tree retrieval.
-RingKey make_ring_key(const Descriptor& d);
+RingKey make_ring_key(const Descriptor& descriptor);
 
 // Mean per column — only used for the optional sector-key alignment.
-SectorKey make_sector_key(const Descriptor& d);
+SectorKey make_sector_key(const Descriptor& descriptor);
 
 // Cosine distance between two descriptors after column-shifting
 // ``candidate`` by ``shift`` columns. 0 = identical, 2 = opposite.

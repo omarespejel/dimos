@@ -82,13 +82,13 @@ def _validate_path_msg(msg: NavPath, event_index: int) -> tuple[float, float]:
 
     max_t = 0.0
     max_q_drift = 0.0
-    for i, ps in enumerate(msg.poses):
-        tx, ty, tz = ps.position.x, ps.position.y, ps.position.z
+    for i, pose in enumerate(msg.poses):
+        tx, ty, tz = pose.position.x, pose.position.y, pose.position.z
         qx, qy, qz, qw = (
-            ps.orientation.x,
-            ps.orientation.y,
-            ps.orientation.z,
-            ps.orientation.w,
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
         )
         for value, name in [(tx, "tx"), (ty, "ty"), (tz, "tz")]:
             assert math.isfinite(value), f"event {event_index} pose {i}: {name}={value} not finite"
@@ -126,7 +126,6 @@ class TestPGOLoopClosure:
 
         lcm_instance = lcmlib.LCM()
 
-        # Log each event the moment it arrives.
         received_events: list[NavPath] = []
         events_lock = threading.Lock()
 

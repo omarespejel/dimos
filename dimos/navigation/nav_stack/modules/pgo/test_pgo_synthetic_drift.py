@@ -130,8 +130,11 @@ def _make_pose(x: float, y: float, z: float, yaw: float) -> Pose:
 
 
 def _yaw_rotation(yaw: float) -> np.ndarray:
-    c, s = math.cos(yaw), math.sin(yaw)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+    return np.array(
+        [[cos_yaw, -sin_yaw, 0.0], [sin_yaw, cos_yaw, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
 
 
 def _world_to_body(points_world: np.ndarray, position: np.ndarray, yaw: float) -> np.ndarray:

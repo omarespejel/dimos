@@ -121,18 +121,17 @@ static nav_msgs::Path build_graph_nodes(const std::vector<KeyPoseWithCloud>& key
     msg.header = dimos::make_header(frame_id, ts);
     msg.poses_length = static_cast<int32_t>(key_poses.size());
     msg.poses.reserve(key_poses.size());
-    for (const auto& kp : key_poses) {
-        geometry_msgs::PoseStamped ps;
-        ps.header = dimos::make_header(frame_id, ts);
-        ps.pose.position.x = kp.t_global.x();
-        ps.pose.position.y = kp.t_global.y();
-        ps.pose.position.z = kp.t_global.z();
-        ps.pose.orientation.x = 0.0;
-        ps.pose.orientation.y = 0.0;
-        ps.pose.orientation.z = 0.0;
-        // node_type 1 = odom/robot (renders green in rerun)
-        ps.pose.orientation.w = 1.0;
-        msg.poses.push_back(ps);
+    for (const auto& keyframe : key_poses) {
+        geometry_msgs::PoseStamped pose_stamped;
+        pose_stamped.header = dimos::make_header(frame_id, ts);
+        pose_stamped.pose.position.x = keyframe.t_global.x();
+        pose_stamped.pose.position.y = keyframe.t_global.y();
+        pose_stamped.pose.position.z = keyframe.t_global.z();
+        pose_stamped.pose.orientation.x = 0.0;
+        pose_stamped.pose.orientation.y = 0.0;
+        pose_stamped.pose.orientation.z = 0.0;
+        pose_stamped.pose.orientation.w = 1.0;
+        msg.poses.push_back(pose_stamped);
     }
     return msg;
 }
@@ -140,32 +139,32 @@ static nav_msgs::Path build_graph_nodes(const std::vector<KeyPoseWithCloud>& key
 static void append_segment(nav_msgs::Path& msg,
                             const std::string& frame_id,
                             double ts,
-                            const V3D& a,
-                            const V3D& b,
+                            const V3D& start,
+                            const V3D& end,
                             double traversability) {
-    geometry_msgs::PoseStamped p1;
-    p1.header = dimos::make_header(frame_id, ts);
-    p1.pose.position.x = a.x();
-    p1.pose.position.y = a.y();
-    p1.pose.position.z = a.z();
-    p1.pose.orientation.x = 0.0;
-    p1.pose.orientation.y = 0.0;
-    p1.pose.orientation.z = 0.0;
+    geometry_msgs::PoseStamped start_pose;
+    start_pose.header = dimos::make_header(frame_id, ts);
+    start_pose.pose.position.x = start.x();
+    start_pose.pose.position.y = start.y();
+    start_pose.pose.position.z = start.z();
+    start_pose.pose.orientation.x = 0.0;
+    start_pose.pose.orientation.y = 0.0;
+    start_pose.pose.orientation.z = 0.0;
     // traversability is encoded on the first pose of each pair
-    p1.pose.orientation.w = traversability;
+    start_pose.pose.orientation.w = traversability;
 
-    geometry_msgs::PoseStamped p2;
-    p2.header = dimos::make_header(frame_id, ts);
-    p2.pose.position.x = b.x();
-    p2.pose.position.y = b.y();
-    p2.pose.position.z = b.z();
-    p2.pose.orientation.x = 0.0;
-    p2.pose.orientation.y = 0.0;
-    p2.pose.orientation.z = 0.0;
-    p2.pose.orientation.w = traversability;
+    geometry_msgs::PoseStamped end_pose;
+    end_pose.header = dimos::make_header(frame_id, ts);
+    end_pose.pose.position.x = end.x();
+    end_pose.pose.position.y = end.y();
+    end_pose.pose.position.z = end.z();
+    end_pose.pose.orientation.x = 0.0;
+    end_pose.pose.orientation.y = 0.0;
+    end_pose.pose.orientation.z = 0.0;
+    end_pose.pose.orientation.w = traversability;
 
-    msg.poses.push_back(p1);
-    msg.poses.push_back(p2);
+    msg.poses.push_back(start_pose);
+    msg.poses.push_back(end_pose);
 }
 
 // Build a Path-encoded loop-closure-deltas message — one PoseStamped per
@@ -179,9 +178,9 @@ static nav_msgs::Path build_loop_closure_deltas(
     const std::string& frame_id) {
     nav_msgs::Path msg;
     msg.header = dimos::make_header(frame_id, ts);
-    size_t n = std::min(pre_poses.size(), post_poses.size());
-    msg.poses.reserve(n);
-    for (size_t i = 0; i < n; i++) {
+    size_t count = std::min(pre_poses.size(), post_poses.size());
+    msg.poses.reserve(count);
+    for (size_t i = 0; i < count; i++) {
         const M3D& pre_r = pre_poses[i].first;
         const V3D& pre_t = pre_poses[i].second;
         const M3D& post_r = post_poses[i].r_global;
@@ -191,17 +190,17 @@ static nav_msgs::Path build_loop_closure_deltas(
         M3D r_delta = post_r * pre_r.transpose();
         V3D t_delta = post_t - r_delta * pre_t;
 
-        geometry_msgs::PoseStamped ps;
-        ps.header = dimos::make_header(frame_id, ts);
-        ps.pose.position.x = t_delta.x();
-        ps.pose.position.y = t_delta.y();
-        ps.pose.position.z = t_delta.z();
+        geometry_msgs::PoseStamped pose_stamped;
+        pose_stamped.header = dimos::make_header(frame_id, ts);
+        pose_stamped.pose.position.x = t_delta.x();
+        pose_stamped.pose.position.y = t_delta.y();
+        pose_stamped.pose.position.z = t_delta.z();
         Eigen::Quaterniond q(r_delta);
-        ps.pose.orientation.x = q.x();
-        ps.pose.orientation.y = q.y();
-        ps.pose.orientation.z = q.z();
-        ps.pose.orientation.w = q.w();
-        msg.poses.push_back(ps);
+        pose_stamped.pose.orientation.x = q.x();
+        pose_stamped.pose.orientation.y = q.y();
+        pose_stamped.pose.orientation.z = q.z();
+        pose_stamped.pose.orientation.w = q.w();
+        msg.poses.push_back(pose_stamped);
     }
     msg.poses_length = static_cast<int32_t>(msg.poses.size());
     return msg;
@@ -385,9 +384,9 @@ int main(int argc, char** argv)
         pgo.smoothAndUpdate();
 
         if (had_loop) {
-            nav_msgs::Path lc_msg = build_loop_closure_deltas(
+            nav_msgs::Path loop_closure_msg = build_loop_closure_deltas(
                 pre_poses, pgo.keyPoses(), cur_time, world_frame);
-            lcm.publish(loop_closure_topic, &lc_msg);
+            lcm.publish(loop_closure_topic, &loop_closure_msg);
             fprintf(stderr,
                     "PGO: loop closure event published — %zu keyframe deltas\n",
                     pre_poses.size());

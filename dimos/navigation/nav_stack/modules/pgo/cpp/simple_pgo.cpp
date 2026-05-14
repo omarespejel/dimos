@@ -71,10 +71,10 @@ bool SimplePGO::addKeyPose(const CloudWithPose &cloud_with_pose)
 
     // Cache the Scan Context descriptor + ring-key for this keyframe.
     if (cloud_with_pose.cloud) {
-        scan_context::Descriptor desc =
+        scan_context::Descriptor descriptor =
             scan_context::make_descriptor(*cloud_with_pose.cloud, m_sc_config);
-        m_sc_ring_keys.push_back(scan_context::make_ring_key(desc));
-        m_sc_descriptors.push_back(std::move(desc));
+        m_sc_ring_keys.push_back(scan_context::make_ring_key(descriptor));
+        m_sc_descriptors.push_back(std::move(descriptor));
     } else {
         m_sc_descriptors.emplace_back();
         m_sc_ring_keys.emplace_back();
@@ -171,9 +171,10 @@ int SimplePGO::searchByScanContext(int& out_sector_shift) const
     }
     if (ranked.empty()) return -1;
 
-    const int k = std::min(static_cast<int>(ranked.size()), m_sc_config.candidate_top_k);
+    const int top_k_count = std::min(
+        static_cast<int>(ranked.size()), m_sc_config.candidate_top_k);
     std::partial_sort(
-        ranked.begin(), ranked.begin() + k, ranked.end(),
+        ranked.begin(), ranked.begin() + top_k_count, ranked.end(),
         [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
             return a.first < b.first;
         });
@@ -181,11 +182,12 @@ int SimplePGO::searchByScanContext(int& out_sector_shift) const
     float best_dist = static_cast<float>(m_sc_config.match_threshold);
     int best_idx = -1;
     int best_shift = 0;
-    for (int rank = 0; rank < k; rank++) {
+    for (int rank = 0; rank < top_k_count; rank++) {
         const int idx = ranked[rank].second;
-        const auto [d, shift] = scan_context::best_distance(query, m_sc_descriptors[idx]);
-        if (d < best_dist) {
-            best_dist = d;
+        const auto [distance, shift] = scan_context::best_distance(
+            query, m_sc_descriptors[idx]);
+        if (distance < best_dist) {
+            best_dist = distance;
             best_idx = idx;
             best_shift = shift;
         }
