@@ -304,12 +304,15 @@ int main(int argc, char** argv) {
     const int timer_period_ms = 30;
 
     while (g_running.load()) {
-        // Drain LCM.
+        // Block waiting for at least one LCM event (or shutdown). When a scan
+        // arrives the Handlers callback pushes it onto the buffer, and
+        // handleTimeout returns >0. timer_period_ms caps the wait so we
+        // still notice g_running going false.
+        lcm.handleTimeout(timer_period_ms);
         while (lcm.handleTimeout(0) > 0) {}
 
         ScanFrame frame;
         if (!handlers.try_pop(frame)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(timer_period_ms));
             continue;
         }
 
@@ -329,7 +332,6 @@ int main(int argc, char** argv) {
         bool processed = rtab.process(data, frame.odom_pose);
         if (!processed) {
             // Frame rejected by rtabmap (e.g. too close to last keyframe).
-            std::this_thread::sleep_for(std::chrono::milliseconds(timer_period_ms));
             continue;
         }
 
@@ -471,8 +473,6 @@ int main(int argc, char** argv) {
                 smartnav::from_pcl(*global_cloud, world_frame, frame.timestamp);
             lcm.publish(global_map_topic, &gmsg);
         }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(timer_period_ms));
     }
 
     fprintf(stderr, "RtabMap native module shutting down\n");
