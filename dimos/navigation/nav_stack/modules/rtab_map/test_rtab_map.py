@@ -134,7 +134,7 @@ def test_config_accepts_overrides() -> None:
 
 def test_invalid_kwarg_rejected() -> None:
     """Unknown config keys raise — guards against silent typos."""
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         RtabMapConfig(nonexistent_knob=True)  # type: ignore[call-arg]
 
 
@@ -158,7 +158,7 @@ def test_create_nav_stack_with_rtab_swaps_slam() -> None:
 
 def test_create_nav_stack_rejects_invalid_slam_choice() -> None:
     """Unknown slam_choice values must error rather than silently fall through."""
-    with pytest.raises(Exception, match="invalid slam_choice"):
+    with pytest.raises(ValueError, match="invalid slam_choice"):
         create_nav_stack(slam_choice="not_a_slam")  # type: ignore[arg-type]
 
 

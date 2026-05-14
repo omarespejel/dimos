@@ -96,7 +96,7 @@ def create_nav_stack(
     elif slam_choice == "rtab":
         slam_module = RtabMap.blueprint(**(rtab_map or {}))
     else:
-        raise Exception(f"invalid slam_choice: {slam_choice}")
+        raise ValueError(f"invalid slam_choice: {slam_choice}")
 
     modules: list[Blueprint] = [
         TerrainAnalysis.blueprint(
