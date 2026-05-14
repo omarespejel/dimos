@@ -51,12 +51,12 @@ class RtabMapConfig(NativeModuleConfig):
     executable: str = "result/bin/rtab_map"
     build_command: str | None = "nix build .#default --no-write-lock-file"
 
-    # --- Frame names ---
+    # Frame names.
     world_frame: str = FRAME_MAP
     local_frame: str = FRAME_ODOM
     body_frame: str = FRAME_BODY
 
-    # --- OctoMap / Grid defaults (the six required by the locked spec) ---
+    # OctoMap / Grid defaults (the six required by the locked spec).
     grid_3d: bool = True
     grid_ray_tracing: bool = True
     grid_from_depth: bool = False
@@ -65,12 +65,12 @@ class RtabMapConfig(NativeModuleConfig):
     grid_ground_is_obstacle: bool = False
     grid_flat_obstacle_detected: bool = True
 
-    # --- Publishing cadence ---
+    # Publishing cadence.
     octomap_publish_period: float = 0.5
     global_map_publish_period: float = 1.0
     global_map_voxel_size: float = 0.15
 
-    # --- Input handling ---
+    # Input handling.
     # Input scans arrive in the world (map) frame; the binary undoes the
     # current odom transform so rtabmap sees body-frame scans.
     unregister_input: bool = True

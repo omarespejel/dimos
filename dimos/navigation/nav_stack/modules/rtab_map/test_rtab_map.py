@@ -48,11 +48,6 @@ def module() -> Generator[RtabMap, None, None]:
         instance._close_module()
 
 
-# ---------------------------------------------------------------------------
-# Required defaults (locked by the task definition)
-# ---------------------------------------------------------------------------
-
-
 def test_defaults_match_spec() -> None:
     """The six OctoMap-relevant defaults required by the locked definition."""
     config = RtabMapConfig()
@@ -71,11 +66,6 @@ def test_native_module_executable_set() -> None:
     assert config.executable.endswith("rtab_map")
     assert config.build_command is not None
     assert "nix build" in config.build_command
-
-
-# ---------------------------------------------------------------------------
-# Port declarations (the SLAM-swap contract)
-# ---------------------------------------------------------------------------
 
 
 def test_required_input_ports_declared(module: RtabMap) -> None:
@@ -132,11 +122,6 @@ def test_rtab_tf_is_odometry(module: RtabMap) -> None:
     assert module.outputs["rtab_tf"].type is Odometry
 
 
-# ---------------------------------------------------------------------------
-# Config validation
-# ---------------------------------------------------------------------------
-
-
 def test_config_accepts_overrides() -> None:
     """Per-field overrides work as expected (mypy-compatible kwargs path)."""
     config = RtabMapConfig(grid_cell_size=0.25, grid_max_ground_angle=30.0)
@@ -151,11 +136,6 @@ def test_invalid_kwarg_rejected() -> None:
     """Unknown config keys raise — guards against silent typos."""
     with pytest.raises(Exception):
         RtabMapConfig(nonexistent_knob=True)  # type: ignore[call-arg]
-
-
-# ---------------------------------------------------------------------------
-# Blueprint wiring (the slam_choice swap)
-# ---------------------------------------------------------------------------
 
 
 def test_create_nav_stack_default_uses_pgo() -> None:
@@ -192,11 +172,6 @@ def test_rtab_map_config_propagation_via_create_nav_stack() -> None:
     assert rtab_atom is not None
     assert rtab_atom.kwargs["grid_cell_size"] == pytest.approx(0.2)
     assert rtab_atom.kwargs["grid_max_ground_angle"] == pytest.approx(30.0)
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 
 
 def _module_classes(blueprint: Blueprint) -> set[type[Module]]:
