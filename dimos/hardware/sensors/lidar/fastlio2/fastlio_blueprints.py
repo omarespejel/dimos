@@ -94,7 +94,7 @@ class FastlioReplay(MemoryModule):
 
 
 def _convert_global_map(msg: PointCloud2):
-    return msg.to_rerun(mode="boxes", voxel_size=voxel_size)
+    return msg.to_rerun(voxel_size=voxel_size)
 
 
 mid360_fastlio = autoconnect(
