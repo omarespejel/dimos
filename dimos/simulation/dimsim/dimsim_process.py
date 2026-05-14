@@ -19,7 +19,6 @@ import threading
 import time
 from typing import IO
 
-from dimos.constants import STATE_DIR
 from dimos.core.global_config import GlobalConfig
 from dimos.simulation.dimsim.deno_utils import ensure_deno, ensure_playwright_chromium
 from dimos.utils.logging_config import setup_logger
@@ -28,8 +27,7 @@ logger = setup_logger()
 
 _VIDEO_RATE = 50
 _LIDAR_RATE = 1000
-_DIMSIM_REPO_URL = "https://github.com/paul-nechifor/DimSim.git"
-_DIMSIM_REPO_BRANCH = "run-from-repo"
+_DIMSIM_DIR = Path(__file__).resolve().parents[3] / "misc" / "DimSim"
 
 
 class DimSimProcess:
@@ -39,8 +37,7 @@ class DimSimProcess:
 
     def start(self) -> None:
         deno_path = ensure_deno()
-        repo_dir = _ensure_repo()
-        base_cmd = _deno_cmd(deno_path, repo_dir)
+        base_cmd = _deno_cmd(deno_path, _DIMSIM_DIR)
 
         scene = self.global_config.dimsim_scene
         port = self.global_config.dimsim_port
@@ -124,28 +121,6 @@ def _kill_port_holder(port: int) -> None:
             time.sleep(0.5)
     except Exception as e:
         logger.warning(f"Failed to check/kill port {port}: {e}")
-
-
-def _ensure_repo() -> Path:
-    repo_dir = STATE_DIR / "dimsim_repo"
-    if (repo_dir / ".git").exists():
-        return repo_dir
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Cloning DimSim into {repo_dir}")
-    subprocess.run(
-        [
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            _DIMSIM_REPO_BRANCH,
-            _DIMSIM_REPO_URL,
-            str(repo_dir),
-        ],
-        check=True,
-    )
-    return repo_dir
 
 
 def _deno_cmd(deno_path: str, repo_dir: Path) -> list[str]:
