@@ -24,9 +24,10 @@ find_package(OpenCV REQUIRED)
 # sensor SDKs even when we don't use any of them, so it can't be used
 # directly with a headless build. Resolve the headers and the core lib
 # manually instead.
+set(RTABMAP_EXPECTED_VERSION "0.23")
 find_path(RTABMAP_INCLUDE_DIR
   NAMES rtabmap/core/Rtabmap.h
-  PATH_SUFFIXES rtabmap-0.23 rtabmap-0.22 rtabmap
+  PATH_SUFFIXES "rtabmap-${RTABMAP_EXPECTED_VERSION}"
   REQUIRED
 )
 find_library(RTABMAP_CORE_LIBRARY
