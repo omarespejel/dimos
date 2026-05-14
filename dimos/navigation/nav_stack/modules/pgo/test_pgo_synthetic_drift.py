@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-import sys
 import threading
 import time
 
@@ -56,6 +55,9 @@ from dimos.navigation.nav_stack.tests.rosbag_fixtures import (
     NativeProcessRunner,
     lcm_handle_loop,
 )
+from dimos.utils.logging_config import setup_logger
+
+logger = setup_logger()
 
 pytestmark = [pytest.mark.slow]
 
@@ -78,11 +80,6 @@ DRIFT_AT_REVISIT_M = 5.0
 LOOP_SEARCH_RADIUS_M = 1.0
 LOOP_TIME_THRESH_S = 5.0
 MIN_LOOP_DETECT_DURATION_S = 1.0
-
-
-def _log(line: str) -> None:
-    print(line, flush=True)
-    sys.stdout.flush()
 
 
 def _make_room_points(half_size: float = 20.0, density: float = 0.15) -> np.ndarray:
@@ -231,7 +228,7 @@ def _run_pgo(use_scan_context: bool) -> int:
         with events_lock:
             idx = len(received_events)
             received_events.append(msg)
-        _log(
+        logger.info(
             f"[synthetic_drift sc={use_scan_context}] event #{idx}: "
             f"N={len(msg.poses)}, ts={msg.ts:.3f}"
         )
@@ -326,9 +323,9 @@ def _run_pgo(use_scan_context: bool) -> int:
         lcm_instance.unsubscribe(sub)
 
         if stderr_data:
-            _log(f"\n--- PGO stderr (sc={use_scan_context}) ---")
-            _log(stderr_data.decode("utf-8", errors="replace"))
-            _log("--- end PGO stderr ---\n")
+            logger.info(f"\n--- PGO stderr (sc={use_scan_context}) ---")
+            logger.info(stderr_data.decode("utf-8", errors="replace"))
+            logger.info("--- end PGO stderr ---\n")
 
     with events_lock:
         return len(received_events)
@@ -339,7 +336,7 @@ class TestPGOSyntheticDrift:
 
     def test_scan_context_catches_drifted_loop(self) -> None:
         sc_events = _run_pgo(use_scan_context=True)
-        _log(f"[synthetic_drift] scan_context=true  → {sc_events} loop events")
+        logger.info(f"[synthetic_drift] scan_context=true  → {sc_events} loop events")
         assert sc_events >= 1, (
             f"Scan Context should catch the loop at the revisit point "
             f"(drift={DRIFT_AT_REVISIT_M}m). Got {sc_events} events."
@@ -347,7 +344,7 @@ class TestPGOSyntheticDrift:
 
     def test_position_search_misses_drifted_loop(self) -> None:
         pos_events = _run_pgo(use_scan_context=False)
-        _log(f"[synthetic_drift] scan_context=false → {pos_events} loop events")
+        logger.info(f"[synthetic_drift] scan_context=false → {pos_events} loop events")
         assert pos_events == 0, (
             f"Position-based search shouldn't fire when drift "
             f"({DRIFT_AT_REVISIT_M}m) >> loop_search_radius "

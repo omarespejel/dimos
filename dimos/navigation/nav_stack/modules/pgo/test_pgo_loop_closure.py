@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-import sys
 import threading
 import time
 
@@ -49,6 +48,9 @@ from dimos.navigation.nav_stack.tests.rosbag_fixtures import (
     lcm_handle_loop,
     load_rosbag_window,
 )
+from dimos.utils.logging_config import setup_logger
+
+logger = setup_logger()
 
 pytestmark = [pytest.mark.slow]
 
@@ -68,13 +70,6 @@ _POST_FEED_DRAIN_SEC = 5.0
 
 _QUATERNION_UNIT_TOL = 0.05
 _TRANSLATION_MAX_M = 100.0
-
-
-def _log(line: str) -> None:
-    """Print to stdout *and* flush so the test framework captures it
-    immediately when invoked with ``-s``."""
-    print(line, flush=True)
-    sys.stdout.flush()
 
 
 def _validate_path_msg(msg: NavPath, event_index: int) -> tuple[float, float]:
@@ -149,7 +144,7 @@ class TestPGOLoopClosure:
                 if first
                 else "<empty>"
             )
-            _log(
+            logger.info(
                 f"[pgo_loop_closure] event #{idx} received: "
                 f"poses_length={len(msg.poses)}, frame_id={msg.frame_id!r}, "
                 f"ts={msg.ts:.3f}, {head}"
@@ -239,7 +234,7 @@ class TestPGOLoopClosure:
         with events_lock:
             events = list(received_events)
 
-        _log(f"\n[pgo_loop_closure] total events received: {len(events)}")
+        logger.info(f"\n[pgo_loop_closure] total events received: {len(events)}")
 
         if not events:
             pytest.skip(
@@ -251,7 +246,7 @@ class TestPGOLoopClosure:
 
         for idx, msg in enumerate(events):
             max_t, max_q_drift = _validate_path_msg(msg, idx)
-            _log(
+            logger.info(
                 f"[pgo_loop_closure] event #{idx} VALID: "
                 f"N={len(msg.poses)}, max|t|={max_t:.4f}m, "
                 f"max|q|-1|={max_q_drift:.6f}"

@@ -13,17 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Demo runner: simple cross-wall sim with agentic_debug rerun layout.
+"""Demo runner: simple cross-wall sim with agentic_debug rerun config.
 
-Builds the same blueprint as unitree_g1_nav_sim but flips the rerun
-config to ``agentic_debug=True`` so the new horizontal 3D + top-down
-panes are active. Used to validate the PGO pose-graph publication added
-on jeff/feat/better_pgo by visual inspection (screenshot dimos-viewer
+Builds the same blueprint as unitree_g1_nav_sim but passes
+``agentic_debug=True`` to ``nav_stack_rerun_config`` so nav markers +
+the PGO pose graph render lifted above terrain (``_AGENTIC_DEBUG_LIFT``,
+3m). Used to validate the PGO pose-graph publication added on
+``jeff/feat/better_pgo`` by visual inspection (screenshot dimos-viewer
 mid-run).
 
-Run manually with the Unity sim already started:
+Run manually:
     source .venv/bin/activate
-    uvx dimos-viewer --connect rerun+http://127.0.0.1:9877/proxy &
     uv run python -m dimos.navigation.nav_stack.demo_better_pgo_viz
 """
 
