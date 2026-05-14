@@ -144,16 +144,7 @@ public:
             // Input is world-frame; convert to body for rtabmap (it expects
             // body-frame scans with sensor at origin).
             CloudType::Ptr body(new CloudType);
-            Eigen::Affine3f w_to_b = Eigen::Affine3f::Identity();
-            w_to_b.translation() << frame.odom_pose.x(),
-                                    frame.odom_pose.y(),
-                                    frame.odom_pose.z();
-            Eigen::Matrix3f r;
-            r << frame.odom_pose.r11(), frame.odom_pose.r12(), frame.odom_pose.r13(),
-                 frame.odom_pose.r21(), frame.odom_pose.r22(), frame.odom_pose.r23(),
-                 frame.odom_pose.r31(), frame.odom_pose.r32(), frame.odom_pose.r33();
-            w_to_b.linear() = r;
-            Eigen::Affine3f inv = w_to_b.inverse();
+            Eigen::Affine3f inv(frame.odom_pose.inverse().toEigen4f());
             pcl::transformPointCloud(*frame.cloud_body, *body, inv);
             frame.cloud_body = body;
         }
