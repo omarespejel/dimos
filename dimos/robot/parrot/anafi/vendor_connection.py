@@ -195,15 +195,10 @@ class AnafiConnection:
         if self._anafi is None:
             return
         sensors = self._anafi.sensors
-        logger.info(f"{self.__class__.__name__}: sensor update: {sensors}")
         altitude = float(sensors.sensors_dict.get("AltitudeChanged_altitude", 0.0) or 0.0)
         roll = float(sensors.sensors_dict.get("AttitudeChanged_roll", 0.0) or 0.0)
         pitch = -float(sensors.sensors_dict.get("AttitudeChanged_pitch", 0.0) or 0.0)
         yaw = -float(sensors.sensors_dict.get("AttitudeChanged_yaw", 0.0) or 0.0)
-        logger.info(
-            f"{self.__class__.__name__}: altitude={altitude:.2f} m, "
-            f"roll={math.degrees(roll):.1f} pitch={math.degrees(pitch):.1f} yaw={math.degrees(yaw):.1f} deg"
-        )
         self._odom_subject.on_next(
             PoseStamped(
                 position=Vector3(0.0, 0.0, altitude),
