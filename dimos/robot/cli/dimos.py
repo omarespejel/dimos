@@ -684,7 +684,6 @@ def cameracalibrate(
     camera_name: str = typer.Option("webcam", "--camera-name", help="Camera name in YAML"),
     target_count: int = typer.Option(20, "--target-count", help="Accepted webcam frame count"),
     no_display: bool = typer.Option(False, "--no-display", help="Disable OpenCV preview windows"),
-    debug: bool = typer.Option(False, "--debug", help="Write debug logs to the system temp dir"),
 ) -> None:
     """Calibrate camera intrinsics and write ROS CameraInfo YAML."""
     from dimos.utils.cli.cameracalibrate.cameracalibrate import run_calibration
@@ -705,7 +704,6 @@ def cameracalibrate(
             camera_name=camera_name,
             target_count=target_count,
             no_display=no_display,
-            debug=debug,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc

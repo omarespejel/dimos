@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from hashlib import sha256
 import os
 from pathlib import Path
+import re
 import tempfile
 from unittest.mock import MagicMock
 
@@ -33,19 +33,6 @@ from dimos.utils.cli.cameracalibrate.cameracalibrate import (
     load_frames_from_folder,
     write_camera_info_yaml,
 )
-
-_OPENCV_FIXTURE_DIR = Path(__file__).with_name("fixtures")
-_OPENCV_FIXTURE_SHA256 = {
-    "left01.jpg": "9621899098adffa1440c8264606bb7be535ccfd9ad126ae8e0bd9b0c5a5b8676",
-    "left02.jpg": "052e700bbcc865c112958ec2ea105cb1bce4deca50ac8d6efae13adca9df7a2c",
-    "left03.jpg": "c85b9426c3d8fcf161e1e727356105091009c3fd0b1b1a65bc2da91fea2724d2",
-    "left04.jpg": "b490599dccfbfe5eb56d33363415b02227a9548ab8c9b8e7b05d3580e97266d9",
-    "left05.jpg": "40bab8934fa76f82ec614a7fd0e6ebb4d9f74391d5e8b0c6f2f0ed6080c6c4de",
-    "left06.jpg": "1cb164db61b3bd52f58a7e9340bb27c5e0278895bc80b6f292fba5cf9bccc4a1",
-    "left07.jpg": "d2211fe9f971646b6ff88ed93a4f0d3f443741eb2894095cba15caade7c8c6e4",
-    "left08.jpg": "f7a0737894812a28243af5b409c5689f4fadfe7610958b8ca5fc79aec2f2cd1b",
-    "left09.jpg": "753939bc62d093c001d9118e989bef2b887f1b2f9ac03603df915a8b85aa81d3",
-}
 
 
 def _synthetic_chessboard_gray(
@@ -129,27 +116,17 @@ def _synthetic_calibration_frames(
     return frames[:count], K_true
 
 
-def test_opencv_fixture_assets_are_trusted_and_detectable() -> None:
-    """Validate official OpenCV chessboard sample images before using them as fixtures."""
-    assert _OPENCV_FIXTURE_DIR.is_dir()
-    for filename, expected_hash in _OPENCV_FIXTURE_SHA256.items():
-        path = _OPENCV_FIXTURE_DIR / filename
-        data = path.read_bytes()
-        assert sha256(data).hexdigest() == expected_hash
-
-        image = cv2.imread(str(path))
-        assert image is not None
-        assert image.shape == (480, 640, 3)
-
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        corners = find_chessboard_corners(gray, cols=9, rows=6)
-        assert corners is not None
-        assert corners.shape == (54, 1, 2)
-
-
-def test_cli_folder_with_real_opencv_fixture_writes_yaml_preview_and_camera_info(
+def test_cli_folder_with_synthetic_images_writes_yaml_preview_and_camera_info(
     tmp_path,
 ) -> None:
+    """Folder mode end-to-end without checked-in JPEG fixtures (CI-friendly)."""
+    cols, rows = 9, 6
+    frames, _K_true = _synthetic_calibration_frames(cols=cols, rows=rows, count=12)
+    images = tmp_path / "images"
+    images.mkdir()
+    for i, frame in enumerate(frames):
+        assert cv2.imwrite(str(images / f"frame_{i:02d}.png"), frame)
+
     out = tmp_path / "camera_info.yaml"
     preview = tmp_path / "camera_info.preview.png"
     result = CliRunner().invoke(
@@ -158,7 +135,7 @@ def test_cli_folder_with_real_opencv_fixture_writes_yaml_preview_and_camera_info
             "--source",
             "folder",
             "--images",
-            str(_OPENCV_FIXTURE_DIR),
+            str(images),
             "--cols",
             "9",
             "--rows",
@@ -168,7 +145,7 @@ def test_cli_folder_with_real_opencv_fixture_writes_yaml_preview_and_camera_info
             "--out",
             str(out),
             "--camera-name",
-            "opencv_left",
+            "synthetic_folder",
             "--no-display",
             str(preview),
         ],
@@ -176,7 +153,7 @@ def test_cli_folder_with_real_opencv_fixture_writes_yaml_preview_and_camera_info
 
     assert result.exit_code == 0, result.output
     assert "RMS:" in result.output
-    assert "(9 frame(s) used)" in result.output
+    assert "(12 frame(s) used)" in result.output
     assert "Wrote preview overlay PNG" in result.output
 
     assert out.exists()
@@ -207,6 +184,7 @@ def test_cli_folder_with_real_opencv_fixture_writes_yaml_preview_and_camera_info
 def test_cli_help_lists_cameracalibrate_flags() -> None:
     result = CliRunner().invoke(app, ["--help"])
     assert result.exit_code == 0
+    output_plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
     for flag in [
         "--source",
         "--device-index",
@@ -218,9 +196,8 @@ def test_cli_help_lists_cameracalibrate_flags() -> None:
         "--camera-name",
         "--target-count",
         "--no-display",
-        "--debug",
     ]:
-        assert flag in result.output
+        assert flag in output_plain
 
 
 def test_cli_folder_writes_only_explicit_yaml_and_prints_rms(tmp_path) -> None:
@@ -378,21 +355,6 @@ def test_capture_frames_from_webcam_mocked_space_fills_target(monkeypatch) -> No
     mock_imshow.assert_not_called()
 
 
-def test_capture_frames_from_webcam_debug_logging_is_opt_in(monkeypatch, capsys) -> None:
-    cols, rows = 9, 6
-    gray = _synthetic_chessboard_gray(640, 480, cols, rows, square_px=40)
-    bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
-    monkeypatch.setattr(cv2, "VideoCapture", lambda *_a, **_k: _MockVideoCapture(bgr))
-    monkeypatch.setattr(cv2, "waitKey", lambda _delay=0: ord(" "))
-
-    capture_frames_from_webcam(0, 1, cols, rows, no_display=True)
-    assert "Writing cameracalibrate debug log" not in capsys.readouterr().out
-
-    capture_frames_from_webcam(0, 1, cols, rows, no_display=True, debug=True)
-    assert "Writing cameracalibrate debug log" in capsys.readouterr().out
-
-
 def test_capture_frames_from_webcam_mocked_quit_raises(monkeypatch) -> None:
     cols, rows = 9, 6
     gray = _synthetic_chessboard_gray(640, 480, cols, rows, square_px=40)
@@ -430,11 +392,11 @@ def test_capture_frames_from_webcam_no_display_false_calls_imshow(monkeypatch) -
 
 
 @pytest.mark.skipif(
-    bool(os.environ.get("DIMOS_TEST_NO_CAMERA")),
-    reason="DIMOS_TEST_NO_CAMERA is set (skip hardware camera smoke in CI).",
+    os.environ.get("DIMOS_TEST_REAL_CAMERA") != "1",
+    reason="Set DIMOS_TEST_REAL_CAMERA=1 to run this hardware webcam smoke test.",
 )
 def test_opencv_video_capture_device_zero_opens_when_camera_available() -> None:
-    """Opt-in hardware check when ``DIMOS_TEST_NO_CAMERA`` is unset."""
+    """Smoke check for a real webcam when explicitly opted in."""
     cap = cv2.VideoCapture(0)
     try:
         assert cap.isOpened()

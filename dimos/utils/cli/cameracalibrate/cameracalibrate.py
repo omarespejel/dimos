@@ -27,8 +27,6 @@ import numpy as np
 import typer
 import yaml
 
-from dimos.utils.cli.cameracalibrate.debug import setup_debug_logger
-
 _IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg"})
 
 
@@ -255,7 +253,6 @@ def _capture_frames_from_webcam(
     rows: int,
     *,
     no_display: bool = False,
-    debug: bool = False,
 ) -> _WebcamCapture:
     """Capture ``target_count`` BGR frames from a webcam when the board is visible.
 
@@ -269,39 +266,22 @@ def _capture_frames_from_webcam(
     if target_count < 1:
         raise ValueError("target_count must be >= 1")
 
-    logger, log_path = setup_debug_logger(debug)
-    if log_path is not None:
-        typer.echo(f"Writing cameracalibrate debug log to {log_path}")
-    logger.info(
-        "capture start device_index=%s target_count=%s requested_cols=%s requested_rows=%s no_display=%s",
-        device_index,
-        target_count,
-        cols,
-        rows,
-        no_display,
-    )
-    logger.info("pattern candidates=%s", _pattern_candidates(cols, rows))
-
     accepted: list[np.ndarray] = []
     accepted_corners: list[np.ndarray] = []
     cap: cv2.VideoCapture | None = None
-    frame_count = 0
     last_detected: tuple[int, int, str] | None = None
     locked_pattern: tuple[int, int, str] | None = None
 
     try:
         cap = cv2.VideoCapture(device_index)
         if not cap.isOpened():
-            logger.error("failed to open camera")
             raise RuntimeError(f"Failed to open camera device_index={device_index!r}")
 
         while len(accepted) < target_count:
             ok, frame = cap.read()
             if not ok or frame is None:
-                logger.warning("frame read failed")
                 continue
 
-            frame_count += 1
             if frame.ndim == 3:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             else:
@@ -311,12 +291,6 @@ def _capture_frames_from_webcam(
                 detection = _find_chessboard_detection(gray, cols, rows)
                 if detection is not None:
                     locked_pattern = (detection.cols, detection.rows, detection.label)
-                    logger.info(
-                        "locked pattern cols=%s rows=%s label=%s",
-                        detection.cols,
-                        detection.rows,
-                        detection.label,
-                    )
             else:
                 locked_cols, locked_rows, locked_label = locked_pattern
                 corners = find_chessboard_corners(gray, locked_cols, locked_rows)
@@ -329,13 +303,6 @@ def _capture_frames_from_webcam(
             if detection is not None:
                 detected = (detection.cols, detection.rows, detection.label)
                 if detected != last_detected:
-                    logger.info(
-                        "detected pattern cols=%s rows=%s label=%s frame_shape=%s",
-                        detection.cols,
-                        detection.rows,
-                        detection.label,
-                        frame.shape,
-                    )
                     last_detected = detected
                 cv2.drawChessboardCorners(
                     preview,
@@ -343,9 +310,6 @@ def _capture_frames_from_webcam(
                     detection.corners,
                     True,
                 )
-            elif frame_count == 1 or frame_count % 30 == 0:
-                logger.info("no detection frame=%s frame_shape=%s", frame_count, frame.shape)
-
             _draw_capture_status(
                 preview,
                 detection=detection,
@@ -357,33 +321,18 @@ def _capture_frames_from_webcam(
                 cv2.imshow(_CAMERACALIBRATE_WINDOW, preview)
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord(" "):
-                if detection is not None:
-                    accepted.append(np.asarray(frame).copy())
-                    accepted_corners.append(np.asarray(detection.corners, dtype=np.float32).copy())
-                    logger.info(
-                        "accepted frame accepted=%s/%s pattern=%sx%s label=%s",
-                        len(accepted),
-                        target_count,
-                        detection.cols,
-                        detection.rows,
-                        detection.label,
-                    )
-                else:
-                    logger.info("space ignored because no pattern was detected")
+            if key == ord(" ") and detection is not None:
+                accepted.append(np.asarray(frame).copy())
+                accepted_corners.append(np.asarray(detection.corners, dtype=np.float32).copy())
             elif key == ord("q"):
-                logger.info("quit requested accepted=%s/%s", len(accepted), target_count)
                 break
 
         if len(accepted) < target_count:
-            logger.error("capture ended accepted=%s target=%s", len(accepted), target_count)
-            log_hint = f" Debug log: {log_path}" if log_path is not None else ""
             raise RuntimeError(
                 f"Capture ended with {len(accepted)} of {target_count} frames "
-                f"(quit early, missing detections on SPACE, or read failures).{log_hint}"
+                f"(quit early, missing detections on SPACE, or read failures)."
             )
 
-        logger.info("capture complete accepted=%s target=%s", len(accepted), target_count)
         return _WebcamCapture(accepted, accepted_corners, locked_pattern)
 
     finally:
@@ -404,7 +353,6 @@ def capture_frames_from_webcam(
     rows: int,
     *,
     no_display: bool = False,
-    debug: bool = False,
 ) -> list[np.ndarray]:
     """Capture ``target_count`` BGR frames from a webcam when the board is visible."""
     return _capture_frames_from_webcam(
@@ -413,7 +361,6 @@ def capture_frames_from_webcam(
         cols,
         rows,
         no_display=no_display,
-        debug=debug,
     ).frames
 
 
@@ -578,7 +525,6 @@ def run_calibration(
     camera_name: str,
     target_count: int,
     no_display: bool,
-    debug: bool = False,
 ) -> CalibrationRunResultDict:
     """Run calibration from the requested frame source and write CameraInfo YAML."""
     source_value = Source(source)
@@ -602,7 +548,6 @@ def run_calibration(
             cols,
             rows,
             no_display=no_display,
-            debug=debug,
         )
         frames = capture.frames
         pattern_hint = capture.pattern
@@ -667,7 +612,6 @@ def calibrate(
     camera_name: str = typer.Option("webcam", "--camera-name", help="Camera name in YAML"),
     target_count: int = typer.Option(20, "--target-count", help="Accepted webcam frame count"),
     no_display: bool = typer.Option(False, "--no-display", help="Disable OpenCV preview windows"),
-    debug: bool = typer.Option(False, "--debug", help="Write debug logs to the system temp dir"),
 ) -> None:
     """Calibrate camera intrinsics and write ROS CameraInfo YAML."""
     if preview_out is not None and out is None:
@@ -686,7 +630,6 @@ def calibrate(
             camera_name=camera_name,
             target_count=target_count,
             no_display=no_display,
-            debug=debug,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc

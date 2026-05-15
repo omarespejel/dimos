@@ -65,6 +65,14 @@ from dimos.utils.decorators.decorators import simple_mcache
 from dimos.utils.logging_config import setup_logger
 from dimos.utils.reactive import backpressure
 
+try:
+    import cv2.aruco
+except (ImportError, AttributeError) as e:
+    raise ImportError(
+        "dimos.perception.fiducial requires cv2.aruco. Install with: "
+        "uv sync --inexact --extra apriltag"
+    ) from e
+
 logger = setup_logger()
 
 if TYPE_CHECKING:

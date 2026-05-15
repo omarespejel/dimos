@@ -14,9 +14,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
-
+import cv2
 import numpy as np
 import pytest
 
@@ -29,30 +27,16 @@ from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.perception.fiducial.fixture_verification import (
     BoardLayout,
-    FrameVerificationResult,
     apparent_scale_bin,
     board_completeness_class,
     generated_apriltag_board_layout,
     image_footprint_bin,
-    load_manifest,
     median_tag_edge_percent,
-    validate_detection_expectation,
     verify_board_layout_geometry,
-    verify_fixture_frame,
     visible_board_layout_area_percent,
     visible_image_hull_area_percent,
 )
 from dimos.perception.fiducial.marker_tf_module import MarkerTfModule
-
-ROOT = Path(__file__).resolve().parents[3]
-MANIFEST_PATH = (
-    ROOT / "dimos/perception/fiducial/blueprints/fixtures/apriltag_fixture_manifest.yaml"
-)
-
-
-@pytest.fixture(scope="module")
-def manifest() -> dict[str, Any]:
-    return load_manifest(MANIFEST_PATH)
 
 
 @pytest.fixture(scope="module")
@@ -60,15 +44,58 @@ def layout() -> BoardLayout:
     return generated_apriltag_board_layout(list(range(12)), marker_length_m=0.05, page_size="a4")
 
 
-@pytest.fixture(scope="module")
-def fixture_results(
-    manifest: dict[str, Any],
+def _synthetic_packed_apriltag_board_bgr(
     layout: BoardLayout,
-) -> list[FrameVerificationResult]:
-    return [
-        verify_fixture_frame(frame, repo_root=ROOT, manifest=manifest, layout=layout)
-        for frame in manifest["frames"]
-    ]
+    *,
+    width: int,
+    height: int,
+    marker_inner_px: int = 220,
+    margin_frac: float = 0.06,
+) -> np.ndarray:
+    """Render the packed DimOS A4 layout in pixels (no checked-in PNG fixtures)."""
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    all_xy = np.concatenate(
+        [layout.tags[i].corners_m[:, :2] for i in sorted(layout.tags)],
+        axis=0,
+    )
+    min_xy = all_xy.min(axis=0)
+    max_xy = all_xy.max(axis=0)
+    span_x = float(max_xy[0] - min_xy[0])
+    span_y = float(max_xy[1] - min_xy[1])
+    margin = margin_frac * min(width, height)
+    usable_w = width - 2.0 * margin
+    usable_h = height - 2.0 * margin
+    scale = min(usable_w / span_x, usable_h / span_y)
+
+    inner = marker_inner_px
+    src = np.array(
+        [[0.0, 0.0], [inner - 1.0, 0.0], [inner - 1.0, inner - 1.0], [0.0, inner - 1.0]],
+        dtype=np.float32,
+    )
+
+    canvas = np.full((height, width, 3), 255, dtype=np.uint8)
+    for tag_id in sorted(layout.tags):
+        tile = np.zeros((inner, inner), dtype=np.uint8)
+        cv2.aruco.generateImageMarker(dictionary, tag_id, inner, tile)
+        tile_bgr = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
+        corners_xy = layout.tags[tag_id].corners_m[:, :2].astype(np.float64)
+        dst = np.empty((4, 2), dtype=np.float32)
+        for k in range(4):
+            xm, ym = corners_xy[k]
+            dst[k, 0] = margin + (xm - min_xy[0]) * scale
+            dst[k, 1] = margin + (max_xy[1] - ym) * scale
+        H, _ = cv2.findHomography(src, dst, method=0)
+        if H is None:
+            raise RuntimeError("homography failed for synthetic marker tile")
+        warped = cv2.warpPerspective(
+            tile_bgr,
+            H,
+            (width, height),
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(255, 255, 255),
+        )
+        canvas = np.minimum(canvas, warped)
+    return canvas
 
 
 def test_fixture_layout_matches_dimos_apriltag_generator_for_a4_50mm_3x4(
@@ -101,44 +128,82 @@ def test_fixture_layout_matches_dimos_apriltag_generator_for_a4_50mm_3x4(
         assert tag.corners_m.shape == (4, 3)
 
 
-def test_all_manifest_frames_run_opencv_detection_and_match_visibility(
-    manifest: dict[str, Any],
-    fixture_results: list[FrameVerificationResult],
+def test_synthetic_packed_board_detects_all_twelve_ids_and_layout_homography(
+    layout: BoardLayout,
 ) -> None:
-    failures: list[str] = []
-    for frame, result in zip(manifest["frames"], fixture_results, strict=True):
-        if result.metrics.image_width_px != manifest["camera"]["image_width_px"]:
-            failures.append(
-                f"{result.frame_id}: image width {result.metrics.image_width_px} "
-                f"!= manifest {manifest['camera']['image_width_px']}"
-            )
-        if result.metrics.image_height_px != manifest["camera"]["image_height_px"]:
-            failures.append(
-                f"{result.frame_id}: image height {result.metrics.image_height_px} "
-                f"!= manifest {manifest['camera']['image_height_px']}"
-            )
-        try:
-            validate_detection_expectation(frame, result.detected_ids)
-        except ValueError as exc:
-            failures.append(f"{result.frame_id}: detected {result.detected_ids}: {exc}")
+    width, height = 1920, 1080
+    bgr = _synthetic_packed_apriltag_board_bgr(layout, width=width, height=height)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    det = cv2.aruco.ArucoDetector(
+        cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11),
+        cv2.aruco.DetectorParameters(),
+    )
+    corners, ids, _ = det.detectMarkers(gray)
+    assert ids is not None and len(ids) == 12
+    detected = sorted(int(np.asarray(i).reshape(-1)[0]) for i in ids)
+    assert detected == list(range(12))
 
-        metric_values = [
-            result.metrics.median_tag_edge_percent,
-            result.metrics.visible_image_hull_area_percent,
-            result.metrics.visible_board_layout_area_percent,
-            result.metrics.board_layout_error_px_p50,
-            result.metrics.board_layout_error_px_p95,
-        ]
-        if not all(np.isfinite(value) for value in metric_values):
-            failures.append(f"{result.frame_id}: non-finite detector-derived metrics")
+    corners_by_id: dict[int, np.ndarray] = {}
+    for corner_set, id_arr in zip(corners, ids, strict=True):
+        corners_by_id[int(id_arr[0])] = np.asarray(corner_set, dtype=np.float32).reshape(4, 2)
 
-        if frame["operator_planned_class"] == "none":
-            if result.accepted:
-                failures.append(f"{result.frame_id}: negative fixture row was accepted")
-        elif not result.accepted:
-            failures.append(f"{result.frame_id}: rejected fixture row: {result.reject_reasons}")
+    geom = verify_board_layout_geometry(corners_by_id, layout)
+    assert geom.ok, f"layout homography failed p95={geom.layout_error_px_p95}"
+    assert geom.layout_error_px_p95 <= 3.0
 
-    assert not failures, "Detector-derived frame verification failed:\n" + "\n".join(failures)
+
+def test_marker_tf_replay_synthetic_packed_board_publishes_twelve_markers(
+    layout: BoardLayout,
+) -> None:
+    width, height = 1920, 1080
+    bgr = _synthetic_packed_apriltag_board_bgr(layout, width=width, height=height)
+    ts = 10_000.0
+    cam_info = CameraInfo.from_intrinsics(
+        1400.0,
+        1400.0,
+        width / 2.0,
+        height / 2.0,
+        width,
+        height,
+        frame_id="camera_optical",
+    )
+    cam_info.ts = ts
+
+    mod = MarkerTfModule(
+        marker_length_m=0.05,
+        marker_namespace_prefix="fixture",
+        max_freq=60.0,
+    )
+    try:
+        mod.tf.publish(
+            Transform(
+                translation=Vector3(0.0, 0.0, 0.0),
+                rotation=Quaternion(0.0, 0.0, 0.0, 1.0),
+                frame_id="world",
+                child_frame_id="base_link",
+                ts=ts,
+            ),
+            Transform(
+                translation=Vector3(0.0, 0.0, 0.0),
+                rotation=Quaternion(0.0, 0.0, 0.0, 1.0),
+                frame_id="base_link",
+                child_frame_id="camera_optical",
+                ts=ts,
+            ),
+        )
+        mod._latest_camera_info = cam_info
+        image = Image.from_opencv(bgr, frame_id="camera_optical", ts=ts)
+        mod._process_color_image(image)
+
+        marker_parent = "fixture/markers"
+        assert mod.tf.get("world", marker_parent, ts, 0.1) is not None
+
+        for tag_id in range(12):
+            tr = mod.tf.get(marker_parent, f"fixture/marker_{tag_id}", ts, 0.1)
+            assert tr is not None, f"missing marker {tag_id}"
+            assert np.all(np.isfinite(tr.to_matrix()))
+    finally:
+        mod.stop()
 
 
 def test_apparent_scale_bins_use_normalized_tag_edge_percent() -> None:
@@ -178,91 +243,12 @@ def test_board_completeness_uses_generated_layout_area_percent(layout: BoardLayo
     assert board_completeness_class(layout, []) == "no_board"
 
 
-def test_board_layout_geometry_accepts_detected_fixture_corners_from_generated_pdf_layout(
-    fixture_results: list[FrameVerificationResult],
-) -> None:
-    failures = [
-        f"{result.frame_id}: p95={result.metrics.board_layout_error_px_p95:.2f}px"
-        for result in fixture_results
-        if result.detected_ids
-        and (
-            result.board_layout_geometry is None
-            or not result.board_layout_geometry.ok
-            or result.metrics.board_layout_error_px_p95 > 3.0
-        )
-    ]
-    assert not failures, "PDF-layout homography verification failed:\n" + "\n".join(failures)
-
-
 def test_board_layout_geometry_rejects_swapped_detected_ids(layout: BoardLayout) -> None:
     corners_by_id = _layout_image_corners(layout, list(range(12)))
     corners_by_id[0], corners_by_id[1] = corners_by_id[1], corners_by_id[0]
     result = verify_board_layout_geometry(corners_by_id, layout)
     assert not result.ok
     assert result.layout_error_px_p95 > 3.0
-
-
-def test_marker_tf_replay_publishes_visible_ids_only(
-    manifest: dict[str, Any],
-) -> None:
-    mod = MarkerTfModule(
-        marker_length_m=manifest["fixture"]["marker_length_m"],
-        marker_namespace_prefix="fixture",
-        max_freq=60.0,
-    )
-    failures: list[str] = []
-    try:
-        for index, frame in enumerate(manifest["frames"]):
-            ts = 10_000.0 + index * 10.0
-            image = Image.from_file(ROOT / frame["image_path"])
-            image.ts = ts
-            image.frame_id = manifest["camera"]["frame_id"]
-            mod.tf.publish(
-                Transform(
-                    translation=Vector3(0.0, 0.0, 0.0),
-                    rotation=Quaternion(0.0, 0.0, 0.0, 1.0),
-                    frame_id="world",
-                    child_frame_id="base_link",
-                    ts=ts,
-                ),
-                Transform(
-                    translation=Vector3(0.0, 0.0, 0.0),
-                    rotation=Quaternion(0.0, 0.0, 0.0, 1.0),
-                    frame_id="base_link",
-                    child_frame_id=manifest["camera"]["frame_id"],
-                    ts=ts,
-                ),
-            )
-            mod._latest_camera_info = _camera_info_from_manifest(manifest, ts=ts)
-            mod._process_color_image(image)
-
-            marker_parent = "fixture/markers"
-            if (
-                frame["expected_visible_ids"]
-                and mod.tf.get("world", marker_parent, ts, 0.1) is None
-            ):
-                failures.append(f"{frame['frame_id']}: missing world -> {marker_parent}")
-
-            published_poses: dict[int, np.ndarray] = {}
-            for tag_id in manifest["fixture"]["ids"]:
-                transform = mod.tf.get(marker_parent, f"fixture/marker_{tag_id}", ts, 0.1)
-                if transform is not None:
-                    published_poses[tag_id] = transform.to_matrix()
-
-            try:
-                validate_detection_expectation(frame, sorted(published_poses))
-            except ValueError as exc:
-                failures.append(
-                    f"{frame['frame_id']}: marker TF IDs {sorted(published_poses)}: {exc}"
-                )
-
-            for tag_id, pose in published_poses.items():
-                if not np.all(np.isfinite(pose)):
-                    failures.append(f"{frame['frame_id']}: marker_{tag_id} TF is non-finite")
-    finally:
-        mod.stop()
-
-    assert not failures, "MarkerTfModule fixture replay failed:\n" + "\n".join(failures)
 
 
 def _square_corners(x: float, y: float, edge: float) -> np.ndarray:
@@ -280,31 +266,3 @@ def _layout_image_corners(layout: BoardLayout, visible_ids: list[int]) -> dict[i
         )
         for tag_id in visible_ids
     }
-
-
-def _camera_info_from_manifest(manifest: dict[str, Any], *, ts: float) -> CameraInfo:
-    camera = manifest["camera"]
-    return CameraInfo(
-        height=camera["image_height_px"],
-        width=camera["image_width_px"],
-        distortion_model=camera["distortion_model"],
-        D=camera["distortion_coefficients"]["data"],
-        K=camera["camera_matrix"]["data"],
-        R=[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        P=[
-            camera["camera_matrix"]["data"][0],
-            0.0,
-            camera["camera_matrix"]["data"][2],
-            0.0,
-            0.0,
-            camera["camera_matrix"]["data"][4],
-            camera["camera_matrix"]["data"][5],
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
-        ],
-        frame_id=camera["frame_id"],
-        ts=ts,
-    )
