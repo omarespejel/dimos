@@ -374,6 +374,22 @@ int main(int argc, char** argv) {
     fprintf(stderr, "  rtab_tf: %s\n", tf_topic.c_str());
     fprintf(stderr, "  octomap: %s\n", octomap_topic.c_str());
     fprintf(stderr, "  projected_2d_grid: %s\n", proj2d_topic.c_str());
+    // Echo the OctoMap log-odds params so we can verify at runtime that
+    // the binary actually picked up the values we expect. Mis-passed
+    // params silently fall back to rtabmap's defaults.
+    fprintf(stderr,
+            "  OctoMap params: ProbHit=%s ProbMiss=%s ClampingMax=%s ClampingMin=%s OccupancyThr=%s\n",
+            params["GridGlobal/ProbHit"].c_str(),
+            params["GridGlobal/ProbMiss"].c_str(),
+            params["GridGlobal/ProbClampingMax"].c_str(),
+            params["GridGlobal/ProbClampingMin"].c_str(),
+            params["GridGlobal/OccupancyThr"].c_str());
+    fprintf(stderr,
+            "  Grid params: MapFrameProjection=%s MaxGroundHeight=%s MaxObstacleHeight=%s RangeMax=%s\n",
+            params["Grid/MapFrameProjection"].c_str(),
+            params["Grid/MaxGroundHeight"].c_str(),
+            params["Grid/MaxObstacleHeight"].c_str(),
+            params["Grid/RangeMax"].c_str());
 
     // Lowered defaults so a fast-moving robot sees the map refresh quickly
     // (max @ ~2 Hz). Each publish is bounded by the cost of the per-signature
