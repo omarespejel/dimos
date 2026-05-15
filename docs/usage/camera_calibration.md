@@ -8,7 +8,7 @@ Operator workflow for chessboard targets and `dimos cameracalibrate` (ROS-style 
 
 A practical default is **8 by 6 inner corners** on **A4**: enough intersections for a stable solve without making each square too small for a typical desk webcam.
 
-1. **Generate a checkerboard.** OpenCV documents pattern creation in [Create calibration pattern](https://docs.opencv.org/4.12.0/da/d0d/tutorial_camera_calibration_pattern.html). To draw your own board, run upstream [`gen_pattern.py`](https://github.com/opencv/opencv/blob/4.12.0/doc/pattern_tools/gen_pattern.py) from that OpenCV version (see the tutorial for dependencies). In `gen_pattern.py`, `--columns` and `--rows` count **checker squares** along each axis. For **8 by 6 inner corners**, use **9 columns and 7 rows** of squares (inner corners are one less than square count in each direction):
+1. **Generate a checkerboard.** OpenCV documents pattern creation in [Create calibration pattern](https://docs.opencv.org/4.12.0/da/d0d/tutorial_camera_calibration_pattern.html). To draw your own board, download and run [OpenCV's gen_pattern.py](https://github.com/opencv/opencv/blob/4.12.0/doc/pattern_tools/gen_pattern.py) from that OpenCV version (see the tutorial for dependencies). In that script, `--columns` and `--rows` count **checker squares** along each axis. For **8 by 6 inner corners**, use **9 columns and 7 rows** of squares (inner corners are one less than square count in each direction):
 
 ```bash
 python gen_pattern.py -o chessboard_a4.svg -T checkerboard --columns 9 --rows 7 --square_size 25 -u mm -a A4
@@ -77,4 +77,4 @@ You can sanity-check an existing CameraInfo YAML without rerunning calibration.
 
 3. `frame_id`: the YAML written by `dimos cameracalibrate` does not embed `frame_id`. When you build a `CameraInfo` from the file (for example `load_camera_info(path, frame_id=...)`), the `frame_id` you pass must match the `Image.header.frame_id` used for that camera in your graph. The stock `Webcam` publishes color images with frame id `camera_optical` (or `{frame_id_prefix}/camera_optical` if `frame_id_prefix` is set). The no-robot desk blueprint (ticket T5 in the feature backlog) publishes TF so that optical frame is consistent with that naming; keep your loaded `CameraInfo` header aligned with whatever your desk stack actually publishes for the optical camera.
 
-For the shape of the ROS-style fields only (matrix blocks, row and column counts, key names), see the checked-in example [`dimos/hardware/sensors/camera/zed/single_webcam.yaml`](../../dimos/hardware/sensors/camera/zed/single_webcam.yaml). Treat it as a schema reference, not as calibration numbers for your camera.
+For the shape of the ROS-style fields only (matrix blocks, row and column counts, key names), see the checked-in example [`dimos/hardware/sensors/camera/zed/single_webcam.yaml`](/dimos/hardware/sensors/camera/zed/single_webcam.yaml). Treat it as a schema reference, not as calibration numbers for your camera.

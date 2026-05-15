@@ -392,6 +392,7 @@ def test_capture_frames_from_webcam_debug_logging_is_opt_in(monkeypatch, capsys)
     capture_frames_from_webcam(0, 1, cols, rows, no_display=True, debug=True)
     assert "Writing cameracalibrate debug log" in capsys.readouterr().out
 
+
 def test_capture_frames_from_webcam_mocked_quit_raises(monkeypatch) -> None:
     cols, rows = 9, 6
     gray = _synthetic_chessboard_gray(640, 480, cols, rows, square_px=40)

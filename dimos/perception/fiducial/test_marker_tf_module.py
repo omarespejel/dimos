@@ -229,7 +229,7 @@ def test_marker_tf_module_publishes_world_markers_chain() -> None:
                 frame_id="base_link",
                 child_frame_id="camera_optical",
                 ts=ts,
-            )
+            ),
         )
         mod._latest_camera_info = cam_info
         mod._process_color_image(image)
@@ -280,7 +280,7 @@ def test_marker_namespace_prefix_child_frames() -> None:
                 frame_id="base_link",
                 child_frame_id="camera_optical",
                 ts=ts,
-            )
+            ),
         )
         mod._latest_camera_info = cam_info
         mod._process_color_image(image)

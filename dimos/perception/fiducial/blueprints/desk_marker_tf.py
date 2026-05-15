@@ -130,6 +130,7 @@ class DeskStaticTfModule(Module):
             ),
         )
 
+
 desk_marker_tf = autoconnect(
     DeskStaticTfModule.blueprint(),
     CameraModule.blueprint(

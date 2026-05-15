@@ -338,7 +338,7 @@ def deploy(
     camera: Camera,
     prefix: str = "/marker_tf",
     **kwargs: Any,
-) -> "ModuleProxy":
+) -> ModuleProxy:
     """Wire :class:`MarkerTfModule` inputs from a :class:`~dimos.spec.perception.Camera`.
 
     Registers the module via :meth:`~dimos.core.coordination.module_coordinator.ModuleCoordinator.deploy`

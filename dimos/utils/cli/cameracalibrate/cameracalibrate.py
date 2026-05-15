@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Any, TypedDict, cast
 
 import cv2
 import numpy as np
@@ -28,6 +30,25 @@ import yaml
 from dimos.utils.cli.cameracalibrate.debug import setup_debug_logger
 
 _IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg"})
+
+
+class CalibrationResultDict(TypedDict):
+    """Structured return from ``calibrate_from_frames`` (and base of ``run_calibration``)."""
+
+    K: np.ndarray
+    D: np.ndarray
+    rms: float
+    image_size: tuple[int, int]
+    n_used: int
+    pattern_size: tuple[int, int]
+    pattern_label: str
+
+
+class CalibrationRunResultDict(CalibrationResultDict, total=False):
+    """Optional paths written when ``run_calibration`` is asked to emit files."""
+
+    out_path: Path
+    preview_path: Path
 
 
 class Source(str, Enum):
@@ -165,7 +186,8 @@ def _as_grayscale_uint8(gray: np.ndarray) -> np.ndarray:
     if g.ndim == 3:
         g = cv2.cvtColor(g, cv2.COLOR_BGR2GRAY)
     if g.dtype != np.uint8:
-        g = cv2.normalize(g, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        out_norm = np.empty(g.shape, dtype=np.uint8)
+        g = cv2.normalize(g, out_norm, 0, 255, cv2.NORM_MINMAX)
     return np.ascontiguousarray(g)
 
 
@@ -173,10 +195,13 @@ def _find_chessboard_corners_exact(gray: np.ndarray, cols: int, rows: int) -> np
     g = _as_grayscale_uint8(gray)
     pattern_size = (cols, rows)
     flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
-    ok, corners = cv2.findChessboardCorners(g, pattern_size, flags)
+    g_cv = cast("Any", np.ascontiguousarray(g))
+    _find_corners = cast("Callable[..., tuple[bool, Any]]", cv2.findChessboardCorners)
+    ok, corners = _find_corners(g_cv, pattern_size, flags)
     if ok and corners is not None:
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-        return cv2.cornerSubPix(g, corners, (11, 11), (-1, -1), criteria)
+        refined = cv2.cornerSubPix(g_cv, corners, (11, 11), (-1, -1), criteria)
+        return cast("np.ndarray", refined)
 
     find_sb = getattr(cv2, "findChessboardCornersSB", None)
     if find_sb is None:
@@ -187,13 +212,15 @@ def _find_chessboard_corners_exact(gray: np.ndarray, cols: int, rows: int) -> np
         sb_flags |= cv2.CALIB_CB_EXHAUSTIVE
     if hasattr(cv2, "CALIB_CB_ACCURACY"):
         sb_flags |= cv2.CALIB_CB_ACCURACY
-    ok, corners = find_sb(g, pattern_size, sb_flags)
+    ok, corners = cast("Callable[..., tuple[bool, Any]]", find_sb)(g_cv, pattern_size, sb_flags)
     if not ok or corners is None:
         return None
     return np.asarray(corners, dtype=np.float32).reshape(cols * rows, 1, 2)
 
 
-def _find_chessboard_detection(gray: np.ndarray, cols: int, rows: int) -> _ChessboardDetection | None:
+def _find_chessboard_detection(
+    gray: np.ndarray, cols: int, rows: int
+) -> _ChessboardDetection | None:
     for cand_cols, cand_rows, label in _pattern_candidates(cols, rows):
         corners = _find_chessboard_corners_exact(gray, cand_cols, cand_rows)
         if corners is not None:
@@ -432,7 +459,7 @@ def calibrate_from_frames(
     *,
     pattern_hint: tuple[int, int, str] | None = None,
     image_points_hint: list[np.ndarray] | None = None,
-) -> dict[str, object]:
+) -> CalibrationResultDict:
     """Calibrate intrinsics from grayscale or BGR frames containing a chessboard.
 
     Each frame where ``find_chessboard_corners`` succeeds contributes one view.
@@ -469,27 +496,31 @@ def calibrate_from_frames(
         if f.shape[:2] != (h0, w0):
             raise ValueError("All frames must have the same shape.")
 
+        corners_found: np.ndarray
         if image_points_hint is not None:
-            corners = np.asarray(image_points_hint[i], dtype=np.float32).reshape(
+            corners_found = np.asarray(image_points_hint[i], dtype=np.float32).reshape(
                 actual_rows * actual_cols,
                 1,
                 2,
             )
         else:
+            gray_in: np.ndarray
             if f.ndim == 3:
-                gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                gray_in = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
             else:
-                gray = f
-            corners = find_chessboard_corners(gray, actual_cols, actual_rows)
-            if corners is None:
+                gray_in = np.asarray(f)
+            corners_opt = find_chessboard_corners(gray_in, actual_cols, actual_rows)
+            if corners_opt is None:
                 continue
+            corners_found = corners_opt
         objpoints.append(objp)
-        imgpoints.append(corners.astype(np.float32))
+        imgpoints.append(corners_found.astype(np.float32))
 
     if not objpoints:
         raise ValueError("Chessboard not found in any frame.")
 
-    rms, camera_matrix, dist_coeffs, _rvecs, _tvecs = cv2.calibrateCamera(
+    _calibrate = cast("Callable[..., Any]", cv2.calibrateCamera)
+    rms, camera_matrix, dist_coeffs, _rvecs, _tvecs = _calibrate(
         objpoints,
         imgpoints,
         (w0, h0),
@@ -548,7 +579,7 @@ def run_calibration(
     target_count: int,
     no_display: bool,
     debug: bool = False,
-) -> dict[str, object]:
+) -> CalibrationRunResultDict:
     """Run calibration from the requested frame source and write CameraInfo YAML."""
     source_value = Source(source)
     if cols < 1:
@@ -577,7 +608,7 @@ def run_calibration(
         pattern_hint = capture.pattern
         image_points_hint = capture.image_points
 
-    result = calibrate_from_frames(
+    cal = calibrate_from_frames(
         frames,
         cols,
         rows,
@@ -585,6 +616,15 @@ def run_calibration(
         pattern_hint=pattern_hint,
         image_points_hint=image_points_hint,
     )
+    result: CalibrationRunResultDict = {
+        "K": cal["K"],
+        "D": cal["D"],
+        "rms": cal["rms"],
+        "image_size": cal["image_size"],
+        "n_used": cal["n_used"],
+        "pattern_size": cal["pattern_size"],
+        "pattern_label": cal["pattern_label"],
+    }
     image_width, image_height = result["image_size"]
 
     if out is not None:
@@ -601,7 +641,7 @@ def run_calibration(
 
     if preview_out is not None:
         preview_out.parent.mkdir(parents=True, exist_ok=True)
-        pattern_cols, pattern_rows = result.get("pattern_size", (cols, rows))
+        pattern_cols, pattern_rows = result["pattern_size"]
         write_preview_overlay_png(frames, int(pattern_cols), int(pattern_rows), preview_out)
         result["preview_path"] = preview_out
 

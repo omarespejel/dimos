@@ -90,7 +90,9 @@ def _opencv_pnp_cam_marker(
     return rvec, tvec
 
 
-def _quaternion_xyzw_close(a: np.ndarray, bx: float, by: float, bz: float, bw: float, atol: float) -> None:
+def _quaternion_xyzw_close(
+    a: np.ndarray, bx: float, by: float, bz: float, bw: float, atol: float
+) -> None:
     b = np.array([bx, by, bz, bw], dtype=np.float64)
     da = np.linalg.norm(a - b)
     db = np.linalg.norm(a + b)
@@ -172,11 +174,19 @@ def test_marker_tf_deploy_lcm_tf_integration() -> None:
 
     T_wb = _se3_to_4x4(
         np.eye(3),
-        np.array([t_world_base.translation.x, t_world_base.translation.y, t_world_base.translation.z]),
+        np.array(
+            [t_world_base.translation.x, t_world_base.translation.y, t_world_base.translation.z]
+        ),
     )
     T_bo = _se3_to_4x4(
         np.eye(3),
-        np.array([t_base_optical.translation.x, t_base_optical.translation.y, t_base_optical.translation.z]),
+        np.array(
+            [
+                t_base_optical.translation.x,
+                t_base_optical.translation.y,
+                t_base_optical.translation.z,
+            ]
+        ),
     )
     T_wm = T_wb @ T_bo @ T_cam_marker
     exp_t = T_wm[:3, 3]

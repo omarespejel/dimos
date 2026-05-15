@@ -683,9 +683,7 @@ def cameracalibrate(
     ),
     camera_name: str = typer.Option("webcam", "--camera-name", help="Camera name in YAML"),
     target_count: int = typer.Option(20, "--target-count", help="Accepted webcam frame count"),
-    no_display: bool = typer.Option(
-        False, "--no-display", help="Disable OpenCV preview windows"
-    ),
+    no_display: bool = typer.Option(False, "--no-display", help="Disable OpenCV preview windows"),
     debug: bool = typer.Option(False, "--debug", help="Write debug logs to the system temp dir"),
 ) -> None:
     """Calibrate camera intrinsics and write ROS CameraInfo YAML."""
