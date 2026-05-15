@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FlowBase physical description and sensor odometry offsets."""
-
 from __future__ import annotations
 
 from dimos.msgs.geometry_msgs.Pose import Pose
@@ -28,7 +26,7 @@ DEFAULT_ADDRESS = "172.6.2.20:11323"
 LOCAL_PLANNER_PRECOMPUTED_PATHS = G1_LOCAL_PLANNER_PRECOMPUTED_PATHS
 
 FLOWBASE = RobotConfig(
-    name="flowbase",
+    name="alfred",
     height_clearance=2.0,  # meters
     width_clearance=1.0,
     internal_odom_offsets={
