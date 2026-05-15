@@ -196,28 +196,38 @@ class AnafiConnection:
         if self._anafi is None:
             return
         sensors = self._anafi.sensors
-
-        altitude = float(getattr(sensors, "altitude", 0.0) or 0.0)
-        heading_deg = float(getattr(sensors, "heading", 0.0) or 0.0)
-        half_yaw = math.radians(heading_deg) / 2.0
+        logger.info(f"{self.__class__.__name__}: sensor update: {sensors}")
+        altitude = float(sensors.sensors_dict.get("AltitudeChanged_altitude", 0.0) or 0.0)
+        roll = float(sensors.sensors_dict.get("AttitudeChanged_roll", 0.0) or 0.0)
+        pitch = -float(sensors.sensors_dict.get("AttitudeChanged_pitch", 0.0) or 0.0)
+        yaw = -float(sensors.sensors_dict.get("AttitudeChanged_yaw", 0.0) or 0.0)
+        logger.info(
+            f"{self.__class__.__name__}: altitude={altitude:.2f} m, "
+            f"roll={math.degrees(roll):.1f} pitch={math.degrees(pitch):.1f} yaw={math.degrees(yaw):.1f} deg"
+        )
         self._odom_subject.on_next(
             PoseStamped(
                 position=Vector3(0.0, 0.0, altitude),
-                orientation=Quaternion(x=0.0, y=0.0, z=math.sin(half_yaw), w=math.cos(half_yaw)),
+                orientation=Quaternion.from_euler(Vector3(roll, pitch, yaw)),
                 frame_id="world",
                 ts=time.time(),
             )
         )
 
         telemetry: dict[str, Any] = {
-            "battery": getattr(sensors, "battery", None),
-            "flying_state": getattr(sensors, "flying_state", None),
+            "battery": sensors.sensors_dict.get("BatteryStateChanged_percent", None),
+            "flying_state": sensors.sensors_dict.get("FlyingStateChanged_state", None),
             "altitude": altitude,
-            "heading_deg": heading_deg,
+            "roll_deg": math.degrees(roll),
+            "pitch_deg": math.degrees(pitch),
+            "heading_deg": math.degrees(yaw),
         }
-        gps = getattr(sensors, "gps_latitude", None)
+        gps = sensors.sensors_dict.get("GpsLocationChanged_latitude", None)
         if gps is not None:
-            telemetry["gps"] = {"lat": gps, "lon": getattr(sensors, "gps_longitude", None)}
+            telemetry["gps"] = {
+                "lat": gps,
+                "lon": sensors.sensors_dict.get("GpsLocationChanged_longitude", None),
+            }
         self._telemetry_subject.on_next(telemetry)
 
     def _video_loop(self) -> None:
