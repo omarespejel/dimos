@@ -457,6 +457,14 @@ int main(int argc, char** argv) {
         // added since last call. We gate on the octomap publish period so
         // we batch multiple scans per update instead of paying the
         // per-cell octree-write cost on every frame.
+        //
+        // Reset last_*_publish if the frame timestamp went backward —
+        // can happen on FastLIO2 restart, NTP correction, or a stream
+        // that starts on wall-clock and then switches to relative. Without
+        // this, a single forward-from-now ts would gate all future
+        // publishes for the duration of the regression.
+        if (frame.timestamp < last_octomap_publish) last_octomap_publish = 0.0;
+        if (frame.timestamp < last_global_map_publish) last_global_map_publish = 0.0;
         bool octomap_due =
             frame.timestamp - last_octomap_publish >= octomap_publish_period;
         bool global_map_due =
