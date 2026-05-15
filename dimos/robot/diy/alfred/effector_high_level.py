@@ -85,6 +85,9 @@ class AlfredHighLevel(Module):
                 self._client = None
             logger.info("Alfred high-level connection stopped")
 
+    async def handle_cmd_vel(self, msg: Twist) -> None:
+        await self.move(msg)
+
     @rpc
     async def move(self, twist: Twist, duration: float = 0.0) -> bool:
         """Send a Twist as a holonomic velocity command.
