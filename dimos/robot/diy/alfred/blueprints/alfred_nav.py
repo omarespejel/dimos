@@ -21,43 +21,45 @@ from dimos.core.global_config import global_config
 from dimos.hardware.sensors.lidar.fastlio2.module import FastLio2
 from dimos.navigation.movement_manager.movement_manager import MovementManager
 from dimos.navigation.nav_stack.main import create_nav_stack, nav_stack_rerun_config
-from dimos.robot.diy.flowbase.config import FLOWBASE, LOCAL_PLANNER_PRECOMPUTED_PATHS
-from dimos.robot.diy.flowbase.effector_high_level import FlowBaseHighLevel
+from dimos.robot.diy.alfred.config import ALFRED, LOCAL_PLANNER_PRECOMPUTED_PATHS
+from dimos.robot.diy.alfred.effector_high_level import AlfredHighLevel
 from dimos.visualization.vis_module import vis_module
 
-flowbase_nav = (
+nav_config = dict(
+    planner="simple",
+    vehicle_height=0.5,
+    max_speed=0.8,
+    terrain_analysis={
+        "obstacle_height_threshold": 0.15,
+        "ground_height_threshold": 0.10,
+        "sensor_range": 20,
+    },
+    local_planner={
+        "paths_dir": str(LOCAL_PLANNER_PRECOMPUTED_PATHS),
+        "publish_free_paths": False,
+    },
+    simple_planner={
+        "cell_size": 0.2,
+        "obstacle_height_threshold": 0.15,
+        "inflation_radius": 0.3,
+        "lookahead_distance": 2.0,
+        "replan_rate": 5.0,
+        "replan_cooldown": 2.0,
+    },
+)
+
+alfred_nav = (
     autoconnect(
         FastLio2.blueprint(
             host_ip=os.getenv("LIDAR_HOST_IP", "192.168.1.5"),
             lidar_ip=os.getenv("LIDAR_IP", "192.168.1.189"),
-            mount=FLOWBASE.internal_odom_offsets["mid360_link"],
+            mount=ALFRED.internal_odom_offsets["mid360_link"],
             map_freq=1.0,
             config="default.yaml",
         ),
-        create_nav_stack(
-            planner="simple",
-            vehicle_height=0.5,
-            max_speed=0.8,
-            terrain_analysis={
-                "obstacle_height_threshold": 0.15,
-                "ground_height_threshold": 0.10,
-                "sensor_range": 20,
-            },
-            local_planner={
-                "paths_dir": str(LOCAL_PLANNER_PRECOMPUTED_PATHS),
-                "publish_free_paths": False,
-            },
-            simple_planner={
-                "cell_size": 0.2,
-                "obstacle_height_threshold": 0.15,
-                "inflation_radius": 0.3,
-                "lookahead_distance": 2.0,
-                "replan_rate": 5.0,
-                "replan_cooldown": 2.0,
-            },
-        ),
+        create_nav_stack(**nav_config),
         MovementManager.blueprint(),
-        FlowBaseHighLevel.blueprint(),
+        AlfredHighLevel.blueprint(),
         vis_module(
             global_config.viewer,
             rerun_config={
