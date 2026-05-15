@@ -34,8 +34,6 @@ logger = setup_logger()
 
 
 class RtabMapConfig(NativeModuleConfig):
-    """Config for the RtabMap native module."""
-
     cwd: str | None = str(Path(__file__).resolve().parent / "cpp")
     executable: str = "result/bin/rtab_map"
     build_command: str | None = "nix build .#default --no-write-lock-file"
@@ -107,11 +105,6 @@ class RtabMap(NativeModule):
     """RtabMap NativeModule — librtabmap behind an LCM wrapper.
 
     Plays the same role in the nav stack as :class:`PGO`: consumes
-    FastLIO2's external odometry + registered lidar scans, runs RTAB-Map
-    SLAM internally (lidar-only mode, ICP registration), and publishes
-    corrected odometry, the accumulated global cloud, a ``map -> odom`` TF
-    correction, plus OctoMap-derived outputs (occupied voxels and a 2D
-    projection).
     """
 
     config: RtabMapConfig
