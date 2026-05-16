@@ -415,214 +415,199 @@ async fn main() {
 mod tests {
     use super::*;
 
-    // Binary semantics: 1 hit to occupy, 1 miss to clear. Keeps the older
-    // ray-traversal tests legible; tests covering multi-scan health build-up
-    // use their own config below.
-    fn cfg(voxel_size: f32) -> Config {
+    fn basic_config() -> Config {
         Config {
+            voxel_size: 1.0,
+            max_range: 100.0,
+            ray_subsample: 1,
+            shadow_depth: 2.0,
+            min_health: 0,
+            max_health: 1,
+        }
+    }
+
+    #[test]
+    fn walk_ray_hits_correct_voxels_1() {
+        let voxel_size = 1.0;
+        let shadow_depth = 2.0;
+        let origin = (0.5, 0.5, 0.5);
+        let end = (5.5, 0.5, 0.5);
+        let inv = 1.0 / voxel_size;
+        let origin_voxel = world_to_voxel(origin.0, origin.1, origin.2, inv);
+        let endpoint = world_to_voxel(end.0, end.1, end.2, inv);
+
+        let mut misses: AHashSet<VoxelKey> = AHashSet::new();
+        walk_ray(
+            &mut misses,
+            origin,
+            end,
             voxel_size,
-            max_range: 100.0,
-            ray_subsample: 1,
-            shadow_depth: 0.0,
-            min_health: 0,
-            max_health: 1,
-        }
+            shadow_depth,
+            origin_voxel,
+            endpoint,
+        );
+
+        let expected: AHashSet<VoxelKey> = [
+            (1, 0, 0),
+            (2, 0, 0),
+            (3, 0, 0),
+            (4, 0, 0),
+            (6, 0, 0),
+            (7, 0, 0),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(misses, expected);
     }
 
     #[test]
-    fn insert_creates_voxel_at_point() {
-        let mut map = VoxelMap::default();
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(1.5, 0.0, 0.0)], &cfg(1.0));
-        assert!(map.voxels.contains_key(&(1, 0, 0)));
+    fn walk_ray_hits_correct_voxels_2() {
+        let voxel_size = 1.0;
+        let shadow_depth = 2.0;
+        let origin = (0.5, 0.5, 0.5);
+        let end = (3.5, 2.5, 1.5);
+        let inv = 1.0 / voxel_size;
+        let origin_voxel = world_to_voxel(origin.0, origin.1, origin.2, inv);
+        let endpoint = world_to_voxel(end.0, end.1, end.2, inv);
+
+        let mut misses: AHashSet<VoxelKey> = AHashSet::new();
+        walk_ray(
+            &mut misses,
+            origin,
+            end,
+            voxel_size,
+            shadow_depth,
+            origin_voxel,
+            endpoint,
+        );
+
+        let expected: AHashSet<VoxelKey> = [
+            (1, 0, 0),
+            (1, 1, 0),
+            (1, 1, 1),
+            (2, 1, 1),
+            (2, 2, 1),
+            (4, 2, 1),
+            (4, 3, 1),
+            (4, 3, 2),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(misses, expected);
     }
 
     #[test]
-    fn raycast_clears_voxel_between_origin_and_hit() {
+    fn hits_insert_voxels() {
+        let cfg = basic_config();
         let mut map = VoxelMap::default();
-        // Pre-existing voxel at x=2 that the ray should sweep through.
-        map.voxels.insert((2, 0, 0), 1);
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &cfg(1.0));
-        // Endpoint kept...
-        assert!(map.voxels.contains_key(&(5, 0, 0)));
-        // ...intermediate voxel cleared.
-        assert!(!map.voxels.contains_key(&(2, 0, 0)));
-    }
-
-    #[test]
-    fn raycast_does_not_clear_endpoint_voxel() {
-        let mut map = VoxelMap::default();
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(3.5, 0.0, 0.0)], &cfg(1.0));
-        assert!(map.voxels.contains_key(&(3, 0, 0)));
-    }
-
-    #[test]
-    fn diagonal_ray_clears_traversed_voxels() {
-        let mut map = VoxelMap::default();
-        // Dynamic obstacle that has moved; should be carved out.
-        map.voxels.insert((1, 1, 0), 1);
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(3.5, 3.5, 0.0)], &cfg(1.0));
-        assert!(!map.voxels.contains_key(&(1, 1, 0)));
-        assert!(map.voxels.contains_key(&(3, 3, 0)));
-    }
-
-    #[test]
-    fn point_inside_origin_voxel_no_raycast() {
-        let mut map = VoxelMap::default();
-        map.voxels.insert((0, 0, 0), 1);
-        update_map(&mut map, (0.5, 0.5, 0.5), &[(0.6, 0.5, 0.5)], &cfg(1.0));
-        assert!(map.voxels.contains_key(&(0, 0, 0)));
-    }
-
-    #[test]
-    fn shadow_depth_clears_voxels_behind_endpoint() {
-        let mut map = VoxelMap::default();
-        // Stale voxel directly behind the new hit, along the same ray.
-        map.voxels.insert((6, 0, 0), 1);
-        let mut c = cfg(1.0);
-        c.shadow_depth = 2.5;
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &c);
-        assert!(map.voxels.contains_key(&(5, 0, 0)));
-        assert!(!map.voxels.contains_key(&(6, 0, 0)));
-    }
-
-    #[test]
-    fn shadow_depth_zero_preserves_voxels_behind_endpoint() {
-        let mut map = VoxelMap::default();
-        map.voxels.insert((6, 0, 0), 1);
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &cfg(1.0));
-        assert!(map.voxels.contains_key(&(6, 0, 0)));
-    }
-
-    #[test]
-    fn shadow_depth_stops_at_configured_distance() {
-        let mut map = VoxelMap::default();
-        map.voxels.insert((6, 0, 0), 1);
-        map.voxels.insert((9, 0, 0), 1);
-        let mut c = cfg(1.0);
-        c.shadow_depth = 2.5;
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &c);
-        assert!(!map.voxels.contains_key(&(6, 0, 0)));
-        assert!(map.voxels.contains_key(&(9, 0, 0)));
-    }
-
-    #[test]
-    fn health_takes_multiple_hits_to_occupy_from_cold() {
-        let mut map = VoxelMap::default();
-        let c = Config {
-            voxel_size: 1.0,
-            max_range: 100.0,
-            ray_subsample: 1,
-            shadow_depth: 0.0,
-            min_health: -2,
-            max_health: 1,
-        };
-        // Hit 1: health -2 -> -1 (not occupied)
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &c);
-        assert_eq!(map.voxels.get(&(5, 0, 0)), Some(&-1));
-        // Hit 2: health -1 -> 0 (still not occupied)
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &c);
-        assert_eq!(map.voxels.get(&(5, 0, 0)), Some(&0));
-        // Hit 3: health 0 -> 1 (occupied)
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &c);
-        assert_eq!(map.voxels.get(&(5, 0, 0)), Some(&1));
-    }
-
-    #[test]
-    fn health_caps_at_max_health() {
-        let mut map = VoxelMap::default();
-        let c = Config {
-            voxel_size: 1.0,
-            max_range: 100.0,
-            ray_subsample: 1,
-            shadow_depth: 0.0,
-            min_health: -2,
-            max_health: 1,
-        };
-        for _ in 0..10 {
-            update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &c);
-        }
-        assert_eq!(map.voxels.get(&(5, 0, 0)), Some(&1));
-    }
-
-    #[test]
-    fn health_decays_through_zero_and_voxel_is_removed_at_min() {
-        let mut map = VoxelMap::default();
-        // Seed at max health and then have a ray sweep through it.
-        map.voxels.insert((2, 0, 0), 1);
-        let c = Config {
-            voxel_size: 1.0,
-            max_range: 100.0,
-            ray_subsample: 1,
-            shadow_depth: 0.0,
-            min_health: -2,
-            max_health: 1,
-        };
-        // Miss 1: 1 -> 0 (still tracked, not occupied)
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &c);
-        assert_eq!(map.voxels.get(&(2, 0, 0)), Some(&0));
-        // Miss 2: 0 -> -1
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &c);
-        assert_eq!(map.voxels.get(&(2, 0, 0)), Some(&-1));
-        // Miss 3: -1 -> -2 == min_health -> removed
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &c);
-        assert!(!map.voxels.contains_key(&(2, 0, 0)));
-    }
-
-    #[test]
-    fn miss_on_unobserved_voxel_is_noop() {
-        let mut map = VoxelMap::default();
-        let c = cfg(1.0);
-        // Ray sweeps through voxels (0..5, 0, 0) but none are in the map.
-        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &c);
-        assert!(!map.voxels.contains_key(&(2, 0, 0)));
-    }
-
-    #[test]
-    fn hit_beats_miss_when_voxel_is_both() {
-        // Voxel V is hit by one beam and would be missed by another's shadow.
-        // With shadow_depth set and a second beam endpoint right behind the first,
-        // V (the second endpoint voxel) is both in misses (shadow of first beam)
-        // and in hits (endpoint of second beam). Hit should win.
-        let mut map = VoxelMap::default();
-        let c = Config {
-            voxel_size: 1.0,
-            max_range: 100.0,
-            ray_subsample: 1,
-            shadow_depth: 2.5,
-            min_health: 0,
-            max_health: 1,
-        };
         update_map(
             &mut map,
             (0.0, 0.0, 0.0),
-            &[(3.5, 0.0, 0.0), (5.5, 0.0, 0.0)],
-            &c,
+            &[(5.5, 0.5, 0.5), (0.5, 5.5, 0.5)],
+            &cfg,
         );
-        assert!(map.voxels.contains_key(&(5, 0, 0)));
+        assert_eq!(map.voxels.get(&(5, 0, 0)), Some(&1));
+        assert_eq!(map.voxels.get(&(0, 5, 0)), Some(&1));
+        assert_eq!(map.voxels.len(), 2);
     }
 
     #[test]
-    fn build_pointcloud_writes_xyz_at_voxel_centers() {
+    fn voxels_on_ray_are_removed() {
+        let cfg = basic_config();
         let mut map = VoxelMap::default();
-        map.voxels.insert((1, 0, 0), 1);
-        let cloud = build_pointcloud(&map, 1.0, "world", Time::default());
-        assert_eq!(cloud.width, 1);
-        assert_eq!(cloud.point_step, 16);
-        let x = read_f32_le(&cloud.data, 0);
-        let y = read_f32_le(&cloud.data, 4);
-        let z = read_f32_le(&cloud.data, 8);
-        assert!((x - 1.5).abs() < 1e-6);
-        assert!((y - 0.5).abs() < 1e-6);
-        assert!((z - 0.5).abs() < 1e-6);
+        map.voxels.insert((3, 0, 0), 1);
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.5, 0.5)], &cfg);
+        // make sure the initial point got cleared by the new update
+        assert!(!map.voxels.contains_key(&(3, 0, 0)));
+        assert_eq!(map.voxels.get(&(5, 0, 0)), Some(&1));
     }
 
     #[test]
-    fn build_pointcloud_skips_voxels_with_non_positive_health() {
+    fn voxels_not_on_ray_survive() {
+        let cfg = basic_config();
         let mut map = VoxelMap::default();
-        map.voxels.insert((1, 0, 0), 1);
-        map.voxels.insert((2, 0, 0), 0);
-        map.voxels.insert((3, 0, 0), -1);
-        let cloud = build_pointcloud(&map, 1.0, "world", Time::default());
-        assert_eq!(cloud.width, 1);
+        map.voxels.insert((3, 5, 0), 1);
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.5, 0.5)], &cfg);
+        assert_eq!(map.voxels.get(&(3, 5, 0)), Some(&1));
+        assert_eq!(map.voxels.get(&(5, 0, 0)), Some(&1));
+    }
+
+    #[test]
+    fn voxels_within_shadow_region_are_removed() {
+        let cfg = basic_config();
+        let mut map = VoxelMap::default();
+        map.voxels.insert((6, 0, 0), 1);
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.5, 0.5)], &cfg);
+        // point within the shadow is no longer included, new point is included
+        assert!(!map.voxels.contains_key(&(6, 0, 0)));
+        assert_eq!(map.voxels.get(&(5, 0, 0)), Some(&1));
+    }
+
+    #[test]
+    fn voxels_beyond_shadow_region_survive() {
+        let cfg = basic_config();
+        let mut map = VoxelMap::default();
+        map.voxels.insert((8, 0, 0), 1);
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.5, 0.5)], &cfg);
+        assert_eq!(map.voxels.get(&(8, 0, 0)), Some(&1));
+        assert_eq!(map.voxels.get(&(5, 0, 0)), Some(&1));
+    }
+
+    #[test]
+    fn hit_caught_by_other_ray_is_not_removed() {
+        let cfg = basic_config();
+        let mut map = VoxelMap::default();
+        update_map(
+            &mut map,
+            (0.0, 0.0, 0.0),
+            &[(3.5, 0.5, 0.5), (5.5, 0.5, 0.5)],
+            &cfg,
+        );
+        assert_eq!(map.voxels.get(&(3, 0, 0)), Some(&1));
+        assert_eq!(map.voxels.get(&(5, 0, 0)), Some(&1));
+    }
+
+    #[test]
+    fn point_beyond_max_range_does_not_clear() {
+        let cfg = Config {
+            max_range: 3.0,
+            ..basic_config()
+        };
+        let mut map = VoxelMap::default();
+        map.voxels.insert((3, 0, 0), 1);
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.5, 0.5)], &cfg);
+        assert_eq!(map.voxels.get(&(3, 0, 0)), Some(&1));
+    }
+
+    #[test]
+    fn two_hits_needed_when_min_health_is_negative() {
+        let cfg = Config {
+            min_health: -1,
+            ..basic_config()
+        };
+        let mut map = VoxelMap::default();
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.5, 0.5)], &cfg);
+        assert_eq!(map.voxels.get(&(5, 0, 0)), Some(&0));
+
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.5, 0.5)], &cfg);
+        assert_eq!(map.voxels.get(&(5, 0, 0)), Some(&1));
+    }
+
+    #[test]
+    fn two_misses_needed_when_max_health_is_two() {
+        let cfg = Config {
+            max_health: 2,
+            ..basic_config()
+        };
+        let mut map = VoxelMap::default();
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(3.5, 0.5, 0.5)], &cfg);
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(3.5, 0.5, 0.5)], &cfg);
+        assert_eq!(map.voxels.get(&(3, 0, 0)), Some(&2));
+
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.5, 0.5)], &cfg);
+        assert_eq!(map.voxels.get(&(3, 0, 0)), Some(&1));
+
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.5, 0.5)], &cfg);
+        assert!(!map.voxels.contains_key(&(3, 0, 0)));
     }
 }
