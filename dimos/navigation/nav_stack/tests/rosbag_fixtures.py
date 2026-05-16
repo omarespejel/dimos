@@ -336,6 +336,7 @@ class RosbagScanOdomPlaybackModule(Module):
         super().__init__(**kwargs)
         self._frames_published: int = 0
         self._playback_finished: bool = False
+        self._playback_error: str | None = None
 
     async def main(self) -> AsyncIterator[None]:
         rosbag_path = Path(self.config.rosbag_path) if self.config.rosbag_path else None
@@ -345,38 +346,51 @@ class RosbagScanOdomPlaybackModule(Module):
         self._playback_task.cancel()
 
     async def _run_playback(self) -> None:
-        if self.config.startup_delay_sec > 0:
-            await asyncio.sleep(self.config.startup_delay_sec)
-        timeline: list[tuple[str, float, Any]] = []
-        for odom_index in range(0, len(self._window.odom), self.config.odom_subsample):
-            row = self._window.odom[odom_index]
-            timeline.append(
-                ("odom", float(row[0]), make_odometry_msg(row[1:4], row[4:8], ts=row[0]))
-            )
-        for timestamp, points in self._window.scans:
-            timeline.append(("scan", float(timestamp), make_pointcloud_msg(points, ts=timestamp)))
-        timeline.sort(key=lambda entry: entry[1])
-        if not timeline:
-            self._playback_finished = True
-            return
+        # finally guarantees is_finished() flips to True even if a frame
+        # raises. Without it, callers polling is_finished() would spin
+        # forever and the coordinator would never tear down.
+        try:
+            if self.config.startup_delay_sec > 0:
+                await asyncio.sleep(self.config.startup_delay_sec)
+            timeline: list[tuple[str, float, Any]] = []
+            for odom_index in range(0, len(self._window.odom), self.config.odom_subsample):
+                row = self._window.odom[odom_index]
+                timeline.append(
+                    ("odom", float(row[0]), make_odometry_msg(row[1:4], row[4:8], ts=row[0]))
+                )
+            for timestamp, points in self._window.scans:
+                timeline.append(
+                    ("scan", float(timestamp), make_pointcloud_msg(points, ts=timestamp))
+                )
+            timeline.sort(key=lambda entry: entry[1])
+            if not timeline:
+                return
 
-        bag_start_time = timeline[0][1]
-        wallclock_start = time.monotonic()
-        for kind, bag_timestamp, message in timeline:
-            target_wallclock = wallclock_start + (bag_timestamp - bag_start_time)
-            now = time.monotonic()
-            if target_wallclock > now:
-                await asyncio.sleep(target_wallclock - now)
-            if kind == "odom":
-                self.odometry.publish(message)
-            else:
-                self.registered_scan.publish(message)
-            self._frames_published += 1
-        self._playback_finished = True
+            bag_start_time = timeline[0][1]
+            wallclock_start = time.monotonic()
+            for kind, bag_timestamp, message in timeline:
+                target_wallclock = wallclock_start + (bag_timestamp - bag_start_time)
+                now = time.monotonic()
+                if target_wallclock > now:
+                    await asyncio.sleep(target_wallclock - now)
+                if kind == "odom":
+                    self.odometry.publish(message)
+                else:
+                    self.registered_scan.publish(message)
+                self._frames_published += 1
+        except Exception as exc:
+            self._playback_error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            self._playback_finished = True
 
     @rpc
     def is_finished(self) -> bool:
         return self._playback_finished
+
+    @rpc
+    def playback_error(self) -> str | None:
+        return self._playback_error
 
     @rpc
     def frames_published(self) -> int:
