@@ -96,12 +96,19 @@ impl RayTracingVoxelMap {
             return;
         }
 
+        let inv = 1.0_f32 / voxel_size;
+        let mut live: AHashSet<VoxelKey> = AHashSet::with_capacity(points.len());
+        for &(x, y, z) in &points {
+            live.insert(world_to_voxel(x, y, z, inv));
+        }
+
         update_map(&mut self.map, origin, &points, &self.config);
 
         // Echo the input cloud's frame; the global map lives in the same
         // world frame as the upstream lidar/odometry.
         let cloud = build_pointcloud(
             &self.map,
+            &live,
             voxel_size,
             &msg.header.frame_id,
             msg.header.stamp,
@@ -354,14 +361,25 @@ fn read_f32_le(buf: &[u8], off: usize) -> f32 {
     f32::from_le_bytes(bytes)
 }
 
-fn build_pointcloud(map: &VoxelMap, voxel_size: f32, frame_id: &str, stamp: Time) -> PointCloud2 {
+fn build_pointcloud(
+    map: &VoxelMap,
+    live: &AHashSet<VoxelKey>,
+    voxel_size: f32,
+    frame_id: &str,
+    stamp: Time,
+) -> PointCloud2 {
     let half = voxel_size * 0.5;
-    let mut data = Vec::with_capacity(map.voxels.len() * 16);
-    let mut n: i32 = 0;
-    for (&(kx, ky, kz), &health) in &map.voxels {
-        if health <= 0 {
-            continue;
+    let mut visible: AHashSet<VoxelKey> = AHashSet::with_capacity(map.voxels.len() + live.len());
+    visible.extend(live.iter().copied());
+    for (&key, &health) in &map.voxels {
+        if health > 0 {
+            visible.insert(key);
         }
+    }
+
+    let mut data = Vec::with_capacity(visible.len() * 16);
+    let mut n: i32 = 0;
+    for &(kx, ky, kz) in &visible {
         let x = kx as f32 * voxel_size + half;
         let y = ky as f32 * voxel_size + half;
         let z = kz as f32 * voxel_size + half;
