@@ -51,6 +51,8 @@ class RayTracingVoxelMapConfig(NativeModuleConfig):
     # Honestly we probably should always have this at 1 unless you don't care about a clean map.
     # Higher num means less ray tracing.
     ray_subsample: int = 1
+    # Extend rays past the end point to clear shadows
+    shadow_depth: float = 0.2
 
 
 class RayTracingVoxelMap(NativeModule, mapping.GlobalPointcloud):

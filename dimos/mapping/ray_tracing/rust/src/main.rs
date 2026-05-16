@@ -35,6 +35,7 @@ struct Config {
     voxel_size: f32,
     max_range: f32,
     ray_subsample: u32,
+    shadow_depth: f32,
 }
 
 #[derive(Default)]
@@ -138,7 +139,15 @@ fn update_map(
             continue;
         }
         let endpoint = world_to_voxel(p.0, p.1, p.2, inv);
-        walk_ray(map, origin, p, cfg.voxel_size, origin_voxel, endpoint);
+        walk_ray(
+            map,
+            origin,
+            p,
+            cfg.voxel_size,
+            cfg.shadow_depth,
+            origin_voxel,
+            endpoint,
+        );
     }
 }
 
@@ -152,12 +161,15 @@ fn world_to_voxel(x: f32, y: f32, z: f32, inv: f32) -> VoxelKey {
 }
 
 /// Amanatides & Woo 3-D DDA. Removes every voxel strictly between
-/// `origin_voxel` and `endpoint` from the map. Endpoint is kept.
+/// `origin_voxel` and `endpoint` from the map, then continues past
+/// `endpoint` for `shadow_depth` meters, clearing those voxels too.
+/// The endpoint voxel itself is preserved.
 fn walk_ray(
     map: &mut VoxelMap,
     origin: (f32, f32, f32),
     end: (f32, f32, f32),
     voxel_size: f32,
+    shadow_depth: f32,
     origin_voxel: VoxelKey,
     endpoint: VoxelKey,
 ) {
@@ -208,8 +220,17 @@ fn walk_ray(
         voxel_size / dz.abs()
     };
 
+    let half = voxel_size * 0.5;
+    let endpoint_center = (
+        endpoint.0 as f32 * voxel_size + half,
+        endpoint.1 as f32 * voxel_size + half,
+        endpoint.2 as f32 * voxel_size + half,
+    );
+    let shadow_sq = shadow_depth.max(0.0).powi(2);
+
     // FIXME: I don't know if we really need this
     let max_iter = 4096;
+    let mut past_endpoint = false;
     for _ in 0..max_iter {
         if tx < ty {
             if tx < tz {
@@ -226,11 +247,27 @@ fn walk_ray(
             z += step_z;
             tz += dt_z;
         }
+
+        // FIXME: I don't like how this is written, come back and change this.
+        // It would be more clear to do this in two loops, one for the normal tracing
+        // and a second for the shadow clearing
         if (x, y, z) == endpoint {
-            return;
+            past_endpoint = true;
+            continue;
         }
 
-        // don't need any fancy logic, it removes it if it's there
+        if past_endpoint {
+            let cx = x as f32 * voxel_size + half;
+            let cy = y as f32 * voxel_size + half;
+            let cz = z as f32 * voxel_size + half;
+            let ddx = cx - endpoint_center.0;
+            let ddy = cy - endpoint_center.1;
+            let ddz = cz - endpoint_center.2;
+            if ddx * ddx + ddy * ddy + ddz * ddz > shadow_sq {
+                return;
+            }
+        }
+
         map.voxels.remove(&(x, y, z));
     }
 }
@@ -358,6 +395,7 @@ mod tests {
             voxel_size,
             max_range: 100.0,
             ray_subsample: 1,
+            shadow_depth: 0.0,
         }
     }
 
@@ -403,6 +441,38 @@ mod tests {
         map.voxels.insert((0, 0, 0));
         update_map(&mut map, (0.5, 0.5, 0.5), &[(0.6, 0.5, 0.5)], &cfg(1.0));
         assert!(map.voxels.contains(&(0, 0, 0)));
+    }
+
+    #[test]
+    fn shadow_depth_clears_voxels_behind_endpoint() {
+        let mut map = VoxelMap::default();
+        // Stale voxel directly behind the new hit, along the same ray.
+        map.voxels.insert((6, 0, 0));
+        let mut c = cfg(1.0);
+        c.shadow_depth = 2.5;
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &c);
+        assert!(map.voxels.contains(&(5, 0, 0)));
+        assert!(!map.voxels.contains(&(6, 0, 0)));
+    }
+
+    #[test]
+    fn shadow_depth_zero_preserves_voxels_behind_endpoint() {
+        let mut map = VoxelMap::default();
+        map.voxels.insert((6, 0, 0));
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &cfg(1.0));
+        assert!(map.voxels.contains(&(6, 0, 0)));
+    }
+
+    #[test]
+    fn shadow_depth_stops_at_configured_distance() {
+        let mut map = VoxelMap::default();
+        map.voxels.insert((6, 0, 0));
+        map.voxels.insert((9, 0, 0));
+        let mut c = cfg(1.0);
+        c.shadow_depth = 2.5;
+        update_map(&mut map, (0.0, 0.0, 0.0), &[(5.5, 0.0, 0.0)], &c);
+        assert!(!map.voxels.contains(&(6, 0, 0)));
+        assert!(map.voxels.contains(&(9, 0, 0)));
     }
 
     #[test]
