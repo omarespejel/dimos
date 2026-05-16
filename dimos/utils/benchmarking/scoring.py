@@ -20,6 +20,7 @@ score identically.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import math
 
@@ -29,7 +30,10 @@ from numpy.typing import NDArray
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.nav_msgs.Path import Path
+from dimos.utils.characterization.trajectories import TrajRefState
 from dimos.utils.trigonometry import angle_diff
+
+RefFn = Callable[[float], TrajRefState]
 
 
 @dataclass
@@ -50,6 +54,7 @@ class ExecutedTrajectory:
 
 @dataclass
 class ScoreResult:
+    # Path-following (spatial CTE — measured against a Path).
     cte_rms: float = 0.0  # m
     cte_max: float = 0.0  # m
     heading_err_rms: float = 0.0  # rad
@@ -60,6 +65,18 @@ class ScoreResult:
     cmd_rate_integral: float = 0.0  # Sum |dcmd| (smoothness; lower is smoother)
     arrived: bool = False
     n_ticks: int = 0
+    # Trajectory tracking (time-indexed — measured against r(t)). Decomposed
+    # in the reference yaw frame at each tick. Positive along-track lag
+    # means the robot is BEHIND the reference along the reference's
+    # heading. ``traj_completed_on_time_pct`` is the fraction of the
+    # expected duration spanned by the run (1.0 if duration unknown).
+    along_track_lag_rms: float = 0.0  # m
+    along_track_lag_max: float = 0.0  # m
+    cross_track_traj_rms: float = 0.0  # m
+    cross_track_traj_max: float = 0.0  # m
+    heading_err_traj_rms: float = 0.0  # rad
+    heading_err_traj_max: float = 0.0  # rad
+    traj_completed_on_time_pct: float = 0.0  # 0..1
 
 
 # ---------------------------------------------------------------------------
@@ -176,4 +193,100 @@ def score_run(reference_path: Path, executed: ExecutedTrajectory) -> ScoreResult
         cmd_rate_integral=cmd_rate_integral,
         arrived=executed.arrived,
         n_ticks=len(executed.ticks),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Trajectory-tracking scoring (time-indexed, decomposed in ref-yaw frame)
+# ---------------------------------------------------------------------------
+
+
+def score_run_with_trajectory(
+    executed: ExecutedTrajectory,
+    ref_fn: RefFn,
+    *,
+    duration_s: float | None = None,
+) -> ScoreResult:
+    """Score against a time-indexed reference ``r(t)``.
+
+    The error vector ``(pose.x - ref.x, pose.y - ref.y)`` is rotated into
+    the **reference yaw frame** at each tick:
+
+      - ``along_track`` (+ if robot is ahead of reference along its heading)
+      - ``cross_track``  (+ if robot is to the LEFT of the reference direction)
+
+    Heading error uses :func:`angle_diff` so wrap-around is handled.
+
+    ``traj_completed_on_time_pct`` reports the fraction of ``duration_s``
+    spanned by the run. When ``duration_s`` is ``None``, defaults to 1.0
+    if any ticks were recorded (analysis is responsible for supplying
+    the expected duration).
+
+    Path-following fields on the returned :class:`ScoreResult` are zero —
+    call :func:`score_run` separately if both are needed.
+    """
+    if not executed.ticks:
+        return ScoreResult(arrived=executed.arrived, n_ticks=0)
+
+    along_lag_sq: list[float] = []
+    along_lag_abs: list[float] = []
+    cross_sq: list[float] = []
+    cross_abs: list[float] = []
+    he_sq: list[float] = []
+    he_abs: list[float] = []
+    lin_sq: list[float] = []
+    ang_sq: list[float] = []
+
+    for tick in executed.ticks:
+        ref = ref_fn(tick.t)
+        ex = tick.pose.position.x - ref.x
+        ey = tick.pose.position.y - ref.y
+
+        cos_y = math.cos(ref.yaw)
+        sin_y = math.sin(ref.yaw)
+        # Project world error into ref-yaw frame. Along-track is the
+        # ref-x component (positive = robot ahead). Lag (the diagnostic
+        # quantity) is the negative of along-track signed offset:
+        along_signed = cos_y * ex + sin_y * ey  # + = ahead
+        lag = -along_signed  # + = behind, matches "robot is X behind ref"
+        cross = -sin_y * ex + cos_y * ey  # + = left of ref direction
+
+        along_lag_sq.append(lag * lag)
+        along_lag_abs.append(abs(lag))
+        cross_sq.append(cross * cross)
+        cross_abs.append(abs(cross))
+
+        he = angle_diff(tick.pose.orientation.euler[2], ref.yaw)
+        he_sq.append(he * he)
+        he_abs.append(abs(he))
+
+        lin_sq.append(_twist_linear_speed(tick.cmd_twist) ** 2)
+        ang_sq.append(_twist_angular_speed(tick.cmd_twist) ** 2)
+
+    n = len(executed.ticks)
+    cmd_rate_integral = sum(
+        _cmd_delta(executed.ticks[i].cmd_twist, executed.ticks[i - 1].cmd_twist)
+        for i in range(1, n)
+    )
+
+    span = executed.ticks[-1].t - executed.ticks[0].t
+    if duration_s is not None and duration_s > 0.0:
+        completed_pct = min(1.0, span / duration_s)
+    else:
+        completed_pct = 1.0
+
+    return ScoreResult(
+        time_to_complete=span,
+        linear_speed_rms=math.sqrt(sum(lin_sq) / n),
+        angular_speed_rms=math.sqrt(sum(ang_sq) / n),
+        cmd_rate_integral=cmd_rate_integral,
+        arrived=executed.arrived,
+        n_ticks=n,
+        along_track_lag_rms=math.sqrt(sum(along_lag_sq) / n),
+        along_track_lag_max=max(along_lag_abs),
+        cross_track_traj_rms=math.sqrt(sum(cross_sq) / n),
+        cross_track_traj_max=max(cross_abs),
+        heading_err_traj_rms=math.sqrt(sum(he_sq) / n),
+        heading_err_traj_max=max(he_abs),
+        traj_completed_on_time_pct=completed_pct,
     )

@@ -54,6 +54,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -64,8 +65,9 @@ from dimos.core.transport import LCMTransport
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
-from dimos.utils.characterization.recipes import TestRecipe
+from dimos.utils.characterization.recipes import TestRecipe, TrajectoryRecipe
 from dimos.utils.characterization.recorder import BmsLogger, CharacterizationRecorder
+from dimos.utils.characterization.trajectories import anchor_trajectory
 
 if TYPE_CHECKING:
     from dimos.core.coordination.blueprints import Blueprint
@@ -314,6 +316,7 @@ class CharacterizationSession:
         cmd_vel_topic: str = "/cmd_vel",
         output_root: Path | str,
         bms: BmsLogger | None = None,
+        odom_topic: str | None = None,
     ) -> None:
         self._cmd_vel = LCMTransport(cmd_vel_topic, Twist)
         self._cmd_vel_topic = cmd_vel_topic
@@ -322,15 +325,51 @@ class CharacterizationSession:
         self._bms = bms
         self._closed = False
 
+        # Lazy pose subscriber, only attached when odom_topic is provided.
+        # The trajectory tick body reads the latest pose; the existing
+        # TestRecipe path doesn't need it.
+        self._odom_topic = odom_topic
+        self._odom_sub: LCMTransport | None = None
+        self._odom_lock = threading.Lock()
+        self._latest_pose: list[PoseStamped | None] = [None]
+        self._last_odom_t: list[float] = [0.0]
+        if odom_topic is not None:
+            self._odom_sub = LCMTransport(odom_topic, PoseStamped)
+
+            def _on_odom(msg: PoseStamped) -> None:
+                with self._odom_lock:
+                    self._latest_pose[0] = msg
+                    self._last_odom_t[0] = time.monotonic()
+
+            self._odom_sub.subscribe(_on_odom)
+
     def close(self) -> None:
-        """Stop the LCM transport. Safe to call multiple times."""
+        """Stop the LCM transports. Safe to call multiple times."""
         if self._closed:
             return
         try:
             self._cmd_vel.stop()
         except Exception:  # pragma: no cover
-            logger.exception("CharacterizationSession: transport stop failed")
+            logger.exception("CharacterizationSession: cmd transport stop failed")
+        if self._odom_sub is not None:
+            try:
+                self._odom_sub.stop()
+            except Exception:  # pragma: no cover
+                logger.exception("CharacterizationSession: odom transport stop failed")
         self._closed = True
+
+    def _read_latest_pose(self, max_age_s: float) -> PoseStamped | None:
+        """Return the latest pose if it's fresher than ``max_age_s``, else ``None``."""
+        if self._odom_sub is None:
+            return None
+        with self._odom_lock:
+            pose = self._latest_pose[0]
+            t = self._last_odom_t[0]
+        if pose is None:
+            return None
+        if time.monotonic() - t > max_age_s:
+            return None
+        return pose
 
     def __enter__(self) -> CharacterizationSession:
         return self
@@ -510,6 +549,222 @@ class CharacterizationSession:
             cmd_monotonic_jsonl=cmd_jsonl,
         )
 
+    def run_trajectory(
+        self,
+        recipe: TrajectoryRecipe,
+        *,
+        blueprint_name: str = "unitree_go2_characterization",
+        simulation: bool = False,
+        operator: OperatorMetadata | None = None,
+        run_dir: Path | None = None,
+        session_db_path: Path | None = None,
+        session_id: str | None = None,
+        stale_pose_s: float = 0.5,
+    ) -> RunResult:
+        """Like :meth:`run`, but ticks a closed-loop ``TrajectoryRecipe``.
+
+        Each active-window tick evaluates ``recipe.trajectory.ref_fn(t)``
+        and calls ``recipe.controller_fn(t, pose, ref)`` where ``pose``
+        is the latest pose from the odom subscriber (or ``None`` if the
+        session was constructed without an ``odom_topic`` or no fresh
+        message has arrived within ``stale_pose_s``).
+
+        Records the reference state and the latest pose alongside the
+        commanded Twist in ``cmd_monotonic.jsonl`` so ``diagnose.py``
+        can score the run without touching the SQLite recording.
+        """
+        operator = operator or OperatorMetadata()
+        if run_dir is not None:
+            run_dir = Path(run_dir).expanduser().resolve()
+            run_id = run_dir.name
+        else:
+            run_id = _generate_run_id(recipe.name)
+            run_dir = self._output_root / run_id
+            run_dir.mkdir(parents=True, exist_ok=False)
+
+        run_json = run_dir / "run.json"
+        cmd_jsonl = run_dir / "cmd_monotonic.jsonl"
+        recording_db = run_dir / "recording.db"
+
+        t_mono_start = time.monotonic()
+        t_wall_start = time.time()
+        bms_start = self._bms.snapshot() if self._bms is not None else None
+
+        session_db_rel: str | None = None
+        if session_db_path is not None:
+            try:
+                session_db_rel = str(
+                    Path(session_db_path).resolve().relative_to(run_dir.resolve(), walk_up=True)
+                )
+            except (ValueError, TypeError):
+                session_db_rel = str(Path(session_db_path).resolve())
+
+        metadata_head = {
+            "run_id": run_id,
+            "session_id": session_id,
+            "recipe": recipe.serialize(),
+            "blueprint": blueprint_name,
+            "simulation": simulation,
+            "cmd_vel_topic": self._cmd_vel_topic,
+            "odom_topic": self._odom_topic,
+            "started_at_wall": t_wall_start,
+            "started_at_monotonic": t_mono_start,
+            "clock_anchor": {"monotonic": t_mono_start, "wall": t_wall_start},
+            "operator": operator.as_dict(),
+            "git_sha": _git_sha(),
+            "python_version": sys.version.split()[0],
+            "dimos_version": _dimos_version(),
+            "bms_start": bms_start,
+            "recording_db": recording_db.name if session_db_rel is None else None,
+            "session_db_path": session_db_rel,
+            "cmd_monotonic_jsonl": cmd_jsonl.name,
+            "bms_samples": [],
+        }
+        _write_json(run_json, metadata_head)
+
+        exit_reason = "ok"
+        n_commanded = 0
+        bms_samples: list[dict[str, Any]] = []
+        last_bms_mono: float = -1.0
+        # Captured at the pre-roll → active transition: the reference is
+        # defined in a local frame (origin, yaw=0); we anchor it to wherever
+        # the robot actually is so e(t) measures plant behavior, not the
+        # fixed start-pose offset.
+        anchored_ref_fn = None
+        start_pose_xytheta: dict[str, float] | None = None
+        try:
+            with cmd_jsonl.open("w") as fh:
+                total = recipe.pre_roll_s + recipe.duration_s + recipe.post_roll_s
+                dt = 1.0 / recipe.sample_rate_hz
+                seq = 0
+                t_start = time.monotonic()
+
+                while True:
+                    t_mono = time.monotonic()
+                    t_rel = t_mono - t_start
+                    if t_rel >= total:
+                        break
+
+                    if t_rel < recipe.pre_roll_s:
+                        vx, vy, wz = 0.0, 0.0, 0.0
+                        ref_x = ref_y = ref_yaw = ref_vx = ref_wz = 0.0
+                        phase = "pre_roll"
+                    elif t_rel < recipe.pre_roll_s + recipe.duration_s:
+                        t_active = t_rel - recipe.pre_roll_s
+                        if anchored_ref_fn is None:
+                            sp = self._read_latest_pose(stale_pose_s)
+                            if sp is not None:
+                                sx = float(sp.position.x)
+                                sy = float(sp.position.y)
+                                syaw = float(sp.orientation.euler[2])
+                            else:
+                                # No odom (e.g. mock backend): local == world.
+                                sx = sy = syaw = 0.0
+                                logger.warning(
+                                    "run_trajectory %s: no pose at active start; "
+                                    "reference NOT anchored (local frame)",
+                                    run_id,
+                                )
+                            start_pose_xytheta = {"x": sx, "y": sy, "yaw": syaw}
+                            anchored_ref_fn = anchor_trajectory(
+                                recipe.trajectory.ref_fn, sx, sy, syaw
+                            )
+                        ref = anchored_ref_fn(t_active)
+                        ref_x, ref_y = ref.x, ref.y
+                        ref_yaw, ref_vx, ref_wz = ref.yaw, ref.vx, ref.wz
+                        pose = self._read_latest_pose(stale_pose_s)
+                        vx, vy, wz = recipe.controller_fn(t_active, pose, ref)
+                        phase = "active"
+                    else:
+                        vx, vy, wz = 0.0, 0.0, 0.0
+                        ref_x = ref_y = ref_yaw = ref_vx = ref_wz = 0.0
+                        phase = "post_roll"
+
+                    twist = Twist(Vector3(vx, vy, 0.0), Vector3(0.0, 0.0, wz))
+                    self._cmd_vel.publish(twist)
+                    t_wall = time.time()
+
+                    # Latest pose (may be None if no odom yet, or stale).
+                    pose_now = self._read_latest_pose(stale_pose_s)
+                    if pose_now is not None:
+                        pose_x = float(pose_now.position.x)
+                        pose_y = float(pose_now.position.y)
+                        pose_yaw = float(pose_now.orientation.euler[2])
+                    else:
+                        pose_x = pose_y = pose_yaw = None  # type: ignore[assignment]
+
+                    fh.write(
+                        json.dumps(
+                            {
+                                "seq": seq,
+                                "tx_mono": t_mono,
+                                "tx_wall": t_wall,
+                                "phase": phase,
+                                "vx": vx,
+                                "vy": vy,
+                                "wz": wz,
+                                "ref_x": ref_x,
+                                "ref_y": ref_y,
+                                "ref_yaw": ref_yaw,
+                                "ref_vx": ref_vx,
+                                "ref_wz": ref_wz,
+                                "pose_x": pose_x,
+                                "pose_y": pose_y,
+                                "pose_yaw": pose_yaw,
+                            }
+                        )
+                        + "\n"
+                    )
+                    n_commanded += 1
+                    seq += 1
+
+                    if self._bms is not None and self._bms.available:
+                        if t_mono - last_bms_mono >= 1.0:
+                            snap = self._bms.snapshot()
+                            snap["t_mono"] = t_mono
+                            snap["t_wall"] = t_wall
+                            bms_samples.append(snap)
+                            last_bms_mono = t_mono
+
+                    next_t = t_start + (seq * dt)
+                    sleep_s = next_t - time.monotonic()
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+
+                self._cmd_vel.publish(Twist(Vector3(0, 0, 0), Vector3(0, 0, 0)))
+
+        except KeyboardInterrupt:
+            exit_reason = "interrupted"
+            logger.warning("trajectory run %s interrupted by user", run_id)
+        except Exception as e:
+            exit_reason = f"exception:{type(e).__name__}:{e}"
+            logger.exception("trajectory run %s failed", run_id)
+        finally:
+            bms_end = self._bms.snapshot() if self._bms is not None else None
+            t_wall_end = time.time()
+            metadata_head["completed_at_wall"] = t_wall_end
+            metadata_head["completed_at_monotonic"] = time.monotonic()
+            metadata_head["exit_reason"] = exit_reason
+            metadata_head["n_commanded"] = n_commanded
+            metadata_head["bms_end"] = bms_end
+            metadata_head["bms_samples"] = bms_samples
+            metadata_head["ts_window_wall"] = {
+                "start": t_wall_start - 0.2,
+                "end": t_wall_end + 0.2,
+            }
+            metadata_head["trajectory_start_pose"] = start_pose_xytheta
+            _write_json(run_json, metadata_head)
+
+        return RunResult(
+            run_id=run_id,
+            run_dir=run_dir,
+            n_commanded=n_commanded,
+            exit_reason=exit_reason,
+            run_json=run_json,
+            recording_db=recording_db,
+            cmd_monotonic_jsonl=cmd_jsonl,
+        )
+
 
 # ---------------------------------------------------------------------- session
 
@@ -611,10 +866,15 @@ class SessionManager:
         self._coord = ModuleCoordinator.build(bp)
         time.sleep(self.warmup_s)
 
+        # Wire the odom subscriber for trajectory recipes. For backends
+        # that don't publish /go2/odom (e.g. mock), the subscription is a
+        # no-op — the trajectory tick body falls back to feedforward-only.
+        odom_topic = "/go2/odom" if self.backend == "go2" else None
         self._recipe_session = CharacterizationSession(
             cmd_vel_topic="/cmd_vel",
             output_root=self.session_dir,
             bms=self._try_make_bms_logger(),
+            odom_topic=odom_topic,
         )
         self._write_session_head(status="ready")
 
@@ -651,6 +911,40 @@ class SessionManager:
         run_dir.mkdir(parents=True, exist_ok=False)
         result = self._recipe_session.run(
             entry.recipe,
+            blueprint_name=f"{self.backend}_characterization",
+            simulation=self.simulation,
+            operator=self.operator,
+            run_dir=run_dir,
+            session_db_path=self.session_db,
+            session_id=self.session_id,
+        )
+        self._runs.append(result)
+        self._write_session_head(status="running")
+        return result
+
+    def run_trajectory(
+        self,
+        recipe: TrajectoryRecipe,
+        *,
+        run_index: int,
+        label: str | None = None,
+    ) -> RunResult:
+        """Run one ``TrajectoryRecipe`` through the active session.
+
+        ``label`` is the filesystem-safe directory suffix (default: the
+        recipe name). The directory layout matches the ``TestRecipe`` path
+        (``{nnn}_{label}/``) so analysis tools find both kinds of run.
+        """
+        if self._recipe_session is None:
+            raise RuntimeError("SessionManager.run_trajectory() called before start_coordinator()")
+
+        safe_label = label or "".join(
+            c if (c.isalnum() or c in "-_.") else "_" for c in recipe.name
+        )
+        run_dir = self.session_dir / f"{run_index:03d}_{safe_label}"
+        run_dir.mkdir(parents=True, exist_ok=False)
+        result = self._recipe_session.run_trajectory(
+            recipe,
             blueprint_name=f"{self.backend}_characterization",
             simulation=self.simulation,
             operator=self.operator,

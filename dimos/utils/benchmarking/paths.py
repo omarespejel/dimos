@@ -315,7 +315,7 @@ def path_to_svg(path: Path, size_px: int = 400, margin_px: int = 20) -> str:
     sp.add(Polyline(msg=path, color="#000000", width=_REF_WIDTH))
     sp.add(Point(msg=path.poses[0], color=_START_COLOR, radius=_MARKER_RADIUS))
     sp.add(Point(msg=path.poses[-1], color=_END_COLOR, radius=_MARKER_RADIUS))
-    return sp.to_svg(show_axes=True)
+    return sp.to_svg()
 
 
 def trajectory_to_svg(
@@ -335,7 +335,7 @@ def trajectory_to_svg(
     ex, ey = executed_xy[-1]
     sp.add(Point(msg=GeoPoint(sx, sy, 0.0), color=_START_COLOR, radius=_MARKER_RADIUS))
     sp.add(Point(msg=GeoPoint(ex, ey, 0.0), color=_END_COLOR, radius=_MARKER_RADIUS))
-    return sp.to_svg(show_axes=True)
+    return sp.to_svg()
 
 
 def multi_trajectory_to_svg(
@@ -403,7 +403,7 @@ def multi_trajectory_to_svg(
         )
         sp.add(Text(position=(x_min + 0.5, ly, 0.0), text=name, font_size=12.0, color=color))
 
-    return sp.to_svg(show_axes=True)
+    return sp.to_svg()
 
 
 __all__ = [

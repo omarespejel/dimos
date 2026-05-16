@@ -94,9 +94,18 @@ SESSION3_VELOCITY_TRACKING = VelocityTrackingConfig(
     dt=0.1,
 )
 
-# Strategy B: static plant-gain feedforward. Numbers from
-# dimos.utils.benchmarking.plant_models (Session 3 fitted Go2 K values).
-GO2_FEEDFORWARD = FeedforwardGainConfig(K_vx=1.008, K_vy=1.008, K_wz=2.175)
+# Strategy B: static plant-gain feedforward. Derived from the single
+# source of truth (dimos.utils.benchmarking.plant_models) so it can never
+# go stale again — a hardcoded copy here (K_wz=2.175) silently diverged
+# from the vendored fit (2.453) and made every FF controller compensate
+# with the wrong gain. Read it; don't copy it.
+from dimos.utils.benchmarking.plant_models import GO2_PLANT_FITTED as _GO2_PLANT
+
+GO2_FEEDFORWARD = FeedforwardGainConfig(
+    K_vx=_GO2_PLANT.vx.K,
+    K_vy=_GO2_PLANT.vy.K,
+    K_wz=_GO2_PLANT.wz.K,
+)
 
 
 # Sim cohort matrix: each entry produces a callable (path, timeout) -> ExecutedTrajectory.

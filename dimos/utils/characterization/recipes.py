@@ -25,6 +25,11 @@ around it. Define a recipe in ~5 lines::
         duration_s=3.0,
         signal_fn=step(amplitude=1.0, channel="vx"),
     )
+
+For the trajectory-tracking diagnostic the sibling :class:`TrajectoryRecipe`
+carries a time-indexed reference and a closed-loop controller_fn instead
+of an open-loop signal_fn. Both run through ``CharacterizationSession``;
+only the inner tick body differs.
 """
 
 from __future__ import annotations
@@ -34,6 +39,9 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import numpy as np
+
+from dimos.utils.characterization.controllers import ControllerFn
+from dimos.utils.characterization.trajectories import Trajectory
 
 Channel = Literal["vx", "vy", "wz"]
 SignalFn = Callable[[float], tuple[float, float, float]]
@@ -73,6 +81,54 @@ class TestRecipe:
             "pre_roll_s": self.pre_roll_s,
             "post_roll_s": self.post_roll_s,
             "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True)
+class TrajectoryRecipe:
+    """A time-indexed reference + closed-loop controller, as data.
+
+    The runner ticks at ``sample_rate_hz`` and on each active-window tick:
+
+      1. evaluates ``ref = trajectory.ref_fn(t_active)``
+      2. reads the latest pose from the odom transport (or ``None`` if stale)
+      3. calls ``controller_fn(t_active, pose, ref) -> (vx, vy, wz)``
+      4. publishes that Twist and records the ref state in
+         ``cmd_monotonic.jsonl``
+
+    ``serialize()`` excludes the callables but includes
+    ``trajectory.spec`` and ``controller_mode`` so the diagnose step can
+    rebuild ``ref_fn`` from ``run.json`` long after the run.
+    """
+
+    # Tell pytest this dataclass is not a test collection target.
+    __test__ = False
+
+    name: str
+    trajectory: Trajectory
+    controller_fn: ControllerFn
+    sample_rate_hz: float = 50.0
+    pre_roll_s: float = 0.5
+    post_roll_s: float = 1.0
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def duration_s(self) -> float:
+        return self.trajectory.duration_s
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "test_type": "trajectory",
+            "duration_s": self.duration_s,
+            "sample_rate_hz": self.sample_rate_hz,
+            "pre_roll_s": self.pre_roll_s,
+            "post_roll_s": self.post_roll_s,
+            "metadata": {
+                **dict(self.metadata),
+                "trajectory_spec": dict(self.trajectory.spec),
+                "controller_mode": self.trajectory.recommended_mode,
+            },
         }
 
 
@@ -169,6 +225,7 @@ __all__ = [
     "SignalFn",
     "TestRecipe",
     "TestType",
+    "TrajectoryRecipe",
     "chirp",
     "composite",
     "constant",

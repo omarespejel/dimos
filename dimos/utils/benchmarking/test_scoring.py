@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
@@ -27,7 +29,9 @@ from dimos.utils.benchmarking.scoring import (
     ExecutedTrajectory,
     TrajectoryTick,
     score_run,
+    score_run_with_trajectory,
 )
+from dimos.utils.characterization.trajectories import circle, straight
 
 
 def _pose(x: float, y: float, yaw: float = 0.0) -> PoseStamped:
@@ -194,3 +198,122 @@ def test_off_axis_perpendicular_to_corner() -> None:
     result = score_run(path, ExecutedTrajectory(ticks=ticks, arrived=False))
     # nearest point on either segment is the corner (1.0, 0.0); distance = 0.3
     assert result.cte_rms == pytest.approx(0.3, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Trajectory-tracking scoring (time-indexed)
+# ---------------------------------------------------------------------------
+
+
+def test_constant_along_track_lag() -> None:
+    """Ref straight at 0.5 m/s; executed shifted 0.1 m back at every tick.
+
+    Pins sign convention: ``along_track_lag > 0`` means robot is BEHIND
+    the reference. Cross-track should be ~0, heading error ~0.
+    """
+    traj = straight(v=0.5, duration=4.0)
+    dt = 0.05
+    n = 80
+    ticks = [
+        TrajectoryTick(
+            t=i * dt,
+            pose=_pose(traj.ref_fn(i * dt).x - 0.1, 0.0, 0.0),  # 0.1 m behind in ref-frame x
+            cmd_twist=_const_twist(0.5),
+            actual_twist=_const_twist(0.5),
+        )
+        for i in range(n)
+    ]
+    result = score_run_with_trajectory(
+        ExecutedTrajectory(ticks=ticks, arrived=False),
+        traj.ref_fn,
+        duration_s=traj.duration_s,
+    )
+
+    assert result.along_track_lag_rms == pytest.approx(0.1, abs=1e-9)
+    assert result.along_track_lag_max == pytest.approx(0.1, abs=1e-9)
+    assert result.cross_track_traj_rms == pytest.approx(0.0, abs=1e-9)
+    assert result.heading_err_traj_rms == pytest.approx(0.0, abs=1e-9)
+    assert result.traj_completed_on_time_pct == pytest.approx(
+        (n - 1) * dt / traj.duration_s, abs=1e-9
+    )
+
+
+def test_pure_cross_track_drift() -> None:
+    """Ref straight along +x; executed has same x but drifts +y at 0.1 m/s.
+
+    Pins frame rotation: cross-track is computed in ref-yaw frame.
+    Since ref.yaw=0, ref-frame y == world y. Cross-track RMS over
+    [0, T] of a linear drift is ``v_drift * T / sqrt(3)``.
+    """
+    traj = straight(v=0.5, duration=4.0)
+    dt = 0.05
+    n = 80
+    v_drift = 0.1
+    ticks = [
+        TrajectoryTick(
+            t=i * dt,
+            pose=_pose(traj.ref_fn(i * dt).x, v_drift * (i * dt), 0.0),
+            cmd_twist=_const_twist(0.5),
+            actual_twist=_const_twist(0.5),
+        )
+        for i in range(n)
+    ]
+    result = score_run_with_trajectory(ExecutedTrajectory(ticks=ticks, arrived=False), traj.ref_fn)
+
+    # Discrete RMS for a linear ramp 0..v_drift*T over n samples
+    T = (n - 1) * dt
+    expected_rms = v_drift * math.sqrt(sum((i * dt) ** 2 for i in range(n)) / n)
+    assert result.cross_track_traj_rms == pytest.approx(expected_rms, abs=1e-9)
+    # Max cross-track is the final tick's drift
+    assert result.cross_track_traj_max == pytest.approx(v_drift * T, abs=1e-9)
+    assert result.along_track_lag_rms == pytest.approx(0.0, abs=1e-9)
+    assert result.heading_err_traj_rms == pytest.approx(0.0, abs=1e-9)
+
+
+def test_saturated_circle() -> None:
+    """Ref circle at w=1.6 rad/s; executed clipped to w=1.5 rad/s.
+
+    Pins the saturation signature the classifier hunts for: heading
+    error grows monotonically with time; cross-track grows too as the
+    two circle radii diverge.
+    """
+    v = 0.5
+    w_ref = 1.6
+    w_actual = 1.5
+    ref_traj = circle(v=v, w=w_ref, duration=1.0)
+
+    dt = 0.02
+    n = 50
+    ticks = []
+    for i in range(n):
+        t = i * dt
+        yaw = w_actual * t
+        inv_w = 1.0 / w_actual
+        x = v * inv_w * math.sin(yaw)
+        y = v * inv_w * (1.0 - math.cos(yaw))
+        ticks.append(
+            TrajectoryTick(
+                t=t,
+                pose=_pose(x, y, yaw),
+                cmd_twist=_const_twist(v, w_actual),
+                actual_twist=_const_twist(v, w_actual),
+            )
+        )
+
+    result = score_run_with_trajectory(
+        ExecutedTrajectory(ticks=ticks, arrived=False),
+        ref_traj.ref_fn,
+        duration_s=ref_traj.duration_s,
+    )
+
+    # Heading error at the final tick should be (1.6 - 1.5) * t_final ≈ 0.1*0.98 = 0.098 rad.
+    # RMS over a linear ramp 0..0.098 over the run is 0.098/sqrt(3) ≈ 0.057.
+    expected_he_max = abs(w_ref - w_actual) * (n - 1) * dt
+    assert result.heading_err_traj_max == pytest.approx(expected_he_max, abs=1e-6)
+    # heading_err and cross_track should both be growing — pin lower bounds:
+    assert result.heading_err_traj_rms > 0.02
+    assert result.cross_track_traj_rms > 0.0
+    # Cross-track should be POSITIVE (the actual circle is to the LEFT of the ref,
+    # because actual has larger radius and they share initial heading); enough
+    # that we know the sign convention is exercised.
+    assert result.cross_track_traj_max > 0.0

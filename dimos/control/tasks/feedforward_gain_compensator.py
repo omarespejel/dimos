@@ -41,8 +41,11 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 class FeedforwardGainConfig:
     """Steady-state plant gains. Default = unity (passthrough).
 
-    For Go2: ``K_vx=1.008``, ``K_wz=2.175`` (Session 3 fitted, see
-    :mod:`dimos.utils.benchmarking.plant_models`).
+    For Go2, do not hardcode: read the vendored fit
+    ``dimos.utils.benchmarking.plant_models.GO2_PLANT_FITTED`` (currently
+    ``K_vx≈0.92``, ``K_wz≈2.45``). A stale hardcoded ``K_wz=2.175`` copy
+    silently mis-calibrated every FF controller; the single source of
+    truth is plant_models.
     """
 
     K_vx: float = 1.0
