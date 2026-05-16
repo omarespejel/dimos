@@ -69,12 +69,12 @@ class PGOConfig(NativeModuleConfig):
 
     # Scan Context place recognition (used by loop closure search)
     use_scan_context: bool = True
-    sc_n_rings: int = 20
-    sc_n_sectors: int = 60
-    sc_max_range_m: float = 80.0
-    sc_top_k: int = 10
-    sc_match_threshold: float = 0.4
-    sc_lidar_height_m: float = 2.0
+    scan_context_num_rings: int = 20
+    scan_context_num_sectors: int = 60
+    scan_context_max_range_m: float = 80.0
+    scan_context_top_k: int = 10
+    scan_context_match_threshold: float = 0.4
+    scan_context_lidar_height_m: float = 2.0
 
     debug: bool = False
 

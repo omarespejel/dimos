@@ -20,12 +20,12 @@ SimplePGO::SimplePGO(const Config &config) : m_config(config)
     m_icp.setEuclideanFitnessEpsilon(1e-6);
     m_icp.setRANSACIterations(0);
 
-    m_sc_config.n_rings = m_config.sc_n_rings;
-    m_sc_config.n_sectors = m_config.sc_n_sectors;
-    m_sc_config.max_range_m = m_config.sc_max_range_m;
-    m_sc_config.candidate_top_k = m_config.sc_top_k;
-    m_sc_config.match_threshold = m_config.sc_match_threshold;
-    m_sc_config.lidar_height_m = m_config.sc_lidar_height_m;
+    m_scan_context_config.n_rings = m_config.scan_context_num_rings;
+    m_scan_context_config.n_sectors = m_config.scan_context_num_sectors;
+    m_scan_context_config.max_range_m = m_config.scan_context_max_range_m;
+    m_scan_context_config.candidate_top_k = m_config.scan_context_top_k;
+    m_scan_context_config.match_threshold = m_config.scan_context_match_threshold;
+    m_scan_context_config.lidar_height_m = m_config.scan_context_lidar_height_m;
 }
 
 bool SimplePGO::isKeyPose(const PoseWithTime &pose)
@@ -76,12 +76,12 @@ bool SimplePGO::addKeyPose(const CloudWithPose &cloud_with_pose)
     // Cache the Scan Context descriptor + ring-key for this keyframe.
     if (cloud_with_pose.cloud) {
         scan_context::Descriptor descriptor =
-            scan_context::make_descriptor(*cloud_with_pose.cloud, m_sc_config);
-        m_sc_ring_keys.push_back(scan_context::make_ring_key(descriptor));
-        m_sc_descriptors.push_back(std::move(descriptor));
+            scan_context::make_descriptor(*cloud_with_pose.cloud, m_scan_context_config);
+        m_scan_context_ring_keys.push_back(scan_context::make_ring_key(descriptor));
+        m_scan_context_descriptors.push_back(std::move(descriptor));
     } else {
-        m_sc_descriptors.emplace_back();
-        m_sc_ring_keys.emplace_back();
+        m_scan_context_descriptors.emplace_back();
+        m_scan_context_ring_keys.emplace_back();
     }
 
     return true;
@@ -152,31 +152,31 @@ int SimplePGO::searchByPosition() const
 int SimplePGO::searchByScanContext(int& out_sector_shift) const
 {
     out_sector_shift = 0;
-    if (m_sc_descriptors.empty() || m_sc_descriptors.back().size() == 0) {
+    if (m_scan_context_descriptors.empty() || m_scan_context_descriptors.back().size() == 0) {
         return -1;
     }
-    const auto& query = m_sc_descriptors.back();
-    const auto& query_key = m_sc_ring_keys.back();
+    const auto& query = m_scan_context_descriptors.back();
+    const auto& query_key = m_scan_context_ring_keys.back();
     const double current_time = m_key_poses.back().time;
 
     // Two-stage retrieval: first rank candidates by ring-key L2 distance
     // (fast coarse filter), then score the top-K via column-shifted cosine
     // distance on the full descriptor.
     std::vector<std::pair<float, int>> ranked;  // (ring-key dist, idx)
-    ranked.reserve(m_sc_descriptors.size());
+    ranked.reserve(m_scan_context_descriptors.size());
     const size_t cur_idx = m_key_poses.size() - 1;
     for (size_t i = 0; i < cur_idx; i++) {
-        if (m_sc_descriptors[i].size() == 0) continue;
+        if (m_scan_context_descriptors[i].size() == 0) continue;
         if (std::abs(current_time - m_key_poses[i].time) <= m_config.loop_time_thresh) {
             continue;  // too recent — not a true loop candidate
         }
-        const float key_dist = (m_sc_ring_keys[i] - query_key).norm();
+        const float key_dist = (m_scan_context_ring_keys[i] - query_key).norm();
         ranked.emplace_back(key_dist, static_cast<int>(i));
     }
     if (ranked.empty()) return -1;
 
     const int top_k_count = std::min(
-        static_cast<int>(ranked.size()), m_sc_config.candidate_top_k);
+        static_cast<int>(ranked.size()), m_scan_context_config.candidate_top_k);
     std::partial_sort(
         ranked.begin(), ranked.begin() + top_k_count, ranked.end(),
         [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
@@ -185,13 +185,13 @@ int SimplePGO::searchByScanContext(int& out_sector_shift) const
 
     float best_dist = std::numeric_limits<float>::max();
     int best_idx_unfiltered = -1;
-    float best_dist_filtered = static_cast<float>(m_sc_config.match_threshold);
+    float best_dist_filtered = static_cast<float>(m_scan_context_config.match_threshold);
     int best_idx = -1;
     int best_shift = 0;
     for (int rank = 0; rank < top_k_count; rank++) {
         const int idx = ranked[rank].second;
         const auto [distance, shift] = scan_context::best_distance(
-            query, m_sc_descriptors[idx]);
+            query, m_scan_context_descriptors[idx]);
         if (distance < best_dist) {
             best_dist = distance;
             best_idx_unfiltered = idx;
@@ -248,7 +248,7 @@ void SimplePGO::searchForLoopPairs()
     // → init · p = rotation · (p - source_position) + source_position
     Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
     if (m_config.use_scan_context && sector_shift != 0) {
-        const double yaw = scan_context::yaw_from_shift(sector_shift, m_sc_config.n_sectors);
+        const double yaw = scan_context::yaw_from_shift(sector_shift, m_scan_context_config.n_sectors);
         Eigen::AngleAxisf yaw_axis_angle(
             static_cast<float>(yaw), Eigen::Vector3f::UnitZ());
         Eigen::Matrix3f rotation = yaw_axis_angle.toRotationMatrix();

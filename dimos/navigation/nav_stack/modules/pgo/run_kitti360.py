@@ -20,7 +20,7 @@ wrapper just supplies the PGO blueprint as the module-under-test so the
 generic benchmark can plug in any other pose-graph SLAM impl the same way.
 
 Usage:
-    uv run python -m dimos.navigation.nav_stack.modules.pgo.benchmark.run_kitti360 \\
+    uv run python -m dimos.navigation.nav_stack.modules.pgo.run_kitti360 \\
         --kitti360-root ~/datasets/kitti360 --sequence 2
 """
 
@@ -43,7 +43,7 @@ def main() -> None:
     parser.add_argument("--kitti360-root", type=Path, required=True)
     parser.add_argument("--sequence", type=int, default=2)
     parser.add_argument("--max-scans", type=int, default=None)
-    parser.add_argument("--sc-match-threshold", type=float, default=0.4)
+    parser.add_argument("--scan-context-match-threshold", type=float, default=0.4)
     parser.add_argument("--loop-score-thresh", type=float, default=0.5)
     parser.add_argument("--loop-search-radius-m", type=float, default=1.0)
     parser.add_argument("--key-pose-delta-trans", type=float, default=0.5)
@@ -52,7 +52,7 @@ def main() -> None:
     args = parser.parse_args()
 
     pgo_blueprint = PGO.blueprint(
-        sc_match_threshold=args.sc_match_threshold,
+        scan_context_match_threshold=args.scan_context_match_threshold,
         loop_score_thresh=args.loop_score_thresh,
         loop_search_radius=args.loop_search_radius_m,
         key_pose_delta_trans=args.key_pose_delta_trans,

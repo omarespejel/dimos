@@ -37,7 +37,7 @@ polar binning, same lidar_height_m=2.0 shift, same column-cosine
 distance over all sector shifts.
 
 Usage:
-    uv run python -m dimos.navigation.nav_stack.modules.pgo.benchmark.place_recognition_ap \\
+    uv run python -m dimos.navigation.nav_stack.modules.pgo.place_recognition_ap \\
         --kitti360-root ~/datasets/kitti360 --sequence 2
 """
 
@@ -66,7 +66,7 @@ logger = setup_logger()
 
 
 @dataclass
-class SCConfig:
+class ScanContextConfig:
     """Mirror of cpp/scan_context.h scan_context::Config defaults."""
 
     num_rings: int = 20
@@ -75,7 +75,7 @@ class SCConfig:
     lidar_height_m: float = 2.0
 
 
-def make_descriptor(points_body: np.ndarray, config: SCConfig) -> np.ndarray:
+def make_descriptor(points_body: np.ndarray, config: ScanContextConfig) -> np.ndarray:
     """Polar max-z descriptor — matches cpp/scan_context.cpp::make_descriptor.
 
     ``points_body``: (N, 3+) body-frame point cloud.
@@ -110,7 +110,7 @@ def make_descriptor(points_body: np.ndarray, config: SCConfig) -> np.ndarray:
     return descriptor
 
 
-def best_sc_distance(query: np.ndarray, candidate: np.ndarray) -> tuple[float, int]:
+def best_scan_context_distance(query: np.ndarray, candidate: np.ndarray) -> tuple[float, int]:
     """Min cosine distance over all column shifts — matches cpp::best_distance.
 
     Returns (min_distance, best_shift). 0 = identical, 2 = opposite.
@@ -164,7 +164,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config = SCConfig()
+    config = ScanContextConfig()
 
     logger.info(f"Loading KITTI-360 sequence {args.sequence} from {args.kitti360_root}")
     sequence = load_kitti360_sequence(args.kitti360_root, args.sequence)
@@ -236,7 +236,7 @@ def main() -> None:
         best_distance = 2.0
         best_candidate_index = -1
         for candidate_index in candidate_indices:
-            distance, _shift = best_sc_distance(
+            distance, _shift = best_scan_context_distance(
                 descriptors[query_index], descriptors[candidate_index]
             )
             if distance < best_distance:

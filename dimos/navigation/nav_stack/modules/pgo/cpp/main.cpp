@@ -271,12 +271,12 @@ int main(int argc, char** argv)
     config.submap_resolution = native_module.arg_float("submap_resolution", 0.1f);
     config.min_loop_detect_duration = native_module.arg_float("min_loop_detect_duration", 5.0f);
     config.use_scan_context = native_module.arg_bool("use_scan_context", true);
-    config.sc_n_rings = native_module.arg_int("sc_n_rings", 20);
-    config.sc_n_sectors = native_module.arg_int("sc_n_sectors", 60);
-    config.sc_max_range_m = native_module.arg_float("sc_max_range_m", 80.0f);
-    config.sc_top_k = native_module.arg_int("sc_top_k", 10);
-    config.sc_match_threshold = native_module.arg_float("sc_match_threshold", 0.4f);
-    config.sc_lidar_height_m = native_module.arg_float("sc_lidar_height_m", 2.0f);
+    config.scan_context_num_rings = native_module.arg_int("scan_context_num_rings", 20);
+    config.scan_context_num_sectors = native_module.arg_int("scan_context_num_sectors", 60);
+    config.scan_context_max_range_m = native_module.arg_float("scan_context_max_range_m", 80.0f);
+    config.scan_context_top_k = native_module.arg_int("scan_context_top_k", 10);
+    config.scan_context_match_threshold = native_module.arg_float("scan_context_match_threshold", 0.4f);
+    config.scan_context_lidar_height_m = native_module.arg_float("scan_context_lidar_height_m", 2.0f);
 
     // Node-level config
     std::string world_frame = native_module.arg("world_frame", "map");
