@@ -23,6 +23,9 @@ from dimos.core.stream import In
 from dimos.memory2.module import Recorder, RecorderConfig
 from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
+from dimos.msgs.nav_msgs.ContourPolygons3D import ContourPolygons3D
+from dimos.msgs.nav_msgs.GraphNodes3D import GraphNodes3D
+from dimos.msgs.nav_msgs.LineSegments3D import LineSegments3D
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.nav_msgs.Path import Path as NavPath
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
@@ -47,23 +50,46 @@ class NavRecord(Recorder):
     def stop(self) -> None:
         super().stop()
 
-    # Core nav outputs
+    # MovementManager outputs (muxed nav + teleop)
     cmd_vel: In[Twist]
-    corrected_odometry: In[Odometry]
-    path: In[NavPath]
-    goal_path: In[NavPath]
-    way_point: In[PointStamped]
     goal: In[PointStamped]
     stop_movement: In[LcmBool]
 
-    # LocalPlanner details
+    # PathFollower output (raw nav cmd before MovementManager mux; remapped from "cmd_vel")
+    nav_cmd_vel: In[Twist]
+
+    # LocalPlanner outputs
+    path: In[NavPath]
     effective_cmd_vel: In[Twist]
+    free_paths: In[PointCloud2]
     slow_down: In[Int8]
     goal_reached: In[Bool]
 
-    # Point clouds
-    terrain_map: In[PointCloud2]
-    global_map: In[PointCloud2]
+    # SimplePlanner / FarPlanner / TarePlanner outputs
+    way_point: In[PointStamped]
+    goal_path: In[NavPath]
+    costmap_cloud: In[PointCloud2]  # SimplePlanner only
+    # FarPlanner-specific
+    graph_nodes: In[GraphNodes3D]
+    graph_edges: In[LineSegments3D]
+    contour_polygons: In[ContourPolygons3D]
+    nav_boundary: In[LineSegments3D]
 
+    # TerrainAnalysis / TerrainMapExt outputs
+    terrain_map: In[PointCloud2]
+    terrain_map_ext: In[PointCloud2]
+
+    # PGO outputs
+    registered_scan: In[PointCloud2]
+    corrected_odometry: Out[Odometry]
+    global_map: Out[PointCloud2]
+    pgo_tf: Out[Odometry]
+    pgo_graph_nodes: Out[GraphNodes3D]
+    pgo_graph_edges: Out[LineSegments3D]
+    pgo_loop_closure: Out[NavPath]
+
+    # FastLio2 outputs (SLAM source; blueprints typically remap FastLio2's
+    # "lidar" -> "registered_scan" and "global_map" -> "global_map_fastlio")
     odometry: In[Odometry]
     registered_scan: In[PointCloud2]
+    global_map_fastlio: In[PointCloud2]
