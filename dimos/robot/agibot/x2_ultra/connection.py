@@ -13,6 +13,10 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
+from pathlib import Path
+import struct
+import subprocess
+import sys
 from threading import Lock, Thread
 import time
 from typing import Any
@@ -287,6 +291,8 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
     _vel_publisher: Any = None
     _latest_video_frame: Image | None = None
     _input_source_registered: bool = False
+    _cam_proc: subprocess.Popen | None = None  # type: ignore[type-arg]
+    _cam_thread: Thread | None = None
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -296,6 +302,9 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         self._joint_lock = Lock()
         self._joint_positions: dict[str, float] = {}
         self._input_source_registered = False
+        self._cam_proc = None
+        self._cam_thread = None
+        self._cam_stop = False
 
     @rpc
     def start(self) -> None:
@@ -351,43 +360,24 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         # high-rate joint-state callbacks.
         sensor_group = ReentrantCallbackGroup()
 
-        # Compressed publisher uses RELIABLE/VOLATILE/KEEP_LAST. depth=1 was
-        # the only setting under which standalone rclpy probes received frames
-        # reliably (depth=5 + the dimos worker's other subscriptions caused
-        # messages to silently drop after the first frame).
-        from rclpy.qos import QoSDurabilityPolicy as _QoSDur
-        compressed_qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
-            durability=_QoSDur.VOLATILE,
-        )
-        node.create_subscription(
-            self._import_msg("sensor_msgs.msg", "CompressedImage"),
-            _TOPIC_RGB_IMAGE,
-            self._on_rgb_image,
-            compressed_qos,
-            callback_group=sensor_group,
-        )
-        node.create_subscription(
-            self._import_msg("sensor_msgs.msg", "Image"),
-            _TOPIC_DEPTH_IMAGE,
-            self._on_depth_image,
-            sensor_qos,
-            callback_group=sensor_group,
-        )
-        node.create_subscription(
-            self._import_msg("sensor_msgs.msg", "PointCloud2"),
-            _TOPIC_DEPTH_CLOUD,
-            self._on_depth_cloud,
-            sensor_qos,
-        )
-        node.create_subscription(
-            self._import_msg("sensor_msgs.msg", "PointCloud2"),
-            _TOPIC_LIDAR,
-            self._on_lidar,
-            sensor_qos,
-        )
+        # NOTE: the /compressed RGB topic is not subscribed here. Inside the
+        # dimos forkserver-spawned worker, FastDDS drops camera frames after
+        # the first one or two — a standalone rclpy process with identical
+        # QoS receives the same topic at 10 Hz with no issue. We sidestep
+        # this by running the subscription in a clean subprocess (see
+        # `_camera_bridge.py`) and piping JPEG frames back here.
+        self._start_camera_bridge()
+
+        # NOTE: depth_image is also large (1280x720 float32 ~3.7 MB/frame); not
+        # subscribed here because nothing downstream consumes it yet, and the
+        # extra UDP bandwidth used to crowd out the camera bridge subprocess.
+        # Re-enable when you actually need depth in a downstream module.
+        # depth_pointcloud + lidar_pointcloud are 30 Hz × MB-per-frame
+        # streams. Subscribing here pulls in ~50 MB/s on the laptop NIC and
+        # crowds out the camera bridge subprocess. They're not consumed by
+        # any downstream module in this blueprint, so we leave them off.
+        # If you need them later, re-enable here and confirm the camera
+        # bridge still flows.
         node.create_subscription(
             self._import_msg("sensor_msgs.msg", "Imu"),
             _TOPIC_IMU,
@@ -465,6 +455,10 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
             logger.warning("X2Connection: ROS spin exited: %s", e)
 
     def _stop_ros(self) -> None:
+        # Tear down the camera bridge first so its rclpy shutdown isn't racing
+        # ours.
+        self._stop_camera_bridge()
+
         if self._ros_node is not None:
             try:
                 import rclpy
@@ -537,29 +531,131 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
 
     # --- ROS2 sensor callbacks ---
 
-    def _on_rgb_image(self, msg: Any) -> None:
-        # sensor_msgs/CompressedImage; msg.data is the JPEG byte string.
-        # The robot's raw RGB topic (~2.7 MB BEST_EFFORT) is fragmented by DDS
-        # and silently dropped on our laptop side; the /compressed topic
-        # (RELIABLE, ~150-400 KB) delivers, so we decode it here.
+    # --- Camera bridge (sidecar subprocess) ---
+
+    def _start_camera_bridge(self) -> None:
+        """Spawn the camera-bridge subprocess and start the reader thread.
+
+        The bridge owns a fresh Python interpreter + fresh DDS state, avoiding
+        the forkserver-worker bug where in-worker camera subscriptions stall
+        after the first frame.
+
+        We pin the bridge to CycloneDDS with a static unicast-only config:
+        - CycloneDDS so it doesn't share FastDDS shared memory with the
+          main worker (two FastDDS participants on the same host raced).
+        - Unicast + explicit Peer so we don't depend on the multicast
+          route that dimos adds to loopback for LCM (`224.0.0.0/4 dev lo`),
+          which breaks normal DDS multicast discovery on enp2s0.
+        - Interface pinned to enp2s0 (the robot's LAN).
+        """
+        import os as _os
+
+        bridge = Path(__file__).parent / "_camera_bridge.py"
+        env = _os.environ.copy()
+        env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+        env["CYCLONEDDS_URI"] = (
+            "<CycloneDDS><Domain>"
+            "<General>"
+            # Pin to enp2s0 so DDS uses the robot LAN, not wlp3s0.
+            "<Interfaces><NetworkInterface name=\"enp2s0\"/></Interfaces>"
+            # Multicast stays enabled for data delivery (the publisher uses it
+            # for high-bandwidth topics); discovery is also fine over multicast
+            # but we add a static peer as a fallback in case the multicast
+            # route is broken by dimos's loopback route.
+            "</General>"
+            "<Discovery>"
+            "<Peers><Peer address=\"10.0.1.41\"/></Peers>"
+            "<ParticipantIndex>auto</ParticipantIndex>"
+            "</Discovery>"
+            "</Domain></CycloneDDS>"
+        )
+        self._cam_stop = False
+        self._cam_proc = subprocess.Popen(
+            [sys.executable, str(bridge), _TOPIC_RGB_IMAGE],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,  # drop fastcdr "sequence size" noise
+            bufsize=0,
+            env=env,
+        )
+        self._cam_thread = Thread(target=self._read_camera_bridge, daemon=True)
+        self._cam_thread.start()
+
+    def _read_camera_bridge(self) -> None:
+        """Consume length-prefixed JPEG frames from the bridge's stdout.
+
+        Frame format on the wire: [u32 little-endian length] [length bytes JPEG].
+        We decode, apply the 180° rotation (the X2 head RGBD sensor is mounted
+        upside-down), and publish a dimos Image on color_image.
+        """
         import cv2
 
-        jpeg = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-        arr = cv2.imdecode(jpeg, cv2.IMREAD_COLOR)  # returns BGR
-        if arr is None:
+        proc = self._cam_proc
+        if proc is None or proc.stdout is None:
             return
+        out = proc.stdout
+        logger.info("X2Connection: camera-bridge reader thread started (pid=%s)", proc.pid)
 
-        # The X2's head RGBD sensor is mounted with its optical axis rotated
-        # 180° (verified by visual inspection of a raw frame). Rotate here so
-        # every downstream consumer gets a human-readable view.
-        # NOTE: camera_info principal point (cx, cy) is left as-published; if
-        # you need projection accuracy, derive (W-1-cx, H-1-cy).
-        arr = np.ascontiguousarray(arr[::-1, ::-1])
+        def _read_exact(n: int) -> bytes | None:
+            buf = bytearray()
+            while len(buf) < n:
+                if self._cam_stop:
+                    return None
+                chunk = out.read(n - len(buf))
+                if not chunk:
+                    return None
+                buf.extend(chunk)
+            return bytes(buf)
 
-        ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        image = Image(data=arr, format=ImageFormat.BGR, frame_id=msg.header.frame_id, ts=ts)
-        self.color_image.publish(image)
-        self._latest_video_frame = image
+        recv = 0
+        try:
+            while not self._cam_stop:
+                header = _read_exact(4)
+                if header is None:
+                    logger.info("X2Connection: camera-bridge stdout EOF (after %d frames)", recv)
+                    break
+                (length,) = struct.unpack("<I", header)
+                data = _read_exact(length)
+                if data is None:
+                    break
+
+                jpeg = np.frombuffer(data, dtype=np.uint8)
+                arr = cv2.imdecode(jpeg, cv2.IMREAD_COLOR)  # BGR
+                if arr is None:
+                    continue
+
+                # X2 head RGBD sensor is mounted with optical axis rotated 180°.
+                arr = np.ascontiguousarray(arr[::-1, ::-1])
+
+                image = Image(
+                    data=arr,
+                    format=ImageFormat.BGR,
+                    frame_id="rgbd_head_front",
+                    ts=time.time(),
+                )
+                self.color_image.publish(image)
+                self._latest_video_frame = image
+                recv += 1
+                if recv == 1 or recv % 60 == 0:
+                    logger.info("X2Connection: camera-bridge frame %d (%d KB)", recv, length // 1024)
+        except Exception as exc:
+            logger.exception("X2Connection: camera-bridge reader crashed: %s", exc)
+
+    def _stop_camera_bridge(self) -> None:
+        self._cam_stop = True
+        proc = self._cam_proc
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self._cam_proc = None
+        if self._cam_thread and self._cam_thread.is_alive():
+            self._cam_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        self._cam_thread = None
 
     def _on_depth_image(self, msg: Any) -> None:
         image = _ros_image_to_dimos(msg)
