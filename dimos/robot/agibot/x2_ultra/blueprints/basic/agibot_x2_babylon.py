@@ -23,6 +23,8 @@ color_image as camera, cmd_vel from viewer Drive button back to robot).
 from pathlib import Path
 
 from dimos.core.coordination.blueprints import autoconnect
+from dimos.core.transport import JpegShmTransport
+from dimos.msgs.sensor_msgs.Image import Image
 from dimos.robot.agibot.x2_ultra.connection import X2Connection
 from dimos.visualization.babylon_scene_viewer import BabylonSceneViewerModule
 
@@ -42,6 +44,14 @@ agibot_x2_babylon = (
             # the viewer's generic `camera_image` input.
             (BabylonSceneViewerModule, "camera_image", "color_image"),
         ]
+    )
+    .transports(
+        {
+            # JpegShmTransport: JPEG-compress on publish, shared-memory IPC
+            # between workers (~150 KB per frame instead of 2.7 MB raw).
+            # LCMTransport over UDP was silently dropping the full RGB stream.
+            ("color_image", Image): JpegShmTransport("/agibot_x2/color_image"),
+        }
     )
     .global_config(n_workers=4, robot_model="agibot_x2_ultra")
 )

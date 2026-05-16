@@ -40,7 +40,11 @@ from dimos.utils.logging_config import setup_logger
 logger = setup_logger()
 
 # ROS2 topic constants
-_TOPIC_RGB_IMAGE = "/aima/hal/sensor/rgbd_head_front/rgb_image"
+# Using the *compressed* (JPEG, ~150 KB/frame, RELIABLE QoS) RGB topic instead
+# of the raw 1280x720 RGB topic (~2.7 MB/frame, BEST_EFFORT): the raw stream's
+# UDP fragments were being dropped by DDS on the laptop, so callbacks never
+# fired. The robot publishes both; the compressed one delivers reliably.
+_TOPIC_RGB_IMAGE = "/aima/hal/sensor/rgbd_head_front/rgb_image/compressed"
 _TOPIC_DEPTH_IMAGE = "/aima/hal/sensor/rgbd_head_front/depth_image"
 _TOPIC_DEPTH_CLOUD = "/aima/hal/sensor/rgbd_head_front/depth_pointcloud"
 _TOPIC_RGB_CAM_INFO = "/aima/hal/sensor/rgbd_head_front/rgb_camera_info"
@@ -310,20 +314,27 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
             import rclpy
 
             os.environ.setdefault("ROS_DOMAIN_ID", str(self.config.ros_domain_id))
-            # rclpy.ok() can disagree with the context's actual init state when a
-            # worker process is reused (forkserver) or a prior crash left state
-            # behind. Swallow the well-known "must only be called once" — any
-            # other init error still bubbles.
+            # dimos workers are forked from a forkserver, which can carry a
+            # half-initialized DDS context into the child. Reusing it works
+            # for the first message or two on high-bandwidth topics, then
+            # silently drops. Tear it down and re-init in this worker so
+            # FastDDS owns a clean state.
             try:
                 rclpy.init()
             except RuntimeError as init_exc:
                 if "must only be called once" not in str(init_exc):
                     raise
-                logger.info("X2Connection: rclpy context already initialized; reusing")
+                logger.info("X2Connection: shutting down inherited rclpy context and re-initing")
+                try:
+                    rclpy.shutdown()
+                except Exception:
+                    pass
+                rclpy.init()
         except Exception as e:
             logger.error("X2Connection: failed to init rclpy: %s", e)
             raise
 
+        from rclpy.callback_groups import ReentrantCallbackGroup
         from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 
         sensor_qos = QoSProfile(
@@ -334,18 +345,36 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
 
         node = rclpy.create_node("dimos_x2_connection")
         self._ros_node = node
+        # ReentrantCallbackGroup pairs with MultiThreadedExecutor (see _ros_spin):
+        # without it, callbacks on this node still serialise even with a thread
+        # pool. With it, the slow camera-decode callback runs in parallel with
+        # high-rate joint-state callbacks.
+        sensor_group = ReentrantCallbackGroup()
 
+        # Compressed publisher uses RELIABLE/VOLATILE/KEEP_LAST. depth=1 was
+        # the only setting under which standalone rclpy probes received frames
+        # reliably (depth=5 + the dimos worker's other subscriptions caused
+        # messages to silently drop after the first frame).
+        from rclpy.qos import QoSDurabilityPolicy as _QoSDur
+        compressed_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=_QoSDur.VOLATILE,
+        )
         node.create_subscription(
-            self._import_msg("sensor_msgs.msg", "Image"),
+            self._import_msg("sensor_msgs.msg", "CompressedImage"),
             _TOPIC_RGB_IMAGE,
             self._on_rgb_image,
-            sensor_qos,
+            compressed_qos,
+            callback_group=sensor_group,
         )
         node.create_subscription(
             self._import_msg("sensor_msgs.msg", "Image"),
             _TOPIC_DEPTH_IMAGE,
             self._on_depth_image,
             sensor_qos,
+            callback_group=sensor_group,
         )
         node.create_subscription(
             self._import_msg("sensor_msgs.msg", "PointCloud2"),
@@ -364,31 +393,34 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
             _TOPIC_IMU,
             self._on_imu,
             sensor_qos,
+            callback_group=sensor_group,
         )
 
         # Joint state subscriptions (one per body part, all aimdk_msgs/JointStateArray).
-        # Each callback updates its slice of self._joint_positions and emits the merged
-        # JointState on self.joint_state — viewer subscribers see one unified stream.
         joint_state_msg = self._import_msg("aimdk_msgs.msg", "JointStateArray")
         node.create_subscription(
             joint_state_msg, _TOPIC_JOINT_ARM,
             lambda m: self._on_joint_state_array(m, _ARM_JOINT_NAMES),
             sensor_qos,
+            callback_group=sensor_group,
         )
         node.create_subscription(
             joint_state_msg, _TOPIC_JOINT_LEG,
             lambda m: self._on_joint_state_array(m, _LEG_JOINT_NAMES),
             sensor_qos,
+            callback_group=sensor_group,
         )
         node.create_subscription(
             joint_state_msg, _TOPIC_JOINT_WAIST,
             lambda m: self._on_joint_state_array(m, _WAIST_JOINT_NAMES),
             sensor_qos,
+            callback_group=sensor_group,
         )
         node.create_subscription(
             joint_state_msg, _TOPIC_JOINT_HEAD,
             lambda m: self._on_joint_state_array(m, _HEAD_JOINT_NAMES),
             sensor_qos,
+            callback_group=sensor_group,
         )
 
         from rclpy.qos import QoSDurabilityPolicy
@@ -404,6 +436,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
             _TOPIC_RGB_CAM_INFO,
             self._on_camera_info,
             cam_info_qos,
+            callback_group=sensor_group,
         )
 
         VelMsg = self._import_msg("aimdk_msgs.msg", "McLocomotionVelocity")
@@ -419,9 +452,15 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
 
     def _ros_spin(self) -> None:
         import rclpy
+        from rclpy.executors import MultiThreadedExecutor
 
+        # MultiThreadedExecutor: joint-state topics on this node tick at
+        # 50-100 Hz × 4 body parts. A SingleThreadedExecutor starves the
+        # camera callback (verified empirically: ~4 RGB frames then silence).
         try:
-            rclpy.spin(self._ros_node)
+            executor = MultiThreadedExecutor(num_threads=4)
+            executor.add_node(self._ros_node)
+            executor.spin()
         except Exception as e:
             logger.warning("X2Connection: ROS spin exited: %s", e)
 
@@ -499,12 +538,33 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
     # --- ROS2 sensor callbacks ---
 
     def _on_rgb_image(self, msg: Any) -> None:
-        image = _ros_image_to_dimos(msg)
+        # sensor_msgs/CompressedImage; msg.data is the JPEG byte string.
+        # The robot's raw RGB topic (~2.7 MB BEST_EFFORT) is fragmented by DDS
+        # and silently dropped on our laptop side; the /compressed topic
+        # (RELIABLE, ~150-400 KB) delivers, so we decode it here.
+        import cv2
+
+        jpeg = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+        arr = cv2.imdecode(jpeg, cv2.IMREAD_COLOR)  # returns BGR
+        if arr is None:
+            return
+
+        # The X2's head RGBD sensor is mounted with its optical axis rotated
+        # 180° (verified by visual inspection of a raw frame). Rotate here so
+        # every downstream consumer gets a human-readable view.
+        # NOTE: camera_info principal point (cx, cy) is left as-published; if
+        # you need projection accuracy, derive (W-1-cx, H-1-cy).
+        arr = np.ascontiguousarray(arr[::-1, ::-1])
+
+        ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        image = Image(data=arr, format=ImageFormat.BGR, frame_id=msg.header.frame_id, ts=ts)
         self.color_image.publish(image)
         self._latest_video_frame = image
 
     def _on_depth_image(self, msg: Any) -> None:
-        self.depth_image.publish(_ros_image_to_dimos(msg))
+        image = _ros_image_to_dimos(msg)
+        image.data = np.ascontiguousarray(image.data[::-1, ::-1])
+        self.depth_image.publish(image)
 
     def _on_depth_cloud(self, msg: Any) -> None:
         self.pointcloud.publish(_ros_pointcloud2_to_dimos(msg))
@@ -517,6 +577,13 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
 
     def _on_camera_info(self, msg: Any) -> None:
         self.camera_info.publish(_ros_camera_info_to_dimos(msg))
+
+    # Joint state visualization throttle: the robot publishes at ~750 Hz per
+    # body part (motor-control telemetry rate). Anything above ~50 Hz is wasted
+    # work for visualization and starves slower callbacks (camera) of executor
+    # time. Update the internal map every message (cheap dict write); only
+    # publish to dimos at JOINT_VIZ_HZ.
+    _JOINT_VIZ_HZ = 50.0
 
     def _on_joint_state_array(self, msg: Any, joint_names: tuple[str, ...]) -> None:
         """Merge one body-part slice into the unified joint_positions and publish.
@@ -539,6 +606,13 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         with self._joint_lock:
             for name, joint in zip(joint_names, joints, strict=True):
                 self._joint_positions[name] = float(joint.position)
+            # Rate-limit dimos publishes: cheap dict updates always happen,
+            # only emit a merged snapshot when the throttle interval is up.
+            now = time.monotonic()
+            last = getattr(self, "_last_joint_pub", 0.0)
+            if now - last < 1.0 / self._JOINT_VIZ_HZ:
+                return
+            self._last_joint_pub = now
             names = list(self._joint_positions.keys())
             positions = list(self._joint_positions.values())
 
