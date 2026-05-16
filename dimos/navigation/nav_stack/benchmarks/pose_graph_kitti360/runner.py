@@ -127,7 +127,7 @@ def run_benchmark(
         logger.info(f"playback done, draining for {drain_sec:.1f}s")
         time.sleep(drain_sec)
 
-        results = scoring.get_results()
+        results: dict[str, Any] = scoring.get_results()
     finally:
         coordinator.stop()
 
