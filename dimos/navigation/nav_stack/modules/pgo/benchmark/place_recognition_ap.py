@@ -50,7 +50,7 @@ import time
 
 import numpy as np
 from scipy.spatial import cKDTree
-from sklearn.metrics import average_precision_score
+from sklearn.metrics import average_precision_score  # type: ignore[import-untyped]
 
 from dimos.navigation.nav_stack.modules.pgo.benchmark.kitti360_loader import (
     load_kitti360_sequence,
