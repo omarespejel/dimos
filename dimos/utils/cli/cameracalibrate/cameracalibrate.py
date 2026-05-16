@@ -135,6 +135,7 @@ def load_frames_from_folder(path: str) -> list[np.ndarray]:
 
 
 _CAMERACALIBRATE_WINDOW = "dimos cameracalibrate"
+_MAX_CONSECUTIVE_WEBCAM_READ_FAILURES = 30
 
 
 @dataclass(frozen=True)
@@ -271,6 +272,7 @@ def _capture_frames_from_webcam(
     cap: cv2.VideoCapture | None = None
     last_detected: tuple[int, int, str] | None = None
     locked_pattern: tuple[int, int, str] | None = None
+    consecutive_read_failures = 0
 
     try:
         cap = cv2.VideoCapture(device_index)
@@ -280,7 +282,15 @@ def _capture_frames_from_webcam(
         while len(accepted) < target_count:
             ok, frame = cap.read()
             if not ok or frame is None:
+                consecutive_read_failures += 1
+                if consecutive_read_failures >= _MAX_CONSECUTIVE_WEBCAM_READ_FAILURES:
+                    raise RuntimeError(
+                        "Failed to read from camera "
+                        f"device_index={device_index!r} for "
+                        f"{_MAX_CONSECUTIVE_WEBCAM_READ_FAILURES} consecutive attempts."
+                    )
                 continue
+            consecutive_read_failures = 0
 
             if frame.ndim == 3:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)

@@ -330,6 +330,24 @@ class _MockVideoCapture:
         self._released = True
 
 
+class _FailingVideoCapture:
+    """``cv2.VideoCapture`` stand-in whose reads never produce frames."""
+
+    def __init__(self) -> None:
+        self.read_count = 0
+        self.released = False
+
+    def isOpened(self) -> bool:
+        return True
+
+    def read(self) -> tuple[bool, None]:
+        self.read_count += 1
+        return False, None
+
+    def release(self) -> None:
+        self.released = True
+
+
 def test_capture_frames_from_webcam_mocked_space_fills_target(monkeypatch) -> None:
     """SPACE accepts frames with chessboard overlay path; ``no_display`` skips GUI."""
     cols, rows = 9, 6
@@ -371,6 +389,17 @@ def test_capture_frames_from_webcam_mocked_quit_raises(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="Capture ended"):
         capture_frames_from_webcam(0, 3, cols, rows, no_display=True)
+
+
+def test_capture_frames_from_webcam_read_failures_raise(monkeypatch) -> None:
+    cap = _FailingVideoCapture()
+    monkeypatch.setattr(cv2, "VideoCapture", lambda *_a, **_k: cap)
+
+    with pytest.raises(RuntimeError, match="Failed to read from camera"):
+        capture_frames_from_webcam(0, 1, 9, 6, no_display=True)
+
+    assert cap.read_count == 30
+    assert cap.released
 
 
 def test_capture_frames_from_webcam_no_display_false_calls_imshow(monkeypatch) -> None:
