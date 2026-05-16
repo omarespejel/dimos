@@ -12,16 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compute groundtruth loop closures from a trajectory.
-
-A pair (i, j) with j < i is a groundtruth loop iff:
-* ``i - j >= MIN_FRAME_GAP`` (default 50) — exclude near-temporal neighbours
-* ``|pose(i).t - pose(j).t| <= MAX_LOOP_DISTANCE_M`` (default 4.0m) —
-  spatial threshold matching the LCDNet / KITTI-360 convention.
-
-Output: per-i list of valid earlier indices, so the eval can score whether
-PGO's detected pair (i, j_detected) hits any of them.
-"""
+"""Tools for helping compute groundtruth loop closures from a trajectory."""
 
 from __future__ import annotations
 
@@ -35,8 +26,6 @@ DEFAULT_MAX_LOOP_DISTANCE_M = 4.0
 
 @dataclass
 class LoopGroundtruth:
-    """Per-query (index i) the set of valid loop indices j < i."""
-
     min_frame_gap: int
     max_distance_m: float
     valid_loops_per_query: dict[int, set[int]]
@@ -56,8 +45,7 @@ def compute_loop_groundtruth(
     min_frame_gap: int = DEFAULT_MIN_FRAME_GAP,
     max_distance_m: float = DEFAULT_MAX_LOOP_DISTANCE_M,
 ) -> LoopGroundtruth:
-    """Compute the groundtruth-loops table.
-
+    """
     Args:
         frame_ids: ordered list of frame IDs (e.g. KITTI frame indices).
         positions_xyz: (N, 3) world-frame translation of each frame.
@@ -74,19 +62,19 @@ def compute_loop_groundtruth(
             f"len(frame_ids)={len(frame_ids)}"
         )
 
-    valid: dict[int, set[int]] = {fid: set() for fid in frame_ids}
-    for i in range(len(frame_ids)):
-        if i < min_frame_gap:
+    valid: dict[int, set[int]] = {frame_id: set() for frame_id in frame_ids}
+    for query_index in range(len(frame_ids)):
+        if query_index < min_frame_gap:
             continue
-        # Bound the search: any j with |i - j| >= min_frame_gap.
-        upper_j = i - min_frame_gap
-        if upper_j < 0:
+        # Bound the search: any candidate with |query - candidate| >= min_frame_gap.
+        upper_candidate_index = query_index - min_frame_gap
+        if upper_candidate_index < 0:
             continue
-        deltas = positions_xyz[: upper_j + 1] - positions_xyz[i]
+        deltas = positions_xyz[: upper_candidate_index + 1] - positions_xyz[query_index]
         distances = np.linalg.norm(deltas, axis=1)
         matches = np.where(distances <= max_distance_m)[0]
-        for j_index in matches:
-            valid[frame_ids[i]].add(frame_ids[int(j_index)])
+        for candidate_index in matches:
+            valid[frame_ids[query_index]].add(frame_ids[int(candidate_index)])
 
     return LoopGroundtruth(
         min_frame_gap=min_frame_gap,
@@ -113,10 +101,10 @@ class LoopMetrics:
 
     @property
     def f1(self) -> float:
-        p, r = self.precision, self.recall
-        if not (p > 0 and r > 0):
+        precision, recall = self.precision, self.recall
+        if not (precision > 0 and recall > 0):
             return 0.0
-        return 2.0 * p * r / (p + r)
+        return 2.0 * precision * recall / (precision + recall)
 
 
 def score_detected_loops(
@@ -132,22 +120,29 @@ def score_detected_loops(
     valid loop. (We don't count "valid pairs missed" because a single
     correct detection per query is enough to count.)
     """
-    tp = 0
-    fp = 0
+    true_positives = 0
+    false_positives = 0
     seen_queries_with_hit: set[int] = set()
-    queries_with_any_gt = {q for q, valid in groundtruth.valid_loops_per_query.items() if valid}
+    queries_with_any_groundtruth = {
+        query_frame_id
+        for query_frame_id, valid in groundtruth.valid_loops_per_query.items()
+        if valid
+    }
 
-    for src, dst in detected_pairs:
+    for source_frame_id, target_frame_id in detected_pairs:
         # Order-agnostic: PGO may report (target, source) or (source, target).
-        src_valid = groundtruth.valid_loops_per_query.get(src, set())
-        dst_valid = groundtruth.valid_loops_per_query.get(dst, set())
-        if dst in src_valid or src in dst_valid:
-            tp += 1
+        source_valid = groundtruth.valid_loops_per_query.get(source_frame_id, set())
+        target_valid = groundtruth.valid_loops_per_query.get(target_frame_id, set())
+        if target_frame_id in source_valid or source_frame_id in target_valid:
+            true_positives += 1
             # For per-query recall, mark whichever side was the "later" query.
-            query = max(src, dst)
-            seen_queries_with_hit.add(query)
+            seen_queries_with_hit.add(max(source_frame_id, target_frame_id))
         else:
-            fp += 1
+            false_positives += 1
 
-    fn = len(queries_with_any_gt - seen_queries_with_hit)
-    return LoopMetrics(true_positive=tp, false_positive=fp, false_negative=fn)
+    false_negatives = len(queries_with_any_groundtruth - seen_queries_with_hit)
+    return LoopMetrics(
+        true_positive=true_positives,
+        false_positive=false_positives,
+        false_negative=false_negatives,
+    )

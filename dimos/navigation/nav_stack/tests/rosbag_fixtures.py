@@ -22,6 +22,8 @@ then capturing and comparing outputs with deviation scores.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import itertools
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -135,34 +137,53 @@ class LcmCollector:
     """Subscribes to an LCM topic and collects decoded messages with timestamps."""
 
     topic: str
-    msg_type: type
+    message_type: type
     messages: list[Any] = field(default_factory=list)
     timestamps: list[float] = field(default_factory=list)
-    _sub: Any = field(default=None, repr=False)
+    _subscription: Any = field(default=None, repr=False)
 
     def start(self, lcm: lcmlib.LCM) -> None:
-        msg_cls = self.msg_type
+        message_class = self.message_type
 
         def handler(_channel: str, data: bytes) -> None:
             try:
-                msg = msg_cls.lcm_decode(data)  # type: ignore[attr-defined]
-                self.messages.append(msg)
+                message = message_class.lcm_decode(data)  # type: ignore[attr-defined]
+                self.messages.append(message)
                 self.timestamps.append(time.monotonic())
             except Exception as exc:
                 logger.error(f"LcmCollector decode error on {self.topic}: {exc}")
 
-        self._sub = lcm.subscribe(self.topic, handler)
+        self._subscription = lcm.subscribe(self.topic, handler)
 
     def stop(self, lcm: lcmlib.LCM) -> None:
-        if self._sub is not None:
-            lcm.unsubscribe(self._sub)
-            self._sub = None
+        if self._subscription is not None:
+            lcm.unsubscribe(self._subscription)
+            self._subscription = None
 
 
 def lcm_handle_loop(lcm: lcmlib.LCM, stop_event: threading.Event, timeout_ms: int = 50) -> None:
     """Run LCM handle loop until stop_event is set."""
     while not stop_event.is_set():
         lcm.handle_timeout(timeout_ms)
+
+
+_isolated_lcm_url_counter = itertools.count()
+
+
+def make_isolated_lcm_url() -> str:
+    """Return an LCM URL that should not collide with concurrent runs.
+
+    Uses the standard multicast group with TTL=0 (so traffic never escapes
+    the local host) and a port picked from the high ephemeral range. The
+    monotonic counter guarantees back-to-back calls in the same process get
+    distinct ports; mixing in the PID disjoint-ifies concurrent CI workers.
+    """
+    # ports 49152..65535 are the IANA "dynamic/private" range
+    span = 16000
+    pid_offset = os.getpid() % span
+    call_offset = next(_isolated_lcm_url_counter)
+    port = 49152 + ((pid_offset + call_offset) % span)
+    return f"udpm://239.255.76.67:{port}?ttl=0"
 
 
 @dataclass
@@ -173,12 +194,22 @@ class NativeProcessRunner:
     args: list[str]
     process: subprocess.Popen[bytes] | None = field(default=None, repr=False)
 
-    def start(self, capture_stderr: bool = False) -> None:
+    def start(
+        self,
+        capture_stderr: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        process_env: dict[str, str] | None
+        if env is None:
+            process_env = None
+        else:
+            process_env = {**os.environ, **env}
         self.process = subprocess.Popen(
             [self.binary_path, *self.args],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
             start_new_session=True,
+            env=process_env,
         )
 
     def stop(self, timeout: float = 3.0) -> None:

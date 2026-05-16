@@ -46,12 +46,12 @@ _POST_FEED_DRAIN_SEC = 3.0
 
 PGO_BIN = Path(__file__).parent / "cpp" / "result" / "bin" / "pgo"
 
-# LCM topic names for this test (prefixed to avoid collision)
-SCAN_LCM = "/rbpgo_scan#sensor_msgs.PointCloud2"
-ODOM_LCM = "/rbpgo_odom#nav_msgs.Odometry"
-CORRECTED_ODOM_LCM = "/rbpgo_corr_odom#nav_msgs.Odometry"
-GLOBAL_MAP_LCM = "/rbpgo_global_map#sensor_msgs.PointCloud2"
-TF_LCM = "/rbpgo_tf#tf2_msgs.TFMessage"
+# TODO: use modules rather than LCM directly
+SCAN_LCM = "/rb_test_scan#sensor_msgs.PointCloud2"
+ODOM_LCM = "/rb_test_odom#nav_msgs.Odometry"
+CORRECTED_ODOM_LCM = "/rb_test_corr_odom#nav_msgs.Odometry"
+GLOBAL_MAP_LCM = "/rb_test_global_map#sensor_msgs.PointCloud2"
+TF_LCM = "/rb_test_tf#tf2_msgs.TFMessage"
 
 
 class TestPGORosbag:
@@ -75,9 +75,9 @@ class TestPGORosbag:
 
         lcm_instance = lcmlib.LCM()
 
-        corrected_odom_collector = LcmCollector(topic=CORRECTED_ODOM_LCM, msg_type=Odometry)
-        global_map_collector = LcmCollector(topic=GLOBAL_MAP_LCM, msg_type=PointCloud2)
-        tf_collector = LcmCollector(topic=TF_LCM, msg_type=TFMessage)
+        corrected_odom_collector = LcmCollector(topic=CORRECTED_ODOM_LCM, message_type=Odometry)
+        global_map_collector = LcmCollector(topic=GLOBAL_MAP_LCM, message_type=PointCloud2)
+        tf_collector = LcmCollector(topic=TF_LCM, message_type=TFMessage)
 
         corrected_odom_collector.start(lcm_instance)
         global_map_collector.start(lcm_instance)
