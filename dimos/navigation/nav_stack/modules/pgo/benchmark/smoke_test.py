@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from collections.abc import Callable
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -44,6 +45,7 @@ from dimos.navigation.nav_stack.modules.pgo.benchmark.kitti360_loader import (
 from dimos.navigation.nav_stack.tests.rosbag_fixtures import (
     NativeProcessRunner,
     lcm_handle_loop,
+    make_isolated_lcm_url,
     make_odometry_msg,
     make_pointcloud_msg,
 )
@@ -165,7 +167,9 @@ def main() -> None:
     message_counts: Counter[str] = Counter()
     topic_prefix = "pgo_smoke"
 
-    lcm_instance = lcmlib.LCM()
+    # Isolate the smoke test's LCM bus from other traffic on the host.
+    lcm_url = make_isolated_lcm_url()
+    lcm_instance = lcmlib.LCM(lcm_url)
     subscriptions = []
 
     def make_handler(topic_name: str) -> Callable[[str, bytes], None]:
@@ -186,11 +190,13 @@ def main() -> None:
 
     runner = _build_runner(topic_prefix, args.loop_search_radius)
     # Capture stderr ourselves so we get the binary's own diagnostics.
+    # Pass the isolated LCM URL through env so the subprocess joins the same bus.
     runner.process = subprocess.Popen(
         [runner.binary_path, *runner.args],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         start_new_session=True,
+        env={**os.environ, "LCM_DEFAULT_URL": lcm_url},
     )
 
     try:

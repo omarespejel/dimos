@@ -25,10 +25,10 @@ For each query frame i (with i >= MIN_FRAME_GAP):
     1. ring-key kd-tree prefilter to top-K (default 10, matching Kim & Kim)
     2. full column-shifted cosine distance against each candidate
     3. top-1 candidate = argmin distance
-    is_tp[i]  = top-1's frame_id is within MAX_LOOP_DISTANCE_M of query
-    score[i]  = -top1_distance  (high = confident match)
+    is_true_positive[i]  = top-1's frame_id is within MAX_LOOP_DISTANCE_M of query
+    score[i]  = -top_match_distance  (high = confident match)
 
-AP = sklearn.metrics.average_precision_score(is_tp, score). Sweeps the
+AP = sklearn.metrics.average_precision_score(is_true_positive, score). Sweeps the
 threshold implicitly. Also reports precision/recall at a few specific
 thresholds for reference.
 
@@ -69,8 +69,8 @@ logger = setup_logger()
 class SCConfig:
     """Mirror of cpp/scan_context.h scan_context::Config defaults."""
 
-    n_rings: int = 20
-    n_sectors: int = 60
+    num_rings: int = 20
+    num_sectors: int = 60
     max_range_m: float = 80.0
     lidar_height_m: float = 2.0
 
@@ -79,10 +79,10 @@ def make_descriptor(points_body: np.ndarray, config: SCConfig) -> np.ndarray:
     """Polar max-z descriptor — matches cpp/scan_context.cpp::make_descriptor.
 
     ``points_body``: (N, 3+) body-frame point cloud.
-    Returns: (n_rings, n_sectors) float32 with cell value = max(z + lidar_height, 0)
+    Returns: (num_rings, num_sectors) float32 with cell value = max(z + lidar_height, 0)
     for points falling in that (range, azimuth) bin.
     """
-    descriptor = np.zeros((config.n_rings, config.n_sectors), dtype=np.float32)
+    descriptor = np.zeros((config.num_rings, config.num_sectors), dtype=np.float32)
     if len(points_body) == 0:
         return descriptor
 
@@ -100,12 +100,12 @@ def make_descriptor(points_body: np.ndarray, config: SCConfig) -> np.ndarray:
     azimuth = np.where(azimuth < 0, azimuth + 2 * np.pi, azimuth)
     z_shifted = np.maximum(z[valid] + config.lidar_height_m, 0.0)
 
-    ring_step = config.max_range_m / config.n_rings
-    sector_step = 2 * np.pi / config.n_sectors
-    rings = np.clip(np.floor(range_valid / ring_step).astype(np.int32), 0, config.n_rings - 1)
-    sectors = np.clip(np.floor(azimuth / sector_step).astype(np.int32), 0, config.n_sectors - 1)
+    ring_step = config.max_range_m / config.num_rings
+    sector_step = 2 * np.pi / config.num_sectors
+    rings = np.clip(np.floor(range_valid / ring_step).astype(np.int32), 0, config.num_rings - 1)
+    sectors = np.clip(np.floor(azimuth / sector_step).astype(np.int32), 0, config.num_sectors - 1)
 
-    flat_idx = rings * config.n_sectors + sectors
+    flat_idx = rings * config.num_sectors + sectors
     np.maximum.at(descriptor.ravel(), flat_idx, z_shifted.astype(np.float32))
     return descriptor
 
@@ -117,14 +117,14 @@ def best_sc_distance(query: np.ndarray, candidate: np.ndarray) -> tuple[float, i
     Each shift's score is mean(1 - cosine_sim) across columns whose
     norms are both non-zero (matches reference's "skip empty sector" logic).
     """
-    n_sectors = query.shape[1]
+    num_sectors = query.shape[1]
     query_norms = np.linalg.norm(query, axis=0)
     candidate_norms = np.linalg.norm(candidate, axis=0)
 
     best_distance = 2.0
     best_shift = 0
-    for shift in range(n_sectors):
-        # roll candidate so candidate_shifted[:, j] = candidate[:, (j + shift) % n_sectors]
+    for shift in range(num_sectors):
+        # roll candidate so candidate_shifted[:, j] = candidate[:, (j + shift) % num_sectors]
         shifted_norms = np.roll(candidate_norms, -shift)
         valid = (query_norms > 1e-6) & (shifted_norms > 1e-6)
         if not valid.any():
@@ -194,8 +194,8 @@ def main() -> None:
 
     logger.info("Building SC descriptors...")
     build_start = time.time()
-    descriptors = np.zeros((num_frames, config.n_rings, config.n_sectors), dtype=np.float32)
-    ring_keys = np.zeros((num_frames, config.n_rings), dtype=np.float32)
+    descriptors = np.zeros((num_frames, config.num_rings, config.num_sectors), dtype=np.float32)
+    ring_keys = np.zeros((num_frames, config.num_rings), dtype=np.float32)
     for i, frame_id in enumerate(frame_ids):
         scan = sequence.scan_xyz(frame_id)
         descriptors[i] = make_descriptor(scan, config)
@@ -207,9 +207,9 @@ def main() -> None:
 
     logger.info("Computing top-1 SC matches per query...")
     score_start = time.time()
-    top1_dist = np.full(num_frames, 2.0, dtype=np.float64)
-    is_tp = np.zeros(num_frames, dtype=bool)
-    has_any_gt = np.zeros(num_frames, dtype=bool)
+    top_match_distances = np.full(num_frames, 2.0, dtype=np.float64)
+    is_true_positive = np.zeros(num_frames, dtype=bool)
+    has_any_groundtruth = np.zeros(num_frames, dtype=bool)
 
     eval_count = 0
     for query_index, frame_id in enumerate(frame_ids):
@@ -218,7 +218,7 @@ def main() -> None:
             continue
         eval_count += 1
         valid_set = groundtruth.valid_loops_per_query.get(frame_id, set())
-        has_any_gt[query_index] = bool(valid_set)
+        has_any_groundtruth[query_index] = bool(valid_set)
 
         if args.brute_force:
             candidate_indices: list[int] = list(range(max_candidate_index + 1))
@@ -243,25 +243,25 @@ def main() -> None:
                 best_distance = distance
                 best_candidate_index = candidate_index
 
-        top1_dist[query_index] = best_distance
+        top_match_distances[query_index] = best_distance
         if best_candidate_index >= 0 and frame_ids[best_candidate_index] in valid_set:
-            is_tp[query_index] = True
+            is_true_positive[query_index] = True
 
         if eval_count % 200 == 0:
             elapsed = time.time() - score_start
             logger.info(
                 f"  scored {eval_count} queries  ({eval_count / elapsed:.1f} q/s, "
-                f"running TP={is_tp.sum()}, has_gt={has_any_gt.sum()})"
+                f"running TP={is_true_positive.sum()}, has_gt={has_any_groundtruth.sum()})"
             )
 
     logger.info(f"Scoring done in {time.time() - score_start:.1f}s")
 
-    # AP: rank queries by score = -top1_dist (high = more confident "this is a loop")
+    # AP: rank queries by score = -top_match_distances (high = more confident "this is a loop")
     eval_mask = np.arange(num_frames) >= args.min_frame_gap
-    y_true = is_tp[eval_mask].astype(np.int32)
-    y_score = -top1_dist[eval_mask]
+    y_true = is_true_positive[eval_mask].astype(np.int32)
+    y_score = -top_match_distances[eval_mask]
     num_evaluated = int(eval_mask.sum())
-    num_with_groundtruth = int(has_any_gt[eval_mask].sum())
+    num_with_groundtruth = int(has_any_groundtruth[eval_mask].sum())
     num_true_positives = int(y_true.sum())
 
     average_precision = (
@@ -269,10 +269,10 @@ def main() -> None:
     )
 
     # Manual P/R sweep at representative SC-distance thresholds.
-    # At threshold T: a query is "predicted loop" iff its top1_dist <= T.
-    #   precision = (#predicted ∧ is_tp) / #predicted
-    #   recall    = (#predicted ∧ is_tp) / #queries_with_any_gt
-    eval_distances = top1_dist[eval_mask]
+    # At threshold T: a query is "predicted loop" iff its top_match_distances <= T.
+    #   precision = (#predicted ∧ is_true_positive) / #predicted
+    #   recall    = (#predicted ∧ is_true_positive) / #queries_with_any_gt
+    eval_distances = top_match_distances[eval_mask]
     pr_rows = []
     for threshold in (0.13, 0.20, 0.30, 0.40, 0.50, 0.60, 0.80, 1.00):
         predicted = eval_distances <= threshold
@@ -304,12 +304,13 @@ def main() -> None:
     print("")
     print("PR points (SC distance threshold):")
     print(
-        f"  {'thresh':>8s}  {'n_pred':>7s}  {'n_tp':>6s}  {'precision':>10s}  {'recall':>8s}  {'F1':>6s}"
+        f"  {'threshold':>9s}  {'predicted':>9s}  {'true_positives':>14s}  "
+        f"{'precision':>9s}  {'recall':>8s}  {'F1':>6s}"
     )
     for threshold, num_predicted, true_positives, precision, recall, f1 in pr_rows:
         print(
-            f"  {threshold:>8.2f}  {num_predicted:>7d}  {true_positives:>6d}  "
-            f"{precision:>10.4f}  {recall:>8.4f}  {f1:>6.4f}"
+            f"  {threshold:>9.2f}  {num_predicted:>9d}  {true_positives:>14d}  "
+            f"{precision:>9.4f}  {recall:>8.4f}  {f1:>6.4f}"
         )
 
 

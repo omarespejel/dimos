@@ -35,6 +35,7 @@ import argparse
 from dataclasses import asdict, dataclass
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -59,6 +60,7 @@ from dimos.navigation.nav_stack.modules.pgo.benchmark.loop_groundtruth import (
 from dimos.navigation.nav_stack.tests.rosbag_fixtures import (
     NativeProcessRunner,
     lcm_handle_loop,
+    make_isolated_lcm_url,
     make_odometry_msg,
     make_pointcloud_msg,
 )
@@ -288,7 +290,10 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         f"{groundtruth.total_loop_pairs} total valid loop pairs."
     )
 
-    lcm_instance = lcmlib.LCM()
+    # Isolate the benchmark from other LCM traffic on the host so we only see
+    # the loop-closure events from our own PGO subprocess.
+    lcm_url = make_isolated_lcm_url()
+    lcm_instance = lcmlib.LCM(lcm_url)
     state = BenchmarkState()
     # Single source of truth: the timestamps the runner will publish are also
     # the keys we cache for the edge-endpoint → frame_id lookup. Building this
@@ -322,11 +327,14 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     try:
         # Capture PGO's stderr so its diagnostic prints (keyframes, sc-search, loop events)
         # are available for debugging. We dump them to the runner's log at the end.
+        # Pass the isolated LCM URL through env so the subprocess joins the same
+        # bus as our Python publisher/subscriber.
         runner.process = subprocess.Popen(
             [runner.binary_path, *runner.args],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            env={**os.environ, "LCM_DEFAULT_URL": lcm_url},
         )
         time.sleep(2.0)
         if not runner.is_running:
@@ -451,18 +459,24 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
     if config.output_json is not None:
         config.output_json.parent.mkdir(parents=True, exist_ok=True)
-        payload = asdict(result)
-        payload["metrics"] = {
-            "true_positive": metrics.true_positive,
-            "false_positive": metrics.false_positive,
-            "false_negative": metrics.false_negative,
-            "precision": metrics.precision if math.isfinite(metrics.precision) else None,
-            "recall": metrics.recall if math.isfinite(metrics.recall) else None,
-            "f1": metrics.f1,
-        }
-        config.output_json.write_text(json.dumps(payload, indent=2))
+        config.output_json.write_text(json.dumps(result_to_json(result), indent=2))
 
     return result
+
+
+def result_to_json(result: BenchmarkResult) -> dict[str, object]:
+    """JSON-safe dict view of a BenchmarkResult (NaN precision/recall → null)."""
+    metrics = result.metrics
+    payload = asdict(result)
+    payload["metrics"] = {
+        "true_positive": metrics.true_positive,
+        "false_positive": metrics.false_positive,
+        "false_negative": metrics.false_negative,
+        "precision": metrics.precision if math.isfinite(metrics.precision) else None,
+        "recall": metrics.recall if math.isfinite(metrics.recall) else None,
+        "f1": metrics.f1,
+    }
+    return payload
 
 
 def _format_result(result: BenchmarkResult) -> str:
@@ -527,7 +541,8 @@ def main() -> None:
     config.print_stderr = args.print_stderr  # type: ignore[attr-defined]
 
     result = run_benchmark(config)
-    print(_format_result(result))
+    logger.info(_format_result(result))
+    print(json.dumps(result_to_json(result), indent=2))
 
 
 if __name__ == "__main__":

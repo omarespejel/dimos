@@ -47,6 +47,7 @@ from dimos.navigation.nav_stack.tests.rosbag_fixtures import (
     feed_at_original_timing,
     lcm_handle_loop,
     load_rosbag_window,
+    make_isolated_lcm_url,
 )
 from dimos.utils.logging_config import setup_logger
 
@@ -148,7 +149,10 @@ class TestPGOLoopClosure:
         assert len(window.scans) > 0, "No scans in rosbag fixture"
         assert len(window.odom) > 0, "No odometry in rosbag fixture"
 
-        lcm_instance = lcmlib.LCM()
+        # Isolate this test's LCM bus from anything else on the host (other
+        # tests, dimos nodes, an actual robot on the LAN).
+        lcm_url = make_isolated_lcm_url()
+        lcm_instance = lcmlib.LCM(lcm_url)
 
         received_events: list[NavPath] = []
         events_lock = threading.Lock()
@@ -232,7 +236,7 @@ class TestPGOLoopClosure:
         )
 
         try:
-            runner.start(capture_stderr=True)
+            runner.start(capture_stderr=True, env={"LCM_DEFAULT_URL": lcm_url})
             assert runner.is_running, "PGO binary failed to start"
             time.sleep(_PROCESS_STARTUP_SEC)
 

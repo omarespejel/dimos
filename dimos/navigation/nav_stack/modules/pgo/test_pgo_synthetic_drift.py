@@ -54,6 +54,7 @@ from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.navigation.nav_stack.tests.rosbag_fixtures import (
     NativeProcessRunner,
     lcm_handle_loop,
+    make_isolated_lcm_url,
 )
 from dimos.utils.logging_config import setup_logger
 
@@ -267,7 +268,11 @@ def _run_pgo(
     if trajectory is None:
         trajectory = _trajectory_with_drift()
 
-    lcm_instance = lcmlib.LCM()
+    # Isolate from any other LCM traffic on the host (other tests, dimos
+    # nodes, an actual robot on the LAN) so this test only sees its own
+    # PGO subprocess's messages.
+    lcm_url = make_isolated_lcm_url()
+    lcm_instance = lcmlib.LCM(lcm_url)
     received_events: list[NavPath] = []
     events_lock = threading.Lock()
 
@@ -345,7 +350,7 @@ def _run_pgo(
 
     stderr_data = b""
     try:
-        runner.start(capture_stderr=True)
+        runner.start(capture_stderr=True, env={"LCM_DEFAULT_URL": lcm_url})
         time.sleep(1.5)
         assert runner.is_running, "PGO failed to start"
 

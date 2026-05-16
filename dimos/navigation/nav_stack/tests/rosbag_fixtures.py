@@ -22,6 +22,7 @@ then capturing and comparing outputs with deviation scores.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -165,6 +166,25 @@ def lcm_handle_loop(lcm: lcmlib.LCM, stop_event: threading.Event, timeout_ms: in
         lcm.handle_timeout(timeout_ms)
 
 
+def make_isolated_lcm_url() -> str:
+    """Return an LCM URL that should not collide with concurrent runs.
+
+    Uses the standard multicast group with TTL=0 (so traffic never escapes
+    the local host) and a port picked from the high ephemeral range plus the
+    OS-supplied PID. This is the same approach the LCM project recommends for
+    test isolation: keep the group address standard (so existing tools can
+    still see the traffic if needed) and vary the port. Concurrent CI workers
+    on the same host pick disjoint ports because their PIDs differ; the same
+    test re-run in the same process is also fine because each call generates
+    a fresh URL.
+    """
+    # ports 49152..65535 are the IANA "dynamic/private" range
+    port = 49152 + (os.getpid() % 16000) + (int(time.time() * 1000) % 384)
+    if port > 65535:
+        port = 49152 + (port % 16000)
+    return f"udpm://239.255.76.67:{port}?ttl=0"
+
+
 @dataclass
 class NativeProcessRunner:
     """Start and manage a native module C++ process for testing."""
@@ -173,12 +193,22 @@ class NativeProcessRunner:
     args: list[str]
     process: subprocess.Popen[bytes] | None = field(default=None, repr=False)
 
-    def start(self, capture_stderr: bool = False) -> None:
+    def start(
+        self,
+        capture_stderr: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        process_env: dict[str, str] | None
+        if env is None:
+            process_env = None
+        else:
+            process_env = {**os.environ, **env}
         self.process = subprocess.Popen(
             [self.binary_path, *self.args],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
             start_new_session=True,
+            env=process_env,
         )
 
     def stop(self, timeout: float = 3.0) -> None:
