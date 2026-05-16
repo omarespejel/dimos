@@ -203,6 +203,7 @@ all_modules = {
     "temporal-memory": "dimos.perception.experimental.temporal_memory.temporal_memory.TemporalMemory",
     "terrain-analysis": "dimos.navigation.nav_stack.modules.terrain_analysis.terrain_analysis.TerrainAnalysis",
     "terrain-map-ext": "dimos.navigation.nav_stack.modules.terrain_map_ext.terrain_map_ext.TerrainMapExt",
+    "topic-counter-module": "dimos.navigation.nav_stack.modules.pgo.demo_benchmark_kitti_smoke.TopicCounterModule",
     "twist-teleop-module": "dimos.teleop.quest.quest_extensions.TwistTeleopModule",
     "unitree-g1-skill-container": "dimos.robot.unitree.g1.skill_container.UnitreeG1SkillContainer",
     "unitree-skill-container": "dimos.robot.unitree.unitree_skill_container.UnitreeSkillContainer",
