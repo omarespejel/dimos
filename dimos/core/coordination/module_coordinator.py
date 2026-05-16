@@ -82,6 +82,20 @@ class ModuleCoordinator(Resource):
                 module.stop()
             except Exception:
                 logger.error("Error stopping module", module=module_class.__name__, exc_info=True)
+            # Belt-and-suspenders: if proxy.stop() raised before the RPC client
+            # had a chance to tear itself down, the host-side LCM listener
+            # thread leaks. Force it here so the test harness's thread-leak
+            # check stays clean.
+            stop_rpc_client = getattr(module, "stop_rpc_client", None)
+            if callable(stop_rpc_client):
+                try:
+                    stop_rpc_client()
+                except Exception:
+                    logger.error(
+                        "Error stopping RPC client",
+                        module=module_class.__name__,
+                        exc_info=True,
+                    )
             logger.info("Module stopped.", module=module_class.__name__)
 
         def _stop_manager(m: WorkerManager) -> None:

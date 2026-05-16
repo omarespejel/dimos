@@ -59,7 +59,7 @@ from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
 
-pytestmark = [pytest.mark.slow]
+pytestmark = [pytest.mark.self_hosted, pytest.mark.skipif_no_nix]
 
 # Cross-trajectory drift injected at the revisit. Must be >> loop_search_radius
 # so position-based search cannot accidentally find the loop.
@@ -77,11 +77,11 @@ INTER_FRAME_SLEEP_SEC = 0.15
 POST_FEED_DRAIN_SEC = 3.0
 # Poll period when waiting for the playback module to drain.
 POLL_INTERVAL_SEC = 0.25
-
-
-# ---------------------------------------------------------------------------
-# Trajectory + scan-cloud generators (test-private)
-# ---------------------------------------------------------------------------
+# Wait this long inside the playback main() before publishing the first
+# frame. PGO's native C++ binary needs a moment to subscribe to its
+# LCM topics after start(); without this delay, the playback can race
+# ahead and publish all frames into the void before PGO is listening.
+PLAYBACK_STARTUP_DELAY_SEC = 2.0
 
 
 def _make_room_points(half_size: float = 20.0, density: float = 0.15) -> np.ndarray:
@@ -230,14 +230,10 @@ def _trajectory_payload(
     return rows
 
 
-# ---------------------------------------------------------------------------
-# Modules
-# ---------------------------------------------------------------------------
-
-
 class SyntheticDriftPlaybackConfig(ModuleConfig):
     trajectory: list[list[float]]
     inter_frame_sleep_sec: float = INTER_FRAME_SLEEP_SEC
+    startup_delay_sec: float = PLAYBACK_STARTUP_DELAY_SEC
     room_half_size: float = 20.0
     room_density: float = 0.15
 
@@ -262,6 +258,8 @@ class SyntheticDriftPlaybackModule(Module):
         self._playback_task.cancel()
 
     async def _run_playback(self) -> None:
+        if self.config.startup_delay_sec > 0:
+            await asyncio.sleep(self.config.startup_delay_sec)
         for row in self.config.trajectory:
             (
                 timestamp,
@@ -308,14 +306,9 @@ class SyntheticDriftPlaybackModule(Module):
         return self._frames_published
 
 
-class LoopClosureCounterConfig(ModuleConfig):
-    pass
-
-
 class LoopClosureCounterModule(Module):
     """Counts loop_closure events from any pose-graph SLAM module."""
 
-    config: LoopClosureCounterConfig
     loop_closure: In[NavPath]
 
     def __init__(self, **kwargs: Any) -> None:
@@ -337,11 +330,6 @@ class LoopClosureCounterModule(Module):
     @rpc
     def count(self) -> int:
         return self._count
-
-
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
 
 
 def _run_pgo(

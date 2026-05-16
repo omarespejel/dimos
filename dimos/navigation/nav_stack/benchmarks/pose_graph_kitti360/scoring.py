@@ -30,10 +30,11 @@ after iSAM2 has shifted the optimized keyframe positions.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
 from typing import Any
 
+from pydantic import Field
 from reactivex.disposable import Disposable
 
 from dimos.core.core import rpc
@@ -74,11 +75,15 @@ class LoopMetrics:
 
 
 class PoseGraphScoringConfig(ModuleConfig):
-    frame_ids: list[int] = field(default_factory=list)
-    send_timestamps: list[float] = field(default_factory=list)
+    # ``ModuleConfig`` inherits from ``pydantic.BaseModel``, so default
+    # factories must come from ``pydantic.Field`` — ``dataclasses.field``
+    # would be stored as the literal default value and break validation
+    # (greptile c5 on PR #2099).
+    frame_ids: list[int] = Field(default_factory=list)
+    send_timestamps: list[float] = Field(default_factory=list)
     # JSON-friendly form of LoopGroundtruth.valid_loops_per_query:
     # frame_id → list of frame_ids that form valid loop pairs.
-    valid_loops_per_query: dict[int, list[int]] = field(default_factory=dict)
+    valid_loops_per_query: dict[int, list[int]] = Field(default_factory=dict)
     # Tag value the publisher writes into orientation.w to mark a
     # pose_graph_edges PoseStamped pair as a loop closure (vs the
     # odometry-edge default of 1.0). Both fields are config-driven so
