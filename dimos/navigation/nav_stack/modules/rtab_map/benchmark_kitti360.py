@@ -69,6 +69,13 @@ def main() -> None:
         help="OctoMap cell size in meters",
     )
     parser.add_argument("--debug", action="store_true", help="verbose C++ stderr")
+    parser.add_argument(
+        "--loop-min-id-gap",
+        type=int,
+        default=50,
+        help="wrapper-side filter: drop detected loops whose signature-id gap "
+        "is below this (default 50, matching KITTI-360 GT min frame gap)",
+    )
 
     # Benchmark-runner knobs.
     parser.add_argument("--publish-interval-sec", type=float, default=0.02)
@@ -80,6 +87,7 @@ def main() -> None:
         rtabmap_process_period=args.rtabmap_process_period,
         rgbd_proximity_path_max_neighbors=args.rgbd_proximity_path_max_neighbors,
         grid_cell_size=args.grid_cell_size,
+        loop_min_id_gap=args.loop_min_id_gap,
         debug=args.debug,
     )
 

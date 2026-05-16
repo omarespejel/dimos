@@ -148,6 +148,14 @@ class RtabMapConfig(NativeModuleConfig):
     # very tight for outdoor LiDAR; 0.5m is forgiving and gives proximity
     # ICP a chance at slightly-misaligned candidates.
     icp_max_correspondence_distance: float = 0.5
+    # Wrapper-side minimum signature-ID gap before publishing a detected
+    # loop closure on `pose_graph_edges`. rtabmap proximity-ICP routinely
+    # matches against the keyframe ~10 ids back (just past Mem/STMSize=10)
+    # as a trajectory-smoothing add — useful for graph optimization but
+    # semantically "not a loop closure" for benchmark-style scoring. 0
+    # keeps every match; KITTI-360 GT uses `frame_gap >= 50` so 50 is
+    # a sensible filter when scoring against that.
+    loop_min_id_gap: int = 0
 
     # Verbose per-frame stderr diagnostics from the C++ binary. Useful for
     # debugging things like "global_map_slam isn't updating": surfaces
