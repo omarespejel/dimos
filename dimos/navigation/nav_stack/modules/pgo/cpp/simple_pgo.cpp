@@ -239,12 +239,21 @@ void SimplePGO::searchForLoopPairs()
 
     // Use Scan Context's column shift to seed ICP with a yaw-aligned initial
     // guess, which dramatically improves convergence on revisits at
-    // different headings.
+    // different headings. Both submaps are in *global* frame, so a naive
+    // rotation about the world origin would translate the source cloud
+    // kilometers off (e.g. at world position (3500, 350), rotating by 90°
+    // sends it to (-350, 3500)). Build a transform that rotates about the
+    // source keyframe's own global position instead:
+    //     init = T(src_pos) · Rz(θ) · T(-src_pos)
+    // → init · p = R · (p - src_pos) + src_pos
     Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
     if (m_config.use_scan_context && sector_shift != 0) {
         const double yaw = scan_context::yaw_from_shift(sector_shift, m_sc_config.n_sectors);
         Eigen::AngleAxisf rot(static_cast<float>(yaw), Eigen::Vector3f::UnitZ());
-        init_guess.block<3, 3>(0, 0) = rot.toRotationMatrix();
+        Eigen::Matrix3f R = rot.toRotationMatrix();
+        Eigen::Vector3f src_pos = m_key_poses[cur_idx].t_global.cast<float>();
+        init_guess.block<3, 3>(0, 0) = R;
+        init_guess.block<3, 1>(0, 3) = src_pos - R * src_pos;
     }
 
     CloudType::Ptr target_cloud = getSubMap(loop_idx, m_config.loop_submap_half_range, m_config.submap_resolution);
