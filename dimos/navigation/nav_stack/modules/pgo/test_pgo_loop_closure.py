@@ -72,45 +72,69 @@ _QUATERNION_UNIT_TOL = 0.05
 _TRANSLATION_MAX_M = 100.0
 
 
-def _validate_path_msg(msg: NavPath, event_index: int) -> tuple[float, float]:
+def _validate_path_message(message: NavPath, event_index: int) -> tuple[float, float]:
     """Assert each PoseStamped's quaternion is unit + translation finite.
 
     Returns ``(max_translation_norm, max_quat_drift)`` so the caller can
     log aggregate stats per event.
     """
-    assert len(msg.poses) > 0, f"event {event_index}: loop-closure msg has no poses"
+    assert len(message.poses) > 0, f"event {event_index}: loop-closure message has no poses"
 
-    max_t = 0.0
-    max_q_drift = 0.0
-    for i, pose in enumerate(msg.poses):
-        tx, ty, tz = pose.position.x, pose.position.y, pose.position.z
-        qx, qy, qz, qw = (
+    max_translation_norm = 0.0
+    max_quaternion_drift = 0.0
+    for pose_index, pose in enumerate(message.poses):
+        translation_x, translation_y, translation_z = (
+            pose.position.x,
+            pose.position.y,
+            pose.position.z,
+        )
+        quaternion_x, quaternion_y, quaternion_z, quaternion_w = (
             pose.orientation.x,
             pose.orientation.y,
             pose.orientation.z,
             pose.orientation.w,
         )
-        for value, name in [(tx, "tx"), (ty, "ty"), (tz, "tz")]:
-            assert math.isfinite(value), f"event {event_index} pose {i}: {name}={value} not finite"
-        for value, name in [(qx, "qx"), (qy, "qy"), (qz, "qz"), (qw, "qw")]:
-            assert math.isfinite(value), f"event {event_index} pose {i}: {name}={value} not finite"
-        t_norm = math.sqrt(tx * tx + ty * ty + tz * tz)
-        assert t_norm < _TRANSLATION_MAX_M, (
-            f"event {event_index} pose {i}: |t|={t_norm:.3f}m exceeds "
-            f"sanity cap {_TRANSLATION_MAX_M}m"
+        for value, name in [
+            (translation_x, "translation_x"),
+            (translation_y, "translation_y"),
+            (translation_z, "translation_z"),
+        ]:
+            assert math.isfinite(value), (
+                f"event {event_index} pose {pose_index}: {name}={value} not finite"
+            )
+        for value, name in [
+            (quaternion_x, "quaternion_x"),
+            (quaternion_y, "quaternion_y"),
+            (quaternion_z, "quaternion_z"),
+            (quaternion_w, "quaternion_w"),
+        ]:
+            assert math.isfinite(value), (
+                f"event {event_index} pose {pose_index}: {name}={value} not finite"
+            )
+        translation_norm = math.sqrt(
+            translation_x * translation_x
+            + translation_y * translation_y
+            + translation_z * translation_z
         )
-        q_norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
-        q_drift = abs(q_norm - 1.0)
-        assert q_drift < _QUATERNION_UNIT_TOL, (
-            f"event {event_index} pose {i}: |q|={q_norm:.6f} drifts "
-            f"from unit by {q_drift:.6f} (tol {_QUATERNION_UNIT_TOL})"
+        assert translation_norm < _TRANSLATION_MAX_M, (
+            f"event {event_index} pose {pose_index}: |t|={translation_norm:.3f}m "
+            f"exceeds sanity cap {_TRANSLATION_MAX_M}m"
         )
-        if t_norm > max_t:
-            max_t = t_norm
-        if q_drift > max_q_drift:
-            max_q_drift = q_drift
+        quaternion_norm = math.sqrt(
+            quaternion_x * quaternion_x
+            + quaternion_y * quaternion_y
+            + quaternion_z * quaternion_z
+            + quaternion_w * quaternion_w
+        )
+        quaternion_drift = abs(quaternion_norm - 1.0)
+        assert quaternion_drift < _QUATERNION_UNIT_TOL, (
+            f"event {event_index} pose {pose_index}: |q|={quaternion_norm:.6f} drifts "
+            f"from unit by {quaternion_drift:.6f} (tol {_QUATERNION_UNIT_TOL})"
+        )
+        max_translation_norm = max(max_translation_norm, translation_norm)
+        max_quaternion_drift = max(max_quaternion_drift, quaternion_drift)
 
-    return max_t, max_q_drift
+    return max_translation_norm, max_quaternion_drift
 
 
 class TestPGOLoopClosure:
@@ -130,23 +154,23 @@ class TestPGOLoopClosure:
         events_lock = threading.Lock()
 
         def _on_loop_closure(_channel: str, data: bytes) -> None:
-            msg = NavPath.lcm_decode(data)
+            message = NavPath.lcm_decode(data)
             with events_lock:
-                idx = len(received_events)
-                received_events.append(msg)
-            first = msg.poses[0] if msg.poses else None
-            head = (
-                f"first=t=({first.position.x:.3f},{first.position.y:.3f},"
-                f"{first.position.z:.3f}) "
-                f"q=({first.orientation.x:.3f},{first.orientation.y:.3f},"
-                f"{first.orientation.z:.3f},{first.orientation.w:.3f})"
-                if first
+                event_index = len(received_events)
+                received_events.append(message)
+            first_pose = message.poses[0] if message.poses else None
+            first_pose_summary = (
+                f"first=t=({first_pose.position.x:.3f},{first_pose.position.y:.3f},"
+                f"{first_pose.position.z:.3f}) "
+                f"q=({first_pose.orientation.x:.3f},{first_pose.orientation.y:.3f},"
+                f"{first_pose.orientation.z:.3f},{first_pose.orientation.w:.3f})"
+                if first_pose
                 else "<empty>"
             )
             logger.info(
-                f"[pgo_loop_closure] event #{idx} received: "
-                f"poses_length={len(msg.poses)}, frame_id={msg.frame_id!r}, "
-                f"ts={msg.ts:.3f}, {head}"
+                f"[pgo_loop_closure] event #{event_index} received: "
+                f"poses_length={len(message.poses)}, frame_id={message.frame_id!r}, "
+                f"ts={message.ts:.3f}, {first_pose_summary}"
             )
 
         loop_closure_subscription = lcm_instance.subscribe(LOOP_CLOSURE_LCM, _on_loop_closure)
@@ -243,12 +267,15 @@ class TestPGOLoopClosure:
                 "lines), not the on-wire payload."
             )
 
-        for idx, msg in enumerate(events):
-            max_t, max_q_drift = _validate_path_msg(msg, idx)
+        for event_index, message in enumerate(events):
+            max_translation_norm, max_quaternion_drift = _validate_path_message(
+                message, event_index
+            )
             logger.info(
-                f"[pgo_loop_closure] event #{idx} VALID: "
-                f"N={len(msg.poses)}, max|t|={max_t:.4f}m, "
-                f"max|q|-1|={max_q_drift:.6f}"
+                f"[pgo_loop_closure] event #{event_index} VALID: "
+                f"keyframe_count={len(message.poses)}, "
+                f"max|t|={max_translation_norm:.4f}m, "
+                f"max|q|-1|={max_quaternion_drift:.6f}"
             )
 
-        assert all(len(msg.poses) > 0 for msg in events)
+        assert all(len(message.poses) > 0 for message in events)

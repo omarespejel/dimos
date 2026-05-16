@@ -113,26 +113,48 @@ class BenchmarkState:
     loop_closure_events: int = 0
     detected_pairs: list[tuple[int, int]] = None  # type: ignore[assignment]
     last_graph_node_count: int = 0
-    keyframe_index_to_frame_id: dict[int, int] = None  # type: ignore[assignment]
+    # Maps round(effective_send_timestamp * 1e3) → frame_id. The keys MUST be
+    # computed from the exact same timestamps the runner publishes to PGO; using
+    # raw KITTI timestamps here de-syncs from the sent ts and silently drops
+    # loop pairs (greptile c2 on PR #2099).
+    timestamp_ms_to_frame_id: dict[int, int] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.detected_pairs is None:
             self.detected_pairs = []
-        if self.keyframe_index_to_frame_id is None:
-            self.keyframe_index_to_frame_id = {}
+        if self.timestamp_ms_to_frame_id is None:
+            self.timestamp_ms_to_frame_id = {}
+
+
+def _compute_send_timestamps(
+    sequence: Kitti360Sequence, frame_ids_in_order: list[int]
+) -> list[float]:
+    """Compute the per-frame timestamp the runner will publish.
+
+    PGO's Odometry constructor treats ``ts==0`` as "now", so we clamp the
+    first ts away from zero and enforce strict monotonicity afterward. The
+    cache built from these values is what ``_on_graph_edges`` consults — keep
+    this function as the single source of truth for both.
+    """
+    if not frame_ids_in_order:
+        return []
+    first_timestamp = max(sequence.timestamps.get(frame_ids_in_order[0], 1.0), 1.0)
+    send_timestamps: list[float] = []
+    for index, frame_id in enumerate(frame_ids_in_order):
+        raw_timestamp = sequence.timestamps.get(frame_id, float(index))
+        send_timestamps.append(max(raw_timestamp, first_timestamp + index * 0.001))
+    return send_timestamps
 
 
 def _on_loop_closure(state: BenchmarkState, _channel: str, data: bytes) -> None:
-    msg = NavPath.lcm_decode(data)
+    message = NavPath.lcm_decode(data)
     state.loop_closure_events += 1
-    # The new keyframe count == len(msg.poses) for our publisher.
-    state.last_graph_node_count = max(state.last_graph_node_count, len(msg.poses))
+    # The new keyframe count == len(message.poses) for our publisher.
+    state.last_graph_node_count = max(state.last_graph_node_count, len(message.poses))
 
 
 def _on_graph_edges(
     state: BenchmarkState,
-    sequence: Kitti360Sequence,
-    frame_ids_in_order: list[int],
     _channel: str,
     data: bytes,
 ) -> None:
@@ -145,37 +167,35 @@ def _on_graph_edges(
     keyframe's *creation* timestamp (not the message publish time), so
     we can look up which input scan produced each endpoint regardless
     of how much iSAM2 has since shifted the keyframe's world position.
-    """
-    msg = NavPath.lcm_decode(data)
-    # ts_to_frame_id: built once on the first call so we don't pay for it on every edge update.
-    if not state.keyframe_index_to_frame_id:  # repurpose this dict as ts→frame_id cache
-        for fid in frame_ids_in_order:
-            ts = sequence.timestamps.get(fid)
-            if ts is not None:
-                state.keyframe_index_to_frame_id[round(ts * 1e3)] = fid
 
-    def _ts_to_frame(ts_sec: float) -> int | None:
-        ts_ms = round(ts_sec * 1e3)
+    The ``state.timestamp_ms_to_frame_id`` cache must be pre-populated by
+    ``run_benchmark`` using the same per-frame send timestamps the runner
+    publishes — otherwise the lookup keys don't line up.
+    """
+    message = NavPath.lcm_decode(data)
+
+    def _timestamp_to_frame(timestamp_sec: float) -> int | None:
+        timestamp_ms = round(timestamp_sec * 1e3)
         # Allow ±1ms slop (PoseStamped ts rounds through int sec + uint nsec)
-        for delta in (0, -1, 1):
-            fid = state.keyframe_index_to_frame_id.get(ts_ms + delta)
-            if fid is not None:
-                return fid
+        for slop_ms in (0, -1, 1):
+            frame_id = state.timestamp_ms_to_frame_id.get(timestamp_ms + slop_ms)
+            if frame_id is not None:
+                return frame_id
         return None
 
-    i = 0
-    while i + 1 < len(msg.poses):
-        pose_a = msg.poses[i]
-        pose_b = msg.poses[i + 1]
-        trav_a = float(pose_a.orientation.w)
-        if abs(trav_a - 0.4) < 0.05:
-            fa = _ts_to_frame(pose_a.ts)
-            fb = _ts_to_frame(pose_b.ts)
-            if fa is not None and fb is not None:
-                pair = (fa, fb)
+    pose_index = 0
+    while pose_index + 1 < len(message.poses):
+        start_pose = message.poses[pose_index]
+        end_pose = message.poses[pose_index + 1]
+        traversability = float(start_pose.orientation.w)
+        if abs(traversability - 0.4) < 0.05:
+            start_frame_id = _timestamp_to_frame(start_pose.ts)
+            end_frame_id = _timestamp_to_frame(end_pose.ts)
+            if start_frame_id is not None and end_frame_id is not None:
+                pair = (start_frame_id, end_frame_id)
                 if pair not in state.detected_pairs:
                     state.detected_pairs.append(pair)
-        i += 2
+        pose_index += 2
 
 
 def _build_runner(config: BenchmarkConfig, topic_prefix: str) -> NativeProcessRunner:
@@ -251,7 +271,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             f"{config.min_frame_gap + 1} to evaluate loop closures."
         )
 
-    positions = np.array([sequence.lidar_pose(fid)[:3, 3] for fid in frame_ids])
+    positions = np.array([sequence.lidar_pose(frame_id)[:3, 3] for frame_id in frame_ids])
     logger.info(
         f"Trajectory has {len(frame_ids)} frames, "
         f"travelled {float(np.linalg.norm(positions[-1] - positions[0])):.1f}m"
@@ -270,6 +290,14 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
     lcm_instance = lcmlib.LCM()
     state = BenchmarkState()
+    # Single source of truth: the timestamps the runner will publish are also
+    # the keys we cache for the edge-endpoint → frame_id lookup. Building this
+    # once before subscribing avoids the cache/publish desync described by
+    # greptile c2 on PR #2099.
+    send_timestamps = _compute_send_timestamps(sequence, frame_ids)
+    for frame_id, send_timestamp in zip(frame_ids, send_timestamps, strict=True):
+        state.timestamp_ms_to_frame_id[round(send_timestamp * 1e3)] = frame_id
+
     topic_prefix = f"kitti360_seq{config.sequence_id:02d}"
     loop_topic = f"/{topic_prefix}_loop_closure#nav_msgs.Path"
     edges_topic = f"/{topic_prefix}_graph_edges#nav_msgs.LineSegments3D"
@@ -280,7 +308,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     )
     edges_sub = lcm_instance.subscribe(
         edges_topic,
-        lambda channel, data: _on_graph_edges(state, sequence, frame_ids, channel, data),
+        lambda channel, data: _on_graph_edges(state, channel, data),
     )
 
     stop_event = threading.Event()
@@ -306,29 +334,23 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
         scan_topic = f"/{topic_prefix}_scan#sensor_msgs.PointCloud2"
         odom_topic = f"/{topic_prefix}_odom#nav_msgs.Odometry"
-        # Choose timestamps that are strictly increasing and start away
-        # from zero (PGO's Odometry constructor treats ts==0 as "now").
-        first_ts = max(sequence.timestamps.get(frame_ids[0], 1.0), 1.0)
 
         for index, frame_id in enumerate(frame_ids):
             scan_xyz = sequence.scan_xyz(frame_id)
             pose = sequence.lidar_pose(frame_id)
             position = pose[:3, 3]
             quaternion = _matrix_to_quaternion(pose[:3, :3])
-            ts = max(
-                sequence.timestamps.get(frame_id, float(index)),
-                first_ts + index * 0.001,
-            )
+            timestamp = send_timestamps[index]
 
-            odom_msg = make_odometry_msg(position, quaternion, ts=ts)
+            odometry_message = make_odometry_msg(position, quaternion, ts=timestamp)
             world_xyz = (pose[:3, :3] @ scan_xyz[:, :3].T).T + position
-            cloud_msg = make_pointcloud_msg(
+            cloud_message = make_pointcloud_msg(
                 np.column_stack([world_xyz, scan_xyz[:, 3:4]]).astype(np.float32),
-                ts=ts,
+                ts=timestamp,
             )
             # Odom first so on_registered_scan can read the latest pose.
-            lcm_instance.publish(odom_topic, odom_msg.lcm_encode())
-            lcm_instance.publish(scan_topic, cloud_msg.lcm_encode())
+            lcm_instance.publish(odom_topic, odometry_message.lcm_encode())
+            lcm_instance.publish(scan_topic, cloud_message.lcm_encode())
 
             if config.publish_interval_sec > 0:
                 time.sleep(config.publish_interval_sec)
@@ -368,39 +390,52 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     # Diagnostic: print every detected pair with positions + verdict, so we can
     # see whether PGO is finding wrong places or whether the scorer is mis-snapping.
     if getattr(config, "print_pairs", False):
-        positions_map = {fid: sequence.lidar_pose(fid)[:3, 3] for fid in frame_ids}
+        positions_by_frame_id = {
+            frame_id: sequence.lidar_pose(frame_id)[:3, 3] for frame_id in frame_ids
+        }
         logger.info(f"\n--- {len(state.detected_pairs)} detected pairs ---")
-        for src, dst in state.detected_pairs:
-            pa = positions_map.get(src)
-            pb = positions_map.get(dst)
-            if pa is None or pb is None:
-                logger.info(f"  detected ({src}, {dst}): MISSING POSITION (off-window)")
+        for source_frame_id, target_frame_id in state.detected_pairs:
+            source_position = positions_by_frame_id.get(source_frame_id)
+            target_position = positions_by_frame_id.get(target_frame_id)
+            if source_position is None or target_position is None:
+                logger.info(
+                    f"  detected ({source_frame_id}, {target_frame_id}): "
+                    "MISSING POSITION (off-window)"
+                )
                 continue
-            dist = float(np.linalg.norm(pa - pb))
-            gap = abs(src - dst)
-            src_valid = groundtruth.valid_loops_per_query.get(src, set())
-            dst_valid = groundtruth.valid_loops_per_query.get(dst, set())
-            is_tp = dst in src_valid or src in dst_valid
+            world_distance = float(np.linalg.norm(source_position - target_position))
+            frame_gap = abs(source_frame_id - target_frame_id)
+            source_valid = groundtruth.valid_loops_per_query.get(source_frame_id, set())
+            target_valid = groundtruth.valid_loops_per_query.get(target_frame_id, set())
+            is_true_positive = target_frame_id in source_valid or source_frame_id in target_valid
             # Find the nearest GT pair for this query
-            nearest_gt = "none"
-            for query in (src, dst):
-                if groundtruth.valid_loops_per_query.get(query):
-                    cand_pos = np.array(
+            nearest_groundtruth = "none"
+            for query_frame_id in (source_frame_id, target_frame_id):
+                if groundtruth.valid_loops_per_query.get(query_frame_id):
+                    candidate_positions = np.array(
                         [
-                            positions_map[c]
-                            for c in groundtruth.valid_loops_per_query[query]
-                            if c in positions_map
+                            positions_by_frame_id[candidate_frame_id]
+                            for candidate_frame_id in groundtruth.valid_loops_per_query[
+                                query_frame_id
+                            ]
+                            if candidate_frame_id in positions_by_frame_id
                         ]
                     )
-                    if len(cand_pos):
-                        qpos = positions_map[query]
-                        dists = np.linalg.norm(cand_pos - qpos, axis=1)
-                        nearest_gt = (
-                            f"q={query} has {len(cand_pos)} valid GT, nearest at {dists.min():.2f}m"
+                    if len(candidate_positions):
+                        query_position = positions_by_frame_id[query_frame_id]
+                        distances_to_query = np.linalg.norm(
+                            candidate_positions - query_position, axis=1
+                        )
+                        nearest_groundtruth = (
+                            f"q={query_frame_id} has {len(candidate_positions)} "
+                            f"valid GT, nearest at {distances_to_query.min():.2f}m"
                         )
                         break
-            verdict = "✓TP" if is_tp else "✗FP"
-            logger.info(f"  {verdict} ({src}, {dst}) gap={gap} dist={dist:.2f}m | gt: {nearest_gt}")
+            verdict = "✓TP" if is_true_positive else "✗FP"
+            logger.info(
+                f"  {verdict} ({source_frame_id}, {target_frame_id}) "
+                f"gap={frame_gap} dist={world_distance:.2f}m | gt: {nearest_groundtruth}"
+            )
 
     metrics = score_detected_loops(state.detected_pairs, groundtruth)
     result = BenchmarkResult(

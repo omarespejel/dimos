@@ -158,25 +158,25 @@ def main() -> None:
     print(f"loading KITTI-360 sequence {args.sequence} from {args.kitti360_root}")
     sequence = load_kitti360_sequence(args.kitti360_root, args.sequence)
     frame_ids = sequence.frame_ids[: args.num_scans]
-    positions = np.array([sequence.lidar_pose(fid)[:3, 3] for fid in frame_ids])
+    positions = np.array([sequence.lidar_pose(frame_id)[:3, 3] for frame_id in frame_ids])
     travelled = float(np.linalg.norm(positions[-1] - positions[0]))
     print(f"playing {len(frame_ids)} scans, ~{travelled:.1f}m of trajectory")
 
-    counts: Counter[str] = Counter()
-    prefix = "pgo_smoke"
+    message_counts: Counter[str] = Counter()
+    topic_prefix = "pgo_smoke"
 
     lcm_instance = lcmlib.LCM()
-    subs = []
+    subscriptions = []
 
     def make_handler(topic_name: str) -> Callable[[str, bytes], None]:
-        def handler(_ch: str, _data: bytes) -> None:
-            counts.update([topic_name])
+        def handler(_channel: str, _data: bytes) -> None:
+            message_counts.update([topic_name])
 
         return handler
 
-    for name, type_name in OUTPUT_TOPICS:
-        topic = f"/{prefix}_{name}#{type_name}"
-        subs.append(lcm_instance.subscribe(topic, make_handler(name)))
+    for output_name, output_type in OUTPUT_TOPICS:
+        topic = f"/{topic_prefix}_{output_name}#{output_type}"
+        subscriptions.append(lcm_instance.subscribe(topic, make_handler(output_name)))
 
     stop_event = threading.Event()
     handle_thread = threading.Thread(
@@ -184,7 +184,7 @@ def main() -> None:
     )
     handle_thread.start()
 
-    runner = _build_runner(prefix, args.loop_search_radius)
+    runner = _build_runner(topic_prefix, args.loop_search_radius)
     # Capture stderr ourselves so we get the binary's own diagnostics.
     runner.process = subprocess.Popen(
         [runner.binary_path, *runner.args],
@@ -198,17 +198,17 @@ def main() -> None:
         if not runner.is_running:
             raise SystemExit("PGO subprocess died before playback started")
 
-        scan_topic = f"/{prefix}_scan#sensor_msgs.PointCloud2"
-        odom_topic = f"/{prefix}_odom#nav_msgs.Odometry"
-        first_ts = max(sequence.timestamps.get(frame_ids[0], 1.0), 1.0)
+        scan_topic = f"/{topic_prefix}_scan#sensor_msgs.PointCloud2"
+        odom_topic = f"/{topic_prefix}_odom#nav_msgs.Odometry"
+        first_timestamp = max(sequence.timestamps.get(frame_ids[0], 1.0), 1.0)
 
         for index, frame_id in enumerate(frame_ids):
             pose = sequence.lidar_pose(frame_id)
             position = pose[:3, 3]
             quaternion = _matrix_to_quaternion(pose[:3, :3])
-            ts = max(
+            timestamp = max(
                 sequence.timestamps.get(frame_id, float(index)),
-                first_ts + index * 0.001,
+                first_timestamp + index * 0.001,
             )
 
             scan_xyz = sequence.scan_xyz(frame_id)
@@ -216,9 +216,10 @@ def main() -> None:
             cloud = np.column_stack([world_xyz, scan_xyz[:, 3:4]]).astype(np.float32)
 
             lcm_instance.publish(
-                odom_topic, make_odometry_msg(position, quaternion, ts=ts).lcm_encode()
+                odom_topic,
+                make_odometry_msg(position, quaternion, ts=timestamp).lcm_encode(),
             )
-            lcm_instance.publish(scan_topic, make_pointcloud_msg(cloud, ts=ts).lcm_encode())
+            lcm_instance.publish(scan_topic, make_pointcloud_msg(cloud, ts=timestamp).lcm_encode())
 
             if args.publish_interval_sec > 0:
                 time.sleep(args.publish_interval_sec)
@@ -236,12 +237,12 @@ def main() -> None:
             runner.process = None
         stop_event.set()
         handle_thread.join(timeout=2.0)
-        for sub in subs:
-            lcm_instance.unsubscribe(sub)
+        for subscription in subscriptions:
+            lcm_instance.unsubscribe(subscription)
 
     print("\n=== PGO topic message counts ===")
     for name, _ in OUTPUT_TOPICS:
-        print(f"  {name:<24} {counts.get(name, 0):>6}")
+        print(f"  {name:<24} {message_counts.get(name, 0):>6}")
 
     stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
     if stderr_text:
@@ -253,11 +254,11 @@ def main() -> None:
         print("\n=== PGO stderr: (empty) ===")
 
     print("\nverdict:")
-    if counts.get("pgo_graph_nodes", 0) == 0:
+    if message_counts.get("pgo_graph_nodes", 0) == 0:
         print("  ⚠ no graph nodes — PGO never promoted a keyframe. Check --key_pose_delta_*.")
-    elif counts.get("pgo_graph_edges", 0) == 0:
+    elif message_counts.get("pgo_graph_edges", 0) == 0:
         print("  ⚠ nodes but no edges — graph isn't being assembled.")
-    elif counts.get("pgo_loop_closure", 0) == 0:
+    elif message_counts.get("pgo_loop_closure", 0) == 0:
         print(
             "  ⚠ graph builds, no loop closure events — try wider --loop-search-radius "
             "or lower --sc-match-threshold."

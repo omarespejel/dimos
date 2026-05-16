@@ -265,7 +265,7 @@ int main(int argc, char** argv)
     config.key_pose_delta_trans = mod.arg_float("key_pose_delta_trans", 0.5f);
     config.loop_search_radius = mod.arg_float("loop_search_radius", 1.0f);
     config.loop_time_tresh = mod.arg_float("loop_time_thresh", 60.0f);
-    config.loop_score_tresh = mod.arg_float("loop_score_thresh", 0.15f);
+    config.loop_score_thresh = mod.arg_float("loop_score_thresh", 0.15f);
     config.loop_submap_half_range = mod.arg_int("loop_submap_half_range", 5);
     config.submap_resolution = mod.arg_float("submap_resolution", 0.1f);
     config.min_loop_detect_duration = mod.arg_float("min_loop_detect_duration", 5.0f);

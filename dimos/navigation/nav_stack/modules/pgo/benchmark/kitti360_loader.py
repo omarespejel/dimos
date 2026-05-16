@@ -199,12 +199,26 @@ def load_kitti360_sequence(root: Path, sequence_id: int) -> Kitti360Sequence:
     # in sorted-by-filename order. Rekey by the actual frame_id so callers can do
     # ``timestamps[frame_id]`` instead of "line index" lookups (which silently miss
     # in the Test SLAM split because frame_ids don't start at 0).
+    # If the file is missing or its row count doesn't match the scan count we
+    # raise — callers further down rely on either a complete mapping or an
+    # explicit absence; a partial dict caused silent benchmark recall collapse
+    # in a prior bug (greptile c3 on PR #2099).
     timestamps: dict[int, float] = {}
     if timestamps_path.exists():
-        sorted_scan_ids = sorted(int(p.stem) for p in velodyne_dir.glob("*.bin"))
+        sorted_scan_ids = sorted(int(scan.stem) for scan in velodyne_dir.glob("*.bin"))
         line_indexed = _load_timestamps_file(timestamps_path)
-        if len(sorted_scan_ids) == len(line_indexed):
-            timestamps = {fid: line_indexed[i] for i, fid in enumerate(sorted_scan_ids)}
+        if len(sorted_scan_ids) != len(line_indexed):
+            raise ValueError(
+                f"KITTI-360 timestamp count mismatch under {root}: "
+                f"{len(sorted_scan_ids)} .bin files in {velodyne_dir} but "
+                f"{len(line_indexed)} lines in {timestamps_path}. Cannot align "
+                "frame_id ↔ timestamp; downstream consumers would silently use "
+                "frame_id as a fake timestamp."
+            )
+        timestamps = {
+            frame_id: line_indexed[line_index]
+            for line_index, frame_id in enumerate(sorted_scan_ids)
+        }
 
     return Kitti360Sequence(
         sequence_id=sequence_id,

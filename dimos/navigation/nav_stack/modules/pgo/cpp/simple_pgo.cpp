@@ -244,16 +244,17 @@ void SimplePGO::searchForLoopPairs()
     // kilometers off (e.g. at world position (3500, 350), rotating by 90°
     // sends it to (-350, 3500)). Build a transform that rotates about the
     // source keyframe's own global position instead:
-    //     init = T(src_pos) · Rz(θ) · T(-src_pos)
-    // → init · p = R · (p - src_pos) + src_pos
+    //     init = T(source_position) · Rz(yaw) · T(-source_position)
+    // → init · p = rotation · (p - source_position) + source_position
     Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
     if (m_config.use_scan_context && sector_shift != 0) {
         const double yaw = scan_context::yaw_from_shift(sector_shift, m_sc_config.n_sectors);
-        Eigen::AngleAxisf rot(static_cast<float>(yaw), Eigen::Vector3f::UnitZ());
-        Eigen::Matrix3f R = rot.toRotationMatrix();
-        Eigen::Vector3f src_pos = m_key_poses[cur_idx].t_global.cast<float>();
-        init_guess.block<3, 3>(0, 0) = R;
-        init_guess.block<3, 1>(0, 3) = src_pos - R * src_pos;
+        Eigen::AngleAxisf yaw_axis_angle(
+            static_cast<float>(yaw), Eigen::Vector3f::UnitZ());
+        Eigen::Matrix3f rotation = yaw_axis_angle.toRotationMatrix();
+        Eigen::Vector3f source_position = m_key_poses[cur_idx].t_global.cast<float>();
+        init_guess.block<3, 3>(0, 0) = rotation;
+        init_guess.block<3, 1>(0, 3) = source_position - rotation * source_position;
     }
 
     CloudType::Ptr target_cloud = getSubMap(loop_idx, m_config.loop_submap_half_range, m_config.submap_resolution);
@@ -264,7 +265,7 @@ void SimplePGO::searchForLoopPairs()
     m_icp.setInputTarget(target_cloud);
     m_icp.align(*align_cloud, init_guess);
 
-    if (!m_icp.hasConverged() || m_icp.getFitnessScore() > m_config.loop_score_tresh)
+    if (!m_icp.hasConverged() || m_icp.getFitnessScore() > m_config.loop_score_thresh)
         return;
 
     M4F loop_transform = m_icp.getFinalTransformation();

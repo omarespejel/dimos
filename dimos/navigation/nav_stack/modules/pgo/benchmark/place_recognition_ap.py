@@ -130,9 +130,9 @@ def best_sc_distance(query: np.ndarray, candidate: np.ndarray) -> tuple[float, i
         if not valid.any():
             continue
         candidate_shifted = np.roll(candidate, -shift, axis=1)
-        dots = (query * candidate_shifted).sum(axis=0)
-        sims = dots[valid] / (query_norms[valid] * shifted_norms[valid])
-        distance = float(1.0 - sims.mean())
+        dot_products = (query * candidate_shifted).sum(axis=0)
+        similarities = dot_products[valid] / (query_norms[valid] * shifted_norms[valid])
+        distance = float(1.0 - similarities.mean())
         if distance < best_distance:
             best_distance = distance
             best_shift = shift
@@ -212,34 +212,40 @@ def main() -> None:
     has_any_gt = np.zeros(num_frames, dtype=bool)
 
     eval_count = 0
-    for i, frame_id in enumerate(frame_ids):
-        max_j = i - args.min_frame_gap
-        if max_j < 0:
+    for query_index, frame_id in enumerate(frame_ids):
+        max_candidate_index = query_index - args.min_frame_gap
+        if max_candidate_index < 0:
             continue
         eval_count += 1
         valid_set = groundtruth.valid_loops_per_query.get(frame_id, set())
-        has_any_gt[i] = bool(valid_set)
+        has_any_gt[query_index] = bool(valid_set)
 
         if args.brute_force:
-            candidate_indices: list[int] = list(range(max_j + 1))
+            candidate_indices: list[int] = list(range(max_candidate_index + 1))
         else:
-            past_keys = ring_keys[: max_j + 1]
+            past_keys = ring_keys[: max_candidate_index + 1]
             tree = cKDTree(past_keys)
-            k = min(args.candidate_top_k, max_j + 1)
-            _, raw = tree.query(ring_keys[i], k=k)
-            candidate_indices = [int(raw)] if k == 1 else [int(x) for x in raw]
+            top_k = min(args.candidate_top_k, max_candidate_index + 1)
+            _, neighbor_indices = tree.query(ring_keys[query_index], k=top_k)
+            candidate_indices = (
+                [int(neighbor_indices)]
+                if top_k == 1
+                else [int(index) for index in neighbor_indices]
+            )
 
         best_distance = 2.0
-        best_j = -1
-        for j in candidate_indices:
-            distance, _shift = best_sc_distance(descriptors[i], descriptors[j])
+        best_candidate_index = -1
+        for candidate_index in candidate_indices:
+            distance, _shift = best_sc_distance(
+                descriptors[query_index], descriptors[candidate_index]
+            )
             if distance < best_distance:
                 best_distance = distance
-                best_j = j
+                best_candidate_index = candidate_index
 
-        top1_dist[i] = best_distance
-        if best_j >= 0 and frame_ids[best_j] in valid_set:
-            is_tp[i] = True
+        top1_dist[query_index] = best_distance
+        if best_candidate_index >= 0 and frame_ids[best_candidate_index] in valid_set:
+            is_tp[query_index] = True
 
         if eval_count % 200 == 0:
             elapsed = time.time() - score_start
@@ -254,41 +260,57 @@ def main() -> None:
     eval_mask = np.arange(num_frames) >= args.min_frame_gap
     y_true = is_tp[eval_mask].astype(np.int32)
     y_score = -top1_dist[eval_mask]
-    n_eval = int(eval_mask.sum())
-    n_has_gt = int(has_any_gt[eval_mask].sum())
-    n_tp = int(y_true.sum())
+    num_evaluated = int(eval_mask.sum())
+    num_with_groundtruth = int(has_any_gt[eval_mask].sum())
+    num_true_positives = int(y_true.sum())
 
-    ap = float(average_precision_score(y_true, y_score)) if y_true.any() else float("nan")
+    average_precision = (
+        float(average_precision_score(y_true, y_score)) if y_true.any() else float("nan")
+    )
 
     # Manual P/R sweep at representative SC-distance thresholds.
     # At threshold T: a query is "predicted loop" iff its top1_dist <= T.
     #   precision = (#predicted ∧ is_tp) / #predicted
     #   recall    = (#predicted ∧ is_tp) / #queries_with_any_gt
-    dists = top1_dist[eval_mask]
-    rows = []
-    for t in (0.13, 0.20, 0.30, 0.40, 0.50, 0.60, 0.80, 1.00):
-        predicted = dists <= t
-        tp_at = int(np.logical_and(predicted, y_true).sum())
-        n_pred = int(predicted.sum())
-        p = tp_at / n_pred if n_pred > 0 else float("nan")
-        r = tp_at / n_has_gt if n_has_gt > 0 else float("nan")
-        f1 = 2 * p * r / (p + r) if (p + r) and not np.isnan(p + r) else 0.0
-        rows.append((t, n_pred, tp_at, p, r, f1))
+    eval_distances = top1_dist[eval_mask]
+    pr_rows = []
+    for threshold in (0.13, 0.20, 0.30, 0.40, 0.50, 0.60, 0.80, 1.00):
+        predicted = eval_distances <= threshold
+        true_positives_at_threshold = int(np.logical_and(predicted, y_true).sum())
+        num_predicted = int(predicted.sum())
+        precision = (
+            true_positives_at_threshold / num_predicted if num_predicted > 0 else float("nan")
+        )
+        recall = (
+            true_positives_at_threshold / num_with_groundtruth
+            if num_with_groundtruth > 0
+            else float("nan")
+        )
+        if (precision + recall) and not np.isnan(precision + recall):
+            f1 = 2 * precision * recall / (precision + recall)
+        else:
+            f1 = 0.0
+        pr_rows.append(
+            (threshold, num_predicted, true_positives_at_threshold, precision, recall, f1)
+        )
 
     print("")
     print(f"=== KITTI-360 seq {args.sequence} — Place Recognition (Scan Context) ===")
-    print(f"frames evaluated:           {n_eval}")
-    print(f"queries with any valid GT:  {n_has_gt}")
-    print(f"top-1 matches that are TP:  {n_tp}")
+    print(f"frames evaluated:           {num_evaluated}")
+    print(f"queries with any valid GT:  {num_with_groundtruth}")
+    print(f"top-1 matches that are TP:  {num_true_positives}")
     print("")
-    print(f"Average Precision (AP):     {ap:.4f}")
+    print(f"Average Precision (AP):     {average_precision:.4f}")
     print("")
     print("PR points (SC distance threshold):")
     print(
         f"  {'thresh':>8s}  {'n_pred':>7s}  {'n_tp':>6s}  {'precision':>10s}  {'recall':>8s}  {'F1':>6s}"
     )
-    for t, n_pred, tp_at, p, r, f1 in rows:
-        print(f"  {t:>8.2f}  {n_pred:>7d}  {tp_at:>6d}  {p:>10.4f}  {r:>8.4f}  {f1:>6.4f}")
+    for threshold, num_predicted, true_positives, precision, recall, f1 in pr_rows:
+        print(
+            f"  {threshold:>8.2f}  {num_predicted:>7d}  {true_positives:>6d}  "
+            f"{precision:>10.4f}  {recall:>8.4f}  {f1:>6.4f}"
+        )
 
 
 if __name__ == "__main__":

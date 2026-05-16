@@ -90,32 +90,29 @@ def _make_room_points(half_size: float = 20.0, density: float = 0.15) -> np.ndar
     """
     points: list[np.ndarray] = []
     z_levels = np.arange(0.0, 3.0, density)
+    wall_axis = np.arange(-half_size, half_size, density)
 
-    line_xy = np.arange(-half_size, half_size, density)
     # north / south walls (y = ±half_size, x varies)
-    for y in (half_size, -half_size):
-        xx = line_xy
-        zz = z_levels
-        xv, zv = np.meshgrid(xx, zz)
-        block = np.column_stack([xv.ravel(), np.full(xv.size, y), zv.ravel()])
+    for wall_y in (half_size, -half_size):
+        grid_x, grid_z = np.meshgrid(wall_axis, z_levels)
+        block = np.column_stack([grid_x.ravel(), np.full(grid_x.size, wall_y), grid_z.ravel()])
         points.append(block)
     # east / west walls (x = ±half_size, y varies)
-    for x in (half_size, -half_size):
-        yy = line_xy
-        zz = z_levels
-        yv, zv = np.meshgrid(yy, zz)
-        block = np.column_stack([np.full(yv.size, x), yv.ravel(), zv.ravel()])
+    for wall_x in (half_size, -half_size):
+        grid_y, grid_z = np.meshgrid(wall_axis, z_levels)
+        block = np.column_stack([np.full(grid_y.size, wall_x), grid_y.ravel(), grid_z.ravel()])
         points.append(block)
 
-    # add a couple of distinctive interior columns so the scene isn't
-    # rotationally symmetric — helps Scan Context disambiguate.
-    for cx, cy in [(5.0, 0.0), (-5.0, 8.0)]:
-        ang = np.arange(0.0, 2.0 * math.pi, 0.2)
-        zz = np.arange(0.0, 3.0, density)
-        ag, zg = np.meshgrid(ang, zz)
-        rx = cx + 0.5 * np.cos(ag.ravel())
-        ry = cy + 0.5 * np.sin(ag.ravel())
-        points.append(np.column_stack([rx, ry, zg.ravel()]))
+    # Distinctive interior columns so the scene isn't rotationally
+    # symmetric — helps Scan Context disambiguate.
+    column_radius = 0.5
+    for column_center_x, column_center_y in [(5.0, 0.0), (-5.0, 8.0)]:
+        angles = np.arange(0.0, 2.0 * math.pi, 0.2)
+        column_z_levels = np.arange(0.0, 3.0, density)
+        grid_angle, grid_z = np.meshgrid(angles, column_z_levels)
+        column_x = column_center_x + column_radius * np.cos(grid_angle.ravel())
+        column_y = column_center_y + column_radius * np.sin(grid_angle.ravel())
+        points.append(np.column_stack([column_x, column_y, grid_z.ravel()]))
 
     return np.concatenate(points).astype(np.float32)
 
@@ -124,8 +121,8 @@ def _make_pose(x: float, y: float, z: float, yaw: float) -> Pose:
     pose = Pose()
     pose.position = Vector3(x, y, z)
     # yaw-only quaternion (rotation about z)
-    half = yaw * 0.5
-    pose.orientation = Quaternion(0.0, 0.0, math.sin(half), math.cos(half))
+    half_yaw = yaw * 0.5
+    pose.orientation = Quaternion(0.0, 0.0, math.sin(half_yaw), math.cos(half_yaw))
     return pose
 
 
@@ -138,13 +135,13 @@ def _yaw_rotation(yaw: float) -> np.ndarray:
 
 
 def _world_to_body(points_world: np.ndarray, position: np.ndarray, yaw: float) -> np.ndarray:
-    rot = _yaw_rotation(yaw).T
-    return (points_world - position) @ rot.T
+    rotation = _yaw_rotation(yaw).T
+    return (points_world - position) @ rotation.T
 
 
 def _body_to_world(points_body: np.ndarray, position: np.ndarray, yaw: float) -> np.ndarray:
-    rot = _yaw_rotation(yaw)
-    return points_body @ rot.T + position
+    rotation = _yaw_rotation(yaw)
+    return points_body @ rotation.T + position
 
 
 def _trajectory_reverse_loop(
@@ -164,25 +161,25 @@ def _trajectory_reverse_loop(
     target and ICP fails to converge.
     """
     samples: list[tuple[float, np.ndarray, float, np.ndarray, float]] = []
-    t = 1.0
-    dt = 0.5
+    timestamp = 1.0
+    time_step = 0.5
     # outbound: drive east, facing east (yaw=0)
-    for i in range(n_outbound + 1):
-        frac = i / max(n_outbound, 1)
-        x = frac * leg_length
-        pos = np.array([x, 0.0, 0.5])
+    for step in range(n_outbound + 1):
+        progress = step / max(n_outbound, 1)
+        x = progress * leg_length
+        position = np.array([x, 0.0, 0.5])
         yaw = 0.0
-        samples.append((t, pos, yaw, pos.copy(), yaw))
-        t += dt
+        samples.append((timestamp, position, yaw, position.copy(), yaw))
+        timestamp += time_step
     # inbound: drive west, facing west (yaw=π) — body-frame scans see
     # the room rotated 180° relative to the outbound leg.
-    for i in range(1, n_inbound + 1):
-        frac = i / max(n_inbound, 1)
-        x = leg_length * (1.0 - frac)
-        pos = np.array([x, 0.0, 0.5])
+    for step in range(1, n_inbound + 1):
+        progress = step / max(n_inbound, 1)
+        x = leg_length * (1.0 - progress)
+        position = np.array([x, 0.0, 0.5])
         yaw = math.pi
-        samples.append((t, pos, yaw, pos.copy(), yaw))
-        t += dt
+        samples.append((timestamp, position, yaw, position.copy(), yaw))
+        timestamp += time_step
     return samples
 
 
@@ -198,31 +195,32 @@ def _trajectory_with_drift(
     (0, 0) the reported odom pose is offset by ``DRIFT_AT_REVISIT_M``.
     """
     samples: list[tuple[float, np.ndarray, float, np.ndarray, float]] = []
-    # Start at t=1.0 because Odometry(ts=0.0) is treated as "now" by the
+    # Start at timestamp=1.0 because Odometry(ts=0.0) is treated as "now" by the
     # message constructor — using 0.0 would inject wall-clock time and
     # break the monotonic-ts assumption in PGO's on_registered_scan.
-    t = 1.0
-    dt = 0.5
+    timestamp = 1.0
+    time_step = 0.5
+    total_steps = n_outbound + n_inbound
     # outbound: drive east
-    for i in range(n_outbound + 1):
-        frac = i / max(n_outbound, 1)
-        x = frac * leg_length
-        true_pos = np.array([x, 0.0, 0.5])
+    for step in range(n_outbound + 1):
+        progress = step / max(n_outbound, 1)
+        x = progress * leg_length
+        true_position = np.array([x, 0.0, 0.5])
         yaw = 0.0
-        drift_amount = (i / (n_outbound + n_inbound)) * DRIFT_AT_REVISIT_M
-        drifted = true_pos + np.array([0.0, drift_amount, 0.0])
-        samples.append((t, true_pos, yaw, drifted, yaw))
-        t += dt
+        drift_amount = (step / total_steps) * DRIFT_AT_REVISIT_M
+        drifted_position = true_position + np.array([0.0, drift_amount, 0.0])
+        samples.append((timestamp, true_position, yaw, drifted_position, yaw))
+        timestamp += time_step
     # inbound: drive west back to origin
-    for i in range(1, n_inbound + 1):
-        frac = i / max(n_inbound, 1)
-        x = leg_length * (1.0 - frac)
-        true_pos = np.array([x, 0.0, 0.5])
+    for step in range(1, n_inbound + 1):
+        progress = step / max(n_inbound, 1)
+        x = leg_length * (1.0 - progress)
+        true_position = np.array([x, 0.0, 0.5])
         yaw = 0.0  # keep heading the same so descriptors are directly comparable
-        drift_amount = ((n_outbound + i) / (n_outbound + n_inbound)) * DRIFT_AT_REVISIT_M
-        drifted = true_pos + np.array([0.0, drift_amount, 0.0])
-        samples.append((t, true_pos, yaw, drifted, yaw))
-        t += dt
+        drift_amount = ((n_outbound + step) / total_steps) * DRIFT_AT_REVISIT_M
+        drifted_position = true_position + np.array([0.0, drift_amount, 0.0])
+        samples.append((timestamp, true_position, yaw, drifted_position, yaw))
+        timestamp += time_step
     return samples
 
 
@@ -230,26 +228,30 @@ def _publish_scan(
     lcm_instance: lcmlib.LCM,
     body_points: np.ndarray,
     drifted_pose: tuple[np.ndarray, float],
-    ts: float,
+    timestamp: float,
 ) -> None:
     # registered_scan is the body-frame scan transformed via the (drifted)
     # odometry — that's what a SLAM frontend publishes.
     world_points = _body_to_world(body_points, drifted_pose[0], drifted_pose[1])
-    msg = PointCloud2.from_numpy(world_points.astype(np.float32), frame_id="map", timestamp=ts)
-    lcm_instance.publish(SCAN_LCM, msg.lcm_encode())
+    message = PointCloud2.from_numpy(
+        world_points.astype(np.float32), frame_id="map", timestamp=timestamp
+    )
+    lcm_instance.publish(SCAN_LCM, message.lcm_encode())
 
 
 def _publish_odom(
-    lcm_instance: lcmlib.LCM, drifted_pose: tuple[np.ndarray, float], ts: float
+    lcm_instance: lcmlib.LCM,
+    drifted_pose: tuple[np.ndarray, float],
+    timestamp: float,
 ) -> None:
-    pos, yaw = drifted_pose
-    msg = Odometry(
-        ts=ts,
+    position, yaw = drifted_pose
+    message = Odometry(
+        ts=timestamp,
         frame_id="odom",
         child_frame_id="base_link",
-        pose=_make_pose(float(pos[0]), float(pos[1]), float(pos[2]), float(yaw)),
+        pose=_make_pose(float(position[0]), float(position[1]), float(position[2]), float(yaw)),
     )
-    lcm_instance.publish(ODOM_LCM, msg.lcm_encode())
+    lcm_instance.publish(ODOM_LCM, message.lcm_encode())
 
 
 def _run_pgo(
@@ -270,16 +272,16 @@ def _run_pgo(
     events_lock = threading.Lock()
 
     def _on_loop_closure(_channel: str, data: bytes) -> None:
-        msg = NavPath.lcm_decode(data)
+        message = NavPath.lcm_decode(data)
         with events_lock:
-            idx = len(received_events)
-            received_events.append(msg)
+            event_index = len(received_events)
+            received_events.append(message)
         logger.info(
-            f"[synthetic_drift sc={use_scan_context}] event #{idx}: "
-            f"N={len(msg.poses)}, ts={msg.ts:.3f}"
+            f"[synthetic_drift sc={use_scan_context}] event #{event_index}: "
+            f"keyframe_count={len(message.poses)}, ts={message.ts:.3f}"
         )
 
-    sub = lcm_instance.subscribe(LOOP_CLOSURE_LCM, _on_loop_closure)
+    subscription = lcm_instance.subscribe(LOOP_CLOSURE_LCM, _on_loop_closure)
 
     stop_event = threading.Event()
     handle_thread = threading.Thread(
@@ -347,10 +349,16 @@ def _run_pgo(
         time.sleep(1.5)
         assert runner.is_running, "PGO failed to start"
 
-        for t, true_pos, true_yaw, drifted_pos, drifted_yaw in trajectory:
-            body_points = _world_to_body(room_points, true_pos, true_yaw)
-            _publish_odom(lcm_instance, (drifted_pos, drifted_yaw), t)
-            _publish_scan(lcm_instance, body_points, (drifted_pos, drifted_yaw), t)
+        for (
+            timestamp,
+            true_position,
+            true_yaw,
+            drifted_position,
+            drifted_yaw,
+        ) in trajectory:
+            body_points = _world_to_body(room_points, true_position, true_yaw)
+            _publish_odom(lcm_instance, (drifted_position, drifted_yaw), timestamp)
+            _publish_scan(lcm_instance, body_points, (drifted_position, drifted_yaw), timestamp)
             time.sleep(0.15)
 
         time.sleep(3.0)
@@ -366,7 +374,7 @@ def _run_pgo(
         runner.stop()
         stop_event.set()
         handle_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-        lcm_instance.unsubscribe(sub)
+        lcm_instance.unsubscribe(subscription)
 
         if stderr_data:
             logger.info(f"\n--- PGO stderr (sc={use_scan_context}) ---")
@@ -381,20 +389,20 @@ class TestPGOSyntheticDrift:
     """Scan Context catches the loop; position search misses it."""
 
     def test_scan_context_catches_drifted_loop(self) -> None:
-        sc_events = _run_pgo(use_scan_context=True)
-        logger.info(f"[synthetic_drift] scan_context=true  → {sc_events} loop events")
-        assert sc_events >= 1, (
+        scan_context_events = _run_pgo(use_scan_context=True)
+        logger.info(f"[synthetic_drift] scan_context=true  → {scan_context_events} loop events")
+        assert scan_context_events >= 1, (
             f"Scan Context should catch the loop at the revisit point "
-            f"(drift={DRIFT_AT_REVISIT_M}m). Got {sc_events} events."
+            f"(drift={DRIFT_AT_REVISIT_M}m). Got {scan_context_events} events."
         )
 
     def test_position_search_misses_drifted_loop(self) -> None:
-        pos_events = _run_pgo(use_scan_context=False)
-        logger.info(f"[synthetic_drift] scan_context=false → {pos_events} loop events")
-        assert pos_events == 0, (
+        position_search_events = _run_pgo(use_scan_context=False)
+        logger.info(f"[synthetic_drift] scan_context=false → {position_search_events} loop events")
+        assert position_search_events == 0, (
             f"Position-based search shouldn't fire when drift "
             f"({DRIFT_AT_REVISIT_M}m) >> loop_search_radius "
-            f"({LOOP_SEARCH_RADIUS_M}m). Got {pos_events} events."
+            f"({LOOP_SEARCH_RADIUS_M}m). Got {position_search_events} events."
         )
 
     def test_scan_context_catches_reverse_loop(self) -> None:
