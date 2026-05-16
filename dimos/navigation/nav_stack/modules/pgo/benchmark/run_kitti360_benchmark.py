@@ -23,8 +23,8 @@ Pipeline:
 2. Compute the loop-pair groundtruth (≥50 frame gap, ≤4m radius).
 3. Spawn the PGO native binary with private LCM topics.
 4. Play (registered_scan, odometry) at controlled rate via LCM.
-5. Subscribe to ``pgo_graph_edges`` to extract detected loop pairs
-   (traversability=0.4 segments) and ``pgo_loop_closure`` for delta
+5. Subscribe to ``pose_graph_edges`` to extract detected loop pairs
+   (traversability=0.4 segments) and ``loop_closure`` for delta
    events (count only — deltas aren't scored here).
 6. Score precision / recall / F1 + write a JSON report.
 """
@@ -38,6 +38,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 
@@ -211,13 +212,13 @@ def _build_runner(config: BenchmarkConfig, topic_prefix: str) -> NativeProcessRu
             f"/{topic_prefix}_corrected#nav_msgs.Odometry",
             "--global_map",
             f"/{topic_prefix}_global_map#sensor_msgs.PointCloud2",
-            "--pgo_tf",
+            "--tf",
             f"/{topic_prefix}_tf#nav_msgs.Odometry",
-            "--pgo_graph_nodes",
+            "--pose_graph_nodes",
             f"/{topic_prefix}_graph_nodes#nav_msgs.GraphNodes3D",
-            "--pgo_graph_edges",
+            "--pose_graph_edges",
             f"/{topic_prefix}_graph_edges#nav_msgs.LineSegments3D",
-            "--pgo_loop_closure",
+            "--loop_closure",
             f"/{topic_prefix}_loop_closure#nav_msgs.Path",
             "--key_pose_delta_deg",
             "10.0",
@@ -456,17 +457,20 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         wallclock_seconds=wallclock,
     )
 
-    if config.output_json is not None:
-        config.output_json.parent.mkdir(parents=True, exist_ok=True)
-        config.output_json.write_text(json.dumps(result_to_json(result), indent=2))
-
     return result
 
 
-def result_to_json(result: BenchmarkResult) -> dict[str, object]:
-    """JSON-safe dict view of a BenchmarkResult (NaN precision/recall → null)."""
+def result_to_json(result: BenchmarkResult, command: list[str] | None = None) -> dict[str, object]:
+    """JSON-safe dict view of a BenchmarkResult (NaN precision/recall → null).
+
+    When ``command`` is provided (typically ``sys.argv``), it's recorded so the
+    payload is self-describing — readers can see exactly how it was generated.
+    """
     metrics = result.metrics
-    payload = asdict(result)
+    payload: dict[str, object] = {}
+    if command is not None:
+        payload["command"] = list(command)
+    payload.update(asdict(result))
     payload["metrics"] = {
         "true_positive": metrics.true_positive,
         "false_positive": metrics.false_positive,
@@ -541,7 +545,11 @@ def main() -> None:
 
     result = run_benchmark(config)
     logger.info(_format_result(result))
-    print(json.dumps(result_to_json(result), indent=2))
+    payload = result_to_json(result, command=sys.argv)
+    if config.output_json is not None:
+        config.output_json.parent.mkdir(parents=True, exist_ok=True)
+        config.output_json.write_text(json.dumps(payload, indent=2))
+    print(json.dumps(payload, indent=2))
 
 
 if __name__ == "__main__":

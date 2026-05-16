@@ -26,8 +26,8 @@ scan rather than the pose, can.
 
 This test runs the PGO native binary twice with the same input:
 
-1. ``use_scan_context=true``  → expect ≥1 pgo_loop_closure event.
-2. ``use_scan_context=false`` → expect 0 pgo_loop_closure events.
+1. ``use_scan_context=true``  → expect ≥1 loop_closure event.
+2. ``use_scan_context=false`` → expect 0 loop_closure events.
 
 Exposes the actual on-the-wire payload (event count, per-event shape)
 on stdout for the user to inspect.
@@ -64,14 +64,14 @@ pytestmark = [pytest.mark.slow]
 
 PGO_BIN = Path(__file__).parent / "cpp" / "result" / "bin" / "pgo"
 
-SCAN_LCM = "/sdpgo_scan#sensor_msgs.PointCloud2"
-ODOM_LCM = "/sdpgo_odom#nav_msgs.Odometry"
-CORRECTED_ODOM_LCM = "/sdpgo_corrected#nav_msgs.Odometry"
-GLOBAL_MAP_LCM = "/sdpgo_global_map#sensor_msgs.PointCloud2"
-TF_LCM = "/sdpgo_tf#nav_msgs.Odometry"
-GRAPH_NODES_LCM = "/sdpgo_graph_nodes#nav_msgs.GraphNodes3D"
-GRAPH_EDGES_LCM = "/sdpgo_graph_edges#nav_msgs.LineSegments3D"
-LOOP_CLOSURE_LCM = "/sdpgo_loop_closure#nav_msgs.Path"
+SCAN_LCM = "/sd_test_scan#sensor_msgs.PointCloud2"
+ODOM_LCM = "/sd_test_odom#nav_msgs.Odometry"
+CORRECTED_ODOM_LCM = "/sd_test_corrected#nav_msgs.Odometry"
+GLOBAL_MAP_LCM = "/sd_test_global_map#sensor_msgs.PointCloud2"
+TF_LCM = "/sd_test_tf#nav_msgs.Odometry"
+GRAPH_NODES_LCM = "/sd_test_graph_nodes#nav_msgs.GraphNodes3D"
+GRAPH_EDGES_LCM = "/sd_test_graph_edges#nav_msgs.LineSegments3D"
+LOOP_CLOSURE_LCM = "/sd_test_loop_closure#nav_msgs.Path"
 
 # Cross-trajectory drift injected at the revisit. Must be >> loop_search_radius
 # so position-based search cannot accidentally find the loop.
@@ -260,7 +260,7 @@ def _run_pgo(
     trajectory: list[tuple[float, np.ndarray, float, np.ndarray, float]] | None = None,
 ) -> int:
     """Run a single PGO instance over the synthetic trajectory and
-    return the number of pgo_loop_closure events received."""
+    return the number of loop_closure events received."""
     if not PGO_BIN.exists():
         pytest.skip(f"PGO binary not found: {PGO_BIN}")
 
@@ -305,13 +305,13 @@ def _run_pgo(
             CORRECTED_ODOM_LCM,
             "--global_map",
             GLOBAL_MAP_LCM,
-            "--pgo_tf",
+            "--tf",
             TF_LCM,
-            "--pgo_graph_nodes",
+            "--pose_graph_nodes",
             GRAPH_NODES_LCM,
-            "--pgo_graph_edges",
+            "--pose_graph_edges",
             GRAPH_EDGES_LCM,
-            "--pgo_loop_closure",
+            "--loop_closure",
             LOOP_CLOSURE_LCM,
             "--key_pose_delta_deg",
             "10.0",

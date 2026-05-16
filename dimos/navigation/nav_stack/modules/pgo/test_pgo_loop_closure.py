@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Validate PGO publishes loop-closure delta events on the
-``pgo_loop_closure`` topic.
+``loop_closure`` topic.
 
 Replays the ``og_nav_60s`` rosbag through the native PGO binary with
 aggressive loop-closure thresholds (low ``loop_time_thresh`` +
@@ -57,14 +57,14 @@ pytestmark = [pytest.mark.slow]
 
 PGO_BIN = Path(__file__).parent / "cpp" / "result" / "bin" / "pgo"
 
-SCAN_LCM = "/lcpgo_scan#sensor_msgs.PointCloud2"
-ODOM_LCM = "/lcpgo_odom#nav_msgs.Odometry"
-CORRECTED_ODOM_LCM = "/lcpgo_corrected#nav_msgs.Odometry"
-GLOBAL_MAP_LCM = "/lcpgo_global_map#sensor_msgs.PointCloud2"
-TF_LCM = "/lcpgo_tf#nav_msgs.Odometry"
-GRAPH_NODES_LCM = "/lcpgo_graph_nodes#nav_msgs.GraphNodes3D"
-GRAPH_EDGES_LCM = "/lcpgo_graph_edges#nav_msgs.LineSegments3D"
-LOOP_CLOSURE_LCM = "/lcpgo_loop_closure#nav_msgs.Path"
+SCAN_LCM = "/lc_test_scan#sensor_msgs.PointCloud2"
+ODOM_LCM = "/lc_test_odom#nav_msgs.Odometry"
+CORRECTED_ODOM_LCM = "/lc_test_corrected#nav_msgs.Odometry"
+GLOBAL_MAP_LCM = "/lc_test_global_map#sensor_msgs.PointCloud2"
+TF_LCM = "/lc_test_tf#nav_msgs.Odometry"
+GRAPH_NODES_LCM = "/lc_test_graph_nodes#nav_msgs.GraphNodes3D"
+GRAPH_EDGES_LCM = "/lc_test_graph_edges#nav_msgs.LineSegments3D"
+LOOP_CLOSURE_LCM = "/lc_test_loop_closure#nav_msgs.Path"
 
 _PROCESS_STARTUP_SEC = 2.0
 _POST_FEED_DRAIN_SEC = 5.0
@@ -172,7 +172,7 @@ class TestPGOLoopClosure:
                 else "<empty>"
             )
             logger.info(
-                f"[pgo_loop_closure] event #{event_index} received: "
+                f"[loop_closure] event #{event_index} received: "
                 f"poses_length={len(message.poses)}, frame_id={message.frame_id!r}, "
                 f"ts={message.ts:.3f}, {first_pose_summary}"
             )
@@ -196,13 +196,13 @@ class TestPGOLoopClosure:
                 CORRECTED_ODOM_LCM,
                 "--global_map",
                 GLOBAL_MAP_LCM,
-                "--pgo_tf",
+                "--tf",
                 TF_LCM,
-                "--pgo_graph_nodes",
+                "--pose_graph_nodes",
                 GRAPH_NODES_LCM,
-                "--pgo_graph_edges",
+                "--pose_graph_edges",
                 GRAPH_EDGES_LCM,
-                "--pgo_loop_closure",
+                "--loop_closure",
                 LOOP_CLOSURE_LCM,
                 # Aggressive loop-closure thresholds — bag is 60s, so we
                 # need short re-visit windows to actually fire events.
@@ -261,7 +261,7 @@ class TestPGOLoopClosure:
         with events_lock:
             events = list(received_events)
 
-        logger.info(f"\n[pgo_loop_closure] total events received: {len(events)}")
+        logger.info(f"\n[loop_closure] total events received: {len(events)}")
 
         if not events:
             pytest.skip(
@@ -276,7 +276,7 @@ class TestPGOLoopClosure:
                 message, event_index
             )
             logger.info(
-                f"[pgo_loop_closure] event #{event_index} VALID: "
+                f"[loop_closure] event #{event_index} VALID: "
                 f"keyframe_count={len(message.poses)}, "
                 f"max|t|={max_translation_norm:.4f}m, "
                 f"max|q|-1|={max_quaternion_drift:.6f}"

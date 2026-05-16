@@ -81,16 +81,16 @@ class PGO(NativeModule):
     odometry: In[Odometry]
     corrected_odometry: Out[Odometry]
     global_map: Out[PointCloud2]
-    pgo_tf: Out[Odometry]
-    pgo_graph_nodes: Out[GraphNodes3D]
-    pgo_graph_edges: Out[LineSegments3D]
-    pgo_loop_closure: Out[NavPath]
+    tf: Out[Odometry]
+    pose_graph_nodes: Out[GraphNodes3D]
+    pose_graph_edges: Out[LineSegments3D]
+    loop_closure: Out[NavPath]
 
     @rpc
     def start(self) -> None:
         super().start()
         self.register_disposable(
-            Disposable(self.pgo_tf.transport.subscribe(self._on_tf_correction, self.pgo_tf))
+            Disposable(self.tf.transport.subscribe(self._on_tf_correction, self.tf))
         )
         # Seed identity TF so consumers can query map->body immediately.
         self._publish_tf(

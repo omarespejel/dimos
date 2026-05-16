@@ -12,17 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fast PGO liveness probe: feed a small KITTI-360 slice, listen to every
+"""
+Fast PGO liveness probe: feed a small KITTI-360 slice, listen to every
 PGO publish topic, capture stderr, report per-topic message counts.
-
-Use this when ``run_kitti360_benchmark`` reports F1=0 to distinguish:
-    * PGO crashed or never started        → stderr has the error
-    * PGO never promoted any keyframes    → 0 graph_nodes
-    * PGO built a graph but no loops      → graph_nodes > 0, edges may be > 0 (odom only), loop_closure == 0
-    * Threshold issue (loops, but too few)→ all topics tick, edges > nodes, loop_closure > 0
-
-    uv run python -m dimos.navigation.nav_stack.modules.pgo.benchmark.smoke_test \\
-        --kitti360-root ~/datasets/kitti360 --sequence 2 --num-scans 200
 """
 
 from __future__ import annotations
@@ -55,10 +47,10 @@ PGO_BIN = Path(__file__).resolve().parent.parent / "cpp" / "result" / "bin" / "p
 OUTPUT_TOPICS = [
     ("corrected_odometry", "nav_msgs.Odometry"),
     ("global_map", "sensor_msgs.PointCloud2"),
-    ("pgo_tf", "nav_msgs.Odometry"),
-    ("pgo_graph_nodes", "nav_msgs.Path"),
-    ("pgo_graph_edges", "nav_msgs.Path"),
-    ("pgo_loop_closure", "nav_msgs.Path"),
+    ("tf", "nav_msgs.Odometry"),
+    ("pose_graph_nodes", "nav_msgs.Path"),
+    ("pose_graph_edges", "nav_msgs.Path"),
+    ("loop_closure", "nav_msgs.Path"),
 ]
 
 
@@ -260,11 +252,11 @@ def main() -> None:
         print("\n=== PGO stderr: (empty) ===")
 
     print("\nverdict:")
-    if message_counts.get("pgo_graph_nodes", 0) == 0:
+    if message_counts.get("pose_graph_nodes", 0) == 0:
         print("  ⚠ no graph nodes — PGO never promoted a keyframe. Check --key_pose_delta_*.")
-    elif message_counts.get("pgo_graph_edges", 0) == 0:
+    elif message_counts.get("pose_graph_edges", 0) == 0:
         print("  ⚠ nodes but no edges — graph isn't being assembled.")
-    elif message_counts.get("pgo_loop_closure", 0) == 0:
+    elif message_counts.get("loop_closure", 0) == 0:
         print(
             "  ⚠ graph builds, no loop closure events — try wider --loop-search-radius "
             "or lower --sc-match-threshold."
