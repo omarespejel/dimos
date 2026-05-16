@@ -27,6 +27,7 @@ import logging
 import os
 from pathlib import Path
 import sys
+from typing import Any
 
 from dimos_lcm.std_msgs import Bool
 
@@ -318,9 +319,7 @@ def _websocket_blueprint(cmd_vel_topic: str) -> Blueprint:
     )
 
 
-def _sim_support_blueprints(
-    mujoco_mjcf_path: str | Path, cmd_vel_topic: str
-) -> tuple[Blueprint, ...]:
+def _sim_support_blueprints(mujoco_mjcf_path: str | Path) -> tuple[Blueprint, ...]:
     if not global_config.simulation:
         return ()
 
@@ -387,60 +386,98 @@ def _sim_support_blueprints(
         except ModuleNotFoundError as exc:
             logger.warning("Viser disabled because optional dependency is missing: %s", exc.name)
 
-    babylon_stack: tuple[Blueprint, ...] = ()
-    if _env_bool("DIMOS_ENABLE_BABYLON", False):
-        from dimos.simulation.mujoco.model import get_assets
-        from dimos.visualization.babylon_scene_viewer import BabylonSceneViewerModule
-
-        scene_visual_override = os.environ.get("DIMOS_SCENE_VISUAL_PATH") or None
-        scene_visual_path = scene_visual_override or scene_mesh_path
-        babylon_stack = (
-            BabylonSceneViewerModule.blueprint(
-                mjcf_path=mujoco_mjcf_path,
-                assets=get_assets(),
-                port=_env_int("DIMOS_BABYLON_PORT", _DEFAULT_BABYLON_PORT),
-                scene_path=scene_visual_path,
-                scene_scale=_env_float("DIMOS_SCENE_VISUAL_SCALE", scene_mesh_scale),
-                scene_translation=_env_xyz(
-                    "DIMOS_SCENE_VISUAL_TRANSLATION", scene_mesh_translation
-                ),
-                scene_rotation_zyx_deg=_env_xyz(
-                    "DIMOS_SCENE_VISUAL_ROTATION_ZYX_DEG", scene_mesh_rotation
-                ),
-                scene_y_up=_env_bool("DIMOS_SCENE_VISUAL_Y_UP", scene_mesh_y_up),
-                pointcloud_hz=_env_float("DIMOS_BABYLON_POINTCLOUD_HZ", 2.0),
-                pointcloud_max_points=_env_int("DIMOS_BABYLON_POINTCLOUD_MAX_POINTS", 70000),
-            ).transports(
-                {
-                    ("joint_state", JointState): LCMTransport(
-                        "/coordinator/joint_state", JointState
-                    ),
-                    ("odom", PoseStamped): LCMTransport("/odom", PoseStamped),
-                    ("path", PathMsg): LCMTransport("/nav_path", PathMsg),
-                    ("pointcloud_overlay", PointCloud2): LCMTransport("/global_map", PointCloud2),
-                    ("cmd_vel", Twist): LCMTransport(cmd_vel_topic, Twist),
-                    ("clicked_point", PointStamped): LCMTransport("/clicked_point", PointStamped),
-                    ("point_goal", PointStamped): LCMTransport("/point_goal", PointStamped),
-                }
-            ),
-        )
-
     return (
         *mapping_stack,
         ReplanningAStarPlanner.blueprint(),
         *viser_stack,
-        *babylon_stack,
+    )
+
+
+def _babylon_blueprint(viewer_mjcf_path: str | Path, cmd_vel_topic: str) -> Blueprint | None:
+    """Build the BabylonSceneViewerModule blueprint for either backend.
+
+    Sim mode optionally overlays a scene-mesh visual; real mode uses the bare
+    G1 MJCF. Returns ``None`` if ``DIMOS_ENABLE_BABYLON`` is unset.
+    """
+    if not _env_bool("DIMOS_ENABLE_BABYLON", False):
+        return None
+
+    from dimos.simulation.mujoco.model import get_assets
+    from dimos.visualization.babylon_scene_viewer import BabylonSceneViewerModule
+
+    kwargs: dict[str, Any] = dict(
+        mjcf_path=viewer_mjcf_path,
+        assets=get_assets(),
+        port=_env_int("DIMOS_BABYLON_PORT", _DEFAULT_BABYLON_PORT),
+    )
+    if global_config.simulation:
+        (
+            scene_mesh_path,
+            scene_mesh_scale,
+            scene_mesh_translation,
+            scene_mesh_rotation,
+            scene_mesh_y_up,
+        ) = _scene_mesh_config()
+        scene_visual_override = os.environ.get("DIMOS_SCENE_VISUAL_PATH") or None
+        scene_visual_path = scene_visual_override or scene_mesh_path
+        kwargs.update(
+            scene_path=scene_visual_path,
+            scene_scale=_env_float("DIMOS_SCENE_VISUAL_SCALE", scene_mesh_scale),
+            scene_translation=_env_xyz(
+                "DIMOS_SCENE_VISUAL_TRANSLATION", scene_mesh_translation
+            ),
+            scene_rotation_zyx_deg=_env_xyz(
+                "DIMOS_SCENE_VISUAL_ROTATION_ZYX_DEG", scene_mesh_rotation
+            ),
+            scene_y_up=_env_bool("DIMOS_SCENE_VISUAL_Y_UP", scene_mesh_y_up),
+            pointcloud_hz=_env_float("DIMOS_BABYLON_POINTCLOUD_HZ", 2.0),
+            pointcloud_max_points=_env_int("DIMOS_BABYLON_POINTCLOUD_MAX_POINTS", 70000),
+        )
+
+    return BabylonSceneViewerModule.blueprint(**kwargs).transports(
+        {
+            ("joint_state", JointState): LCMTransport(
+                "/coordinator/joint_state", JointState
+            ),
+            ("odom", PoseStamped): LCMTransport("/odom", PoseStamped),
+            ("path", PathMsg): LCMTransport("/nav_path", PathMsg),
+            ("pointcloud_overlay", PointCloud2): LCMTransport("/global_map", PointCloud2),
+            ("cmd_vel", Twist): LCMTransport(cmd_vel_topic, Twist),
+            ("clicked_point", PointStamped): LCMTransport("/clicked_point", PointStamped),
+            ("point_goal", PointStamped): LCMTransport("/point_goal", PointStamped),
+        }
+    )
+
+
+def _arm_teleop_blueprint() -> Blueprint | None:
+    """Bridge the babylon slider HUD to the coordinator's ``servo_arms`` task.
+
+    Implements ``HumanoidControlSpec``; the viewer auto-wires it. Only worth
+    starting when Babylon is enabled (nothing else consumes the spec).
+    """
+    if not _env_bool("DIMOS_ENABLE_BABYLON", False):
+        return None
+    from dimos.robot.unitree.g1.arm_teleop import G1ArmTeleop
+
+    return G1ArmTeleop.blueprint().transports(
+        {
+            ("joint_command", JointState): LCMTransport("/g1/joint_command", JointState),
+        }
     )
 
 
 _backend_selection = _select_backend()
 _coordinator, _cmd_vel_topic = _coordinator_blueprint(_backend_selection)
+_babylon = _babylon_blueprint(_backend_selection.viewer_mjcf_path, _cmd_vel_topic)
+_teleop = _arm_teleop_blueprint()
+_optional = tuple(bp for bp in (_babylon, _teleop) if bp is not None)
 
 g1_groot_wbc = autoconnect(
     _backend_selection.blueprint,
     _coordinator,
     _websocket_blueprint(_cmd_vel_topic),
-    *_sim_support_blueprints(_backend_selection.viewer_mjcf_path, _cmd_vel_topic),
+    *_sim_support_blueprints(_backend_selection.viewer_mjcf_path),
+    *_optional,
 ).transports(
     {
         ("odom", PoseStamped): LCMTransport("/odom", PoseStamped),

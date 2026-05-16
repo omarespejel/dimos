@@ -71,12 +71,27 @@ class MujocoRespawnSpec(Spec, Protocol):
 class HumanoidControlSpec(Spec, Protocol):
     """Optional spec implemented by humanoid robot adapters.
 
-    Auto-wired into the viewer so the HUD's Arms preset buttons work.
-    Stays robot-agnostic — any humanoid implementing these two methods slots in.
+    Auto-wired into the viewer so the per-joint arm sliders in the HUD can
+    drive each joint within its declared limits. Stays robot-agnostic — any
+    humanoid that knows its own joint range can implement it.
     """
 
-    def home_arms(self) -> bool: ...
-    def tuck_arms(self) -> bool: ...
+    def set_arm_joint(self, name: str, position: float) -> bool: ...
+    def release_arms(self) -> bool: ...
+    def arm_joint_limits(self) -> list[tuple[str, float, float]]: ...
+
+
+class CoordinatorControlSpec(Spec, Protocol):
+    """Arm / dry-run knobs on a ControlCoordinator.
+
+    Matches the same RPCs the command center hits — see
+    ``WebsocketVisModule._create_server`` ``arm`` / ``disarm`` / ``set_dry_run``
+    handlers. Any module exposing these two methods (e.g. ``ControlCoordinator``)
+    is auto-wired and unlocks the HUD's Policy toggles.
+    """
+
+    def set_activated(self, engaged: bool) -> None: ...
+    def set_dry_run(self, enabled: bool) -> None: ...
 
 
 def _compose_scene_mesh_wxyz(
@@ -129,6 +144,7 @@ class BabylonSceneViewerModule(Module):
     cmd_vel: Out[Twist]
     _mujoco_sim: MujocoRespawnSpec | None = None
     _robot_ctrl: HumanoidControlSpec | None = None
+    _coordinator_ctrl: CoordinatorControlSpec | None = None
 
     def __init__(
         self,
@@ -244,11 +260,27 @@ class BabylonSceneViewerModule(Module):
                 Route("/", self._index),
                 Route("/config.json", self._config),
                 Route("/robot.json", self._robot_json),
+                Route("/arms.json", self._arms_json),
                 Route("/assets/{asset_name:path}", self._asset),
                 WebSocketRoute("/ws", self._websocket),
             ],
             lifespan=_lifespan,
         )
+
+    async def _arms_json(self, request: Request) -> JSONResponse:
+        """Joint-limit catalogue so the page can build sliders with real range."""
+        if self._robot_ctrl is None:
+            return JSONResponse({"joints": []})
+        try:
+            limits = self._robot_ctrl.arm_joint_limits()
+        except Exception as exc:
+            logger.warning("BabylonViewer: arm_joint_limits() failed: %s", exc)
+            return JSONResponse({"joints": []})
+        joints = [
+            {"name": name, "min": float(lo), "max": float(hi)}
+            for (name, lo, hi) in limits
+        ]
+        return JSONResponse({"joints": joints})
 
     async def _index(self, request: Request) -> HTMLResponse:
         return HTMLResponse(_HTML)
@@ -338,15 +370,36 @@ class BabylonSceneViewerModule(Module):
             if twist is not None:
                 self.cmd_vel.publish(twist)
             return
-        if message_type == "arm_preset":
-            preset = message.get("preset")
-            if self._robot_ctrl is None:
-                logger.warning("BabylonViewer: arm_preset requested but no robot adapter is wired")
+        if message_type == "arm_joint":
+            name = message.get("name")
+            position = message.get("position")
+            if (
+                self._robot_ctrl is None
+                or not isinstance(name, str)
+                or not isinstance(position, (int, float))
+            ):
                 return
-            if preset == "home":
-                self._robot_ctrl.home_arms()
-            elif preset == "tuck":
-                self._robot_ctrl.tuck_arms()
+            self._robot_ctrl.set_arm_joint(name, float(position))
+            return
+        if message_type == "release_arms":
+            if self._robot_ctrl is not None:
+                self._robot_ctrl.release_arms()
+            return
+        if message_type == "set_activated":
+            engaged = bool(message.get("engaged", False))
+            if self._coordinator_ctrl is None:
+                logger.warning("BabylonViewer: set_activated requested but no coordinator wired")
+                return
+            logger.info("BabylonViewer: set_activated=%s", engaged)
+            self._coordinator_ctrl.set_activated(engaged=engaged)
+            return
+        if message_type == "set_dry_run":
+            enabled = bool(message.get("enabled", False))
+            if self._coordinator_ctrl is None:
+                logger.warning("BabylonViewer: set_dry_run requested but no coordinator wired")
+                return
+            logger.info("BabylonViewer: set_dry_run=%s", enabled)
+            self._coordinator_ctrl.set_dry_run(enabled=enabled)
             return
         if message_type not in {"clicked_point", "point_goal"}:
             return
@@ -430,11 +483,25 @@ class BabylonSceneViewerModule(Module):
                     "wxyz": robot.data.xquat[body_id].astype(np.float32).tolist(),
                 }
             )
+        # Normalise joint names to the short form the slider HUD uses:
+        #   * strip a leading "<hwid>/" prefix (e.g. "g1/left_shoulder_pitch"
+        #     → "left_shoulder_pitch") for coordinator-style names.
+        #   * strip a trailing "_joint" suffix (e.g. "left_shoulder_pitch_joint"
+        #     → "left_shoulder_pitch") for URDF-style names.
+        def _canon(k: str) -> str:
+            if "/" in k:
+                k = k.split("/", 1)[1]
+            if k.endswith("_joint"):
+                k = k[: -len("_joint")]
+            return k
+
+        joint_positions = {_canon(k): float(v) for k, v in joints.items()}
         return {
             "type": "state",
             "time": time.time(),
             "bodies": bodies,
             "path": path_points,
+            "joints": joint_positions,
         }
 
     def _on_joint_state(self, msg: JointState) -> None:
@@ -781,6 +848,123 @@ _HTML = r"""<!doctype html>
       #cameraPanel[data-has-frame="true"] #cameraEmpty {
         display: none;
       }
+
+      #armsPanel {
+        position: fixed;
+        right: 16px;
+        top: 16px;
+        width: 420px;
+        max-width: calc(100vw - 32px);
+        max-height: calc(100vh - 320px);
+        overflow-y: auto;
+        padding: 14px 16px 16px 16px;
+        border: 1px solid rgb(255 255 255 / 10%);
+        border-radius: 10px;
+        background: rgb(17 20 26 / 90%);
+        backdrop-filter: blur(14px);
+        box-shadow: 0 8px 28px rgb(0 0 0 / 40%);
+        z-index: 5;
+      }
+
+      #armsPanel[data-active="false"] {
+        display: none;
+      }
+
+      #armsHeader {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: rgb(255 255 255 / 50%);
+        margin-bottom: 12px;
+        font-weight: 600;
+      }
+
+      #armsColumns {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 14px;
+      }
+
+      .arm-col-title {
+        font-size: 12px;
+        color: rgb(255 255 255 / 80%);
+        margin-bottom: 6px;
+        font-weight: 600;
+        text-align: center;
+        padding: 4px 0;
+        background: rgb(255 255 255 / 4%);
+        border-radius: 4px;
+      }
+
+      .arm-sliders {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .arm-slider-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 2px 6px;
+        align-items: center;
+      }
+
+      .arm-slider-row .joint-name {
+        font-size: 11px;
+        color: rgb(255 255 255 / 75%);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .arm-slider-row .joint-val {
+        font-size: 10px;
+        color: rgb(96 165 250 / 90%);
+        font-variant-numeric: tabular-nums;
+        min-width: 48px;
+        text-align: right;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      }
+
+      .arm-slider-row input[type="range"] {
+        grid-column: 1 / span 2;
+        appearance: none;
+        -webkit-appearance: none;
+        width: 100%;
+        height: 4px;
+        background: rgb(255 255 255 / 8%);
+        border-radius: 2px;
+        outline: none;
+      }
+
+      .arm-slider-row input[type="range"]::-webkit-slider-thumb {
+        appearance: none;
+        -webkit-appearance: none;
+        width: 12px;
+        height: 12px;
+        background: rgb(96 165 250);
+        border-radius: 50%;
+        cursor: pointer;
+        border: none;
+      }
+
+      .arm-slider-row input[type="range"]::-moz-range-thumb {
+        width: 12px;
+        height: 12px;
+        background: rgb(96 165 250);
+        border-radius: 50%;
+        cursor: pointer;
+        border: none;
+      }
+
+      .arm-slider-row .joint-range {
+        grid-column: 1 / span 2;
+        display: flex;
+        justify-content: space-between;
+        font-size: 9px;
+        color: rgb(255 255 255 / 35%);
+        font-variant-numeric: tabular-nums;
+      }
     </style>
   </head>
   <body>
@@ -791,6 +975,19 @@ _HTML = r"""<!doctype html>
       </div>
       <img id="cameraImg" alt="" />
       <div id="cameraEmpty">waiting for frames…</div>
+    </div>
+    <div id="armsPanel" data-active="false">
+      <div id="armsHeader">Arm joints</div>
+      <div id="armsColumns">
+        <div class="arm-col">
+          <div class="arm-col-title">Left</div>
+          <div id="leftArmSliders" class="arm-sliders"></div>
+        </div>
+        <div class="arm-col">
+          <div class="arm-col-title">Right</div>
+          <div id="rightArmSliders" class="arm-sliders"></div>
+        </div>
+      </div>
     </div>
     <div id="hud">
       <div class="hud-group">
@@ -804,9 +1001,14 @@ _HTML = r"""<!doctype html>
         <button id="forceVisible" data-active="false">Force</button>
       </div>
       <div class="hud-group">
+        <span class="hud-label">Policy</span>
+        <button id="policyArm" data-active="false" title="Arm/disarm the coordinator's control tasks">Arm</button>
+        <button id="policyDryRun" data-active="true" title="Dry-run: task computes but coordinator does not write to hardware">Dry-run</button>
+      </div>
+      <div class="hud-group">
         <span class="hud-label">Arms</span>
-        <button id="armsHome">Home</button>
-        <button id="armsTuck">Tuck</button>
+        <button id="armsToggle" data-active="false">Sliders</button>
+        <button id="armsRelease">Release</button>
       </div>
       <div class="hud-group">
         <span class="hud-label">Interact</span>
@@ -1312,7 +1514,10 @@ _HTML = r"""<!doctype html>
         socket.onmessage = (event) => {
           if (typeof event.data === "string") {
             const payload = JSON.parse(event.data);
-            if (payload.type === "state") updateState(payload);
+            if (payload.type === "state") {
+              updateState(payload);
+              _updateSlidersFromState(payload.joints);
+            }
             if (payload.type === "pointcloud") updatePointCloud(payload);
           } else {
             handleBinaryMessage(event.data);
@@ -1461,17 +1666,151 @@ _HTML = r"""<!doctype html>
         });
       };
 
-      // --- Arm presets ---
-      document.getElementById("armsHome").onclick = () => {
-        if (sendSocketPayload({ type: "arm_preset", preset: "home" })) {
-          setStatus("arms → home");
+      // --- Policy arm / dry-run toggles ---
+      // Initial dataset.active reflects the coordinator's defaults for the
+      // typical real-hardware blueprint (unarmed, dry-run on). If the
+      // blueprint configured different defaults the button is still a plain
+      // toggle — click it once to sync.
+      document.getElementById("policyArm").onclick = () => {
+        const btn = document.getElementById("policyArm");
+        const engaged = btn.dataset.active !== "true";
+        if (!sendSocketPayload({ type: "set_activated", engaged })) return;
+        btn.dataset.active = engaged ? "true" : "false";
+        setStatus(engaged ? "policy armed" : "policy disarmed");
+      };
+      document.getElementById("policyDryRun").onclick = () => {
+        const btn = document.getElementById("policyDryRun");
+        const enabled = btn.dataset.active !== "true";
+        if (!sendSocketPayload({ type: "set_dry_run", enabled })) return;
+        btn.dataset.active = enabled ? "true" : "false";
+        setStatus(enabled ? "dry-run on" : "dry-run off (live)");
+      };
+
+      // --- Arm slider panel ---
+      // Toggle visibility
+      document.getElementById("armsToggle").onclick = () => {
+        const btn = document.getElementById("armsToggle");
+        const panel = document.getElementById("armsPanel");
+        const active = btn.dataset.active !== "true";
+        btn.dataset.active = active ? "true" : "false";
+        panel.dataset.active = active ? "true" : "false";
+      };
+
+      // Release: stop publishing arm commands (hand control back to MC)
+      document.getElementById("armsRelease").onclick = () => {
+        if (sendSocketPayload({ type: "release_arms" })) {
+          setStatus("arms released");
         }
       };
-      document.getElementById("armsTuck").onclick = () => {
-        if (sendSocketPayload({ type: "arm_preset", preset: "tuck" })) {
-          setStatus("arms → tuck");
+
+      // Build the slider list from /arms.json. Each slider sends an
+      // {type: arm_joint, name, position} message on input (throttled).
+      function _humanLabel(name) {
+        // strip "left_"/"right_" prefix for column-internal display
+        return name
+          .replace(/^left_/, "")
+          .replace(/^right_/, "")
+          .replace(/_/g, " ");
+      }
+      // Track which slider the user is currently dragging so we don't
+      // overwrite its value from incoming joint-state updates.
+      const _armSliders = {};       // joint_name -> {slider, val, dragging}
+      let _armSendThrottle = {};
+      function _throttledSendJoint(name, position) {
+        const now = performance.now();
+        const last = _armSendThrottle[name] || 0;
+        if (now - last < 30) return; // ~33 Hz max per slider
+        _armSendThrottle[name] = now;
+        sendSocketPayload({ type: "arm_joint", name, position });
+      }
+      function _buildSlider(joint) {
+        const row = document.createElement("div");
+        row.className = "arm-slider-row";
+
+        const labelTop = document.createElement("div");
+        labelTop.className = "joint-name";
+        labelTop.textContent = _humanLabel(joint.name);
+        row.appendChild(labelTop);
+
+        const val = document.createElement("div");
+        val.className = "joint-val";
+        val.textContent = "  …  ";
+        row.appendChild(val);
+
+        const slider = document.createElement("input");
+        slider.type = "range";
+        slider.min = String(joint.min);
+        slider.max = String(joint.max);
+        slider.step = "0.005";
+        // Default to midpoint until we get a real reading — visually obvious
+        // it's not real yet (the value cell shows "..." until first update).
+        slider.value = String((joint.min + joint.max) / 2);
+        slider.disabled = true;  // enabled once a joint_state arrives
+
+        const entry = { slider, val, dragging: false, ready: false };
+        _armSliders[joint.name] = entry;
+
+        slider.addEventListener("pointerdown", () => { entry.dragging = true; });
+        slider.addEventListener("pointerup",   () => { entry.dragging = false; });
+        slider.addEventListener("pointercancel", () => { entry.dragging = false; });
+
+        slider.oninput = () => {
+          const pos = parseFloat(slider.value);
+          val.textContent = pos.toFixed(3);
+          _throttledSendJoint(joint.name, pos);
+        };
+        slider.onchange = () => {
+          // Final exact value on release (in case the throttle dropped it)
+          const pos = parseFloat(slider.value);
+          sendSocketPayload({ type: "arm_joint", name: joint.name, position: pos });
+        };
+        row.appendChild(slider);
+
+        const range = document.createElement("div");
+        range.className = "joint-range";
+        const lo = document.createElement("span");
+        lo.textContent = joint.min.toFixed(2);
+        const hi = document.createElement("span");
+        hi.textContent = joint.max.toFixed(2);
+        range.appendChild(lo);
+        range.appendChild(hi);
+        row.appendChild(range);
+
+        return row;
+      }
+
+      function _updateSlidersFromState(joints) {
+        if (!joints) return;
+        for (const [name, value] of Object.entries(joints)) {
+          const entry = _armSliders[name];
+          if (!entry) continue;
+          if (!entry.ready) {
+            // First sample → enable the slider, set it to actual position.
+            entry.ready = true;
+            entry.slider.disabled = false;
+          }
+          if (entry.dragging) continue;  // don't fight the user
+          // Only set value when the slider is idle, so the user sees ground truth.
+          entry.slider.value = String(value);
+          entry.val.textContent = Number(value).toFixed(3);
         }
-      };
+      }
+
+      (async () => {
+        try {
+          const resp = await fetch("/arms.json");
+          const data = await resp.json();
+          const leftCol = document.getElementById("leftArmSliders");
+          const rightCol = document.getElementById("rightArmSliders");
+          for (const j of data.joints || []) {
+            const row = _buildSlider(j);
+            if (j.name.startsWith("left_")) leftCol.appendChild(row);
+            else if (j.name.startsWith("right_")) rightCol.appendChild(row);
+          }
+        } catch (e) {
+          console.error("Failed to load /arms.json:", e);
+        }
+      })();
 
       const socketRef = { current: null };
       (async () => {
