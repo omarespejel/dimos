@@ -569,6 +569,35 @@ int main(int argc, char** argv) {
     // for outdoor LiDAR (~10cm voxelization is common). 0.5m is forgiving.
     params["Icp/MaxCorrespondenceDistance"] =
         mod.arg("icp_max_correspondence_distance", "0.5");
+    // ICP transform-validity gates relative to the proximity guess. rtabmap
+    // defaults are 0.2m / 0.78rad — tuned for desktop / hand-held RGBD.
+    // Outdoor LiDAR loop closures (KITTI-360) routinely produce 0.5-4m
+    // corrections in lateral / vertical position, so loosen these to
+    // KITTI-scale. With the tight defaults rtabmap rejected 100% of
+    // proximity ICP attempts ("libpointmatcher has failed: limit out of
+    // bounds: rot: 0.04/0.78 tr: 0.48/0.2").
+    params["Icp/MaxTranslation"] =
+        mod.arg("icp_max_translation", "5.0");
+    params["Icp/MaxRotation"] =
+        mod.arg("icp_max_rotation", "1.5");
+    // Min fraction of points that must find a correspondence for ICP
+    // to be considered a valid match. rtabmap default 0.2 (20%) is far
+    // too strict for outdoor lidar where the two scans cover different
+    // halves of the environment — we observed 2-5% on KITTI-360. Drop
+    // to 0.01 (1%) which is more forgiving but still flags totally-
+    // mismatched scans.
+    params["Icp/CorrespondenceRatio"] =
+        mod.arg("icp_correspondence_ratio", "0.01");
+    // Voxel-downsample the laser scan in Memory before ICP runs. Default
+    // 0 (no downsampling) makes ICP eat the full 80k-point KITTI scan
+    // each iteration. 0.2m voxel gets the scan to ~5-10k points with
+    // negligible accuracy loss for proximity matching.
+    params["Mem/LaserScanVoxelSize"] =
+        mod.arg("mem_laser_scan_voxel_size", "0.2");
+    params["Mem/LaserScanNormalK"] =
+        mod.arg("mem_laser_scan_normal_k", "10");
+    params["Mem/LaserScanNormalRadius"] =
+        mod.arg("mem_laser_scan_normal_radius", "0.0");
     // Keyframe admission. We bypass rtabmap's motion gate (LinearUpdate=0)
     // because for the dynamic-clearing use case we want keyframes to keep
     // arriving even on a stationary robot — so the OctoMap keeps getting
@@ -824,25 +853,27 @@ int main(int argc, char** argv) {
         bool processed = rtab.process(data, frame.odom_pose);
         sync_signature_grids(rtab, octomap_grid_cache, max_synced_id);
 
-        // Loop-closure detection. rtab.getLoopClosureId() returns the
-        // target signature id when this iteration triggered closure (0
-        // otherwise). Pair (current, target) → publish edge marked
-        // w=0.4 (the value the KITTI scorer matches on) plus a
-        // loop_closure event so external listeners can react. PoseStamped
-        // header timestamps mirror each signature's scan stamp so the
-        // scorer can map back to frame ids via its send-time cache.
+        // Loop-closure detection. rtabmap exposes TWO loop-target ids:
+        //   * getLoopClosureId() — Bayes-filter (visual bag-of-words) hit
+        //   * statistics.proximityDetectionId() — spatial proximity (ICP)
+        // In lidar-only mode the visual path is disabled (Kp/DetectorStrategy
+        // = -1), so all real loop closures come through the proximity path.
+        // Treat either as "loop closure detected" and publish the edge.
         if (processed) {
             const int loop_id = rtab.getLoopClosureId();
-            if (loop_id > 0) {
+            const int prox_id = static_cast<int>(rtab.getStatistics().proximityDetectionId());
+            const int target_id = loop_id > 0 ? loop_id : prox_id;
+            if (target_id > 0) {
+                const int loop_id_publish = target_id;
                 const rtabmap::Memory* mem = rtab.getMemory();
                 const int curr_id = rtab.getLastLocationId();
                 const auto& opt = rtab.getLocalOptimizedPoses();
                 const auto curr_it = opt.find(curr_id);
-                const auto loop_it = opt.find(loop_id);
+                const auto loop_it = opt.find(loop_id_publish);
                 const rtabmap::Signature* curr_sig =
                     mem ? mem->getSignature(curr_id) : nullptr;
                 const rtabmap::Signature* loop_sig =
-                    mem ? mem->getSignature(loop_id) : nullptr;
+                    mem ? mem->getSignature(loop_id_publish) : nullptr;
                 if (curr_it != opt.end() && loop_it != opt.end()
                     && curr_sig && loop_sig) {
                     const double curr_ts = curr_sig->getStamp();
@@ -862,7 +893,7 @@ int main(int argc, char** argv) {
                     if (debug) {
                         fprintf(stderr,
                                 "[rtab DEBUG] LOOP CLOSURE detected — curr_id=%d (ts=%.3f) ↔ loop_id=%d (ts=%.3f) score=%.3f\n",
-                                curr_id, curr_ts, loop_id, loop_ts,
+                                curr_id, curr_ts, loop_id_publish, loop_ts,
                                 rtab.getLoopClosureValue());
                     }
                 }
