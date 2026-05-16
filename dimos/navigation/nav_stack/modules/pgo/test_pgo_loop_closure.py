@@ -196,7 +196,7 @@ class TestPGOLoopClosure:
                 CORRECTED_ODOM_LCM,
                 "--global_map",
                 GLOBAL_MAP_LCM,
-                "--tf",
+                "--corrected_tf",
                 TF_LCM,
                 "--pose_graph_nodes",
                 GRAPH_NODES_LCM,

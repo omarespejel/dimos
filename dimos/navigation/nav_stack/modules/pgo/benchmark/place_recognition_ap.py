@@ -52,10 +52,10 @@ import numpy as np
 from scipy.spatial import cKDTree
 from sklearn.metrics import average_precision_score  # type: ignore[import-untyped]
 
-from dimos.navigation.nav_stack.modules.pgo.benchmark.kitti360_loader import (
+from dimos.navigation.nav_stack.benchmarks.pose_graph_kitti360.kitti360_loader import (
     load_kitti360_sequence,
 )
-from dimos.navigation.nav_stack.modules.pgo.benchmark.loop_groundtruth import (
+from dimos.navigation.nav_stack.benchmarks.pose_graph_kitti360.loop_groundtruth import (
     DEFAULT_MAX_LOOP_DISTANCE_M,
     DEFAULT_MIN_FRAME_GAP,
     compute_loop_groundtruth,

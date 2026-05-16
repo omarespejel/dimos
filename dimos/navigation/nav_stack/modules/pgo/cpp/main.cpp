@@ -255,7 +255,7 @@ int main(int argc, char** argv)
     std::string odom_topic = native_module.topic("odometry");
     std::string corrected_odom_topic = native_module.topic("corrected_odometry");
     std::string global_map_topic = native_module.topic("global_map");
-    std::string tf_topic = native_module.topic("tf");
+    std::string tf_topic = native_module.topic("corrected_tf");
     std::string graph_nodes_topic = native_module.topic("pose_graph_nodes");
     std::string graph_edges_topic = native_module.topic("pose_graph_edges");
     std::string loop_closure_topic = native_module.topic("loop_closure");
@@ -312,7 +312,7 @@ int main(int argc, char** argv)
         fprintf(stderr, "  odometry: %s\n", odom_topic.c_str());
         fprintf(stderr, "  corrected_odometry: %s\n", corrected_odom_topic.c_str());
         fprintf(stderr, "  global_map: %s\n", global_map_topic.c_str());
-        fprintf(stderr, "  tf: %s\n", tf_topic.c_str());
+        fprintf(stderr, "  corrected_tf: %s\n", tf_topic.c_str());
         fprintf(stderr, "  pose_graph_nodes: %s\n", graph_nodes_topic.c_str());
         fprintf(stderr, "  pose_graph_edges: %s\n", graph_edges_topic.c_str());
         fprintf(stderr, "  loop_closure: %s\n", loop_closure_topic.c_str());

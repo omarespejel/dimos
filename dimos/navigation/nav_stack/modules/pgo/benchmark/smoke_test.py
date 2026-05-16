@@ -31,7 +31,7 @@ import time
 import lcm as lcmlib
 import numpy as np
 
-from dimos.navigation.nav_stack.modules.pgo.benchmark.kitti360_loader import (
+from dimos.navigation.nav_stack.benchmarks.pose_graph_kitti360.kitti360_loader import (
     load_kitti360_sequence,
 )
 from dimos.navigation.nav_stack.tests.rosbag_fixtures import (
@@ -47,7 +47,7 @@ PGO_BIN = Path(__file__).resolve().parent.parent / "cpp" / "result" / "bin" / "p
 OUTPUT_TOPICS = [
     ("corrected_odometry", "nav_msgs.Odometry"),
     ("global_map", "sensor_msgs.PointCloud2"),
-    ("tf", "nav_msgs.Odometry"),
+    ("corrected_tf", "nav_msgs.Odometry"),
     ("pose_graph_nodes", "nav_msgs.Path"),
     ("pose_graph_edges", "nav_msgs.Path"),
     ("loop_closure", "nav_msgs.Path"),

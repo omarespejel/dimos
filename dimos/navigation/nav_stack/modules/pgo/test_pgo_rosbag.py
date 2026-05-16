@@ -99,7 +99,7 @@ class TestPGORosbag:
                 CORRECTED_ODOM_LCM,
                 "--global_map",
                 GLOBAL_MAP_LCM,
-                "--tf",
+                "--corrected_tf",
                 TF_LCM,
                 # Config params matching pgo_unity_sim.yaml
                 "--key_pose_delta_deg",
