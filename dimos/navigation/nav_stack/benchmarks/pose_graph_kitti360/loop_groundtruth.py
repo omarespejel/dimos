@@ -111,20 +111,7 @@ def score_detected_loops(
     detected_pairs: list[tuple[int, int]],
     groundtruth: LoopGroundtruth,
 ) -> LoopMetrics:
-    """Score detected (query_id, candidate_id) pairs against groundtruth.
-
-    A detection is a true positive iff its candidate is in the
-    groundtruth set for that query (or vice-versa — order-agnostic).
-
-    Recall denominator = number of queries that have at least one
-    valid loop. (We don't count "valid pairs missed" because a single
-    correct detection per query is enough to count.)
-    """
-    # TP/FP/FN are all query-level so precision/recall stay
-    # dimensionally consistent. The "query" of a detection pair is
-    # max(source, target) per the LCDNet convention. A query that
-    # fires only correct edges counts as 1 TP; a query whose every
-    # edge is wrong counts as 1 FP; mixed cases collapse to TP.
+    """Score detected (query_id, candidate_id) pairs against groundtruth."""
     seen_queries_with_hit: set[int] = set()
     seen_queries_without_hit: set[int] = set()
     queries_with_any_groundtruth = {
