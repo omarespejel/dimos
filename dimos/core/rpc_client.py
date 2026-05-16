@@ -63,9 +63,14 @@ class RpcCall:
         # For stop, use call_nowait to avoid deadlock
         # (the remote side stops its RPC service before responding)
         if self._name == "stop":
-            self._rpc.call_nowait(f"{self._remote_name}/{self._name}", (args, kwargs))  # type: ignore[arg-type]
-            if self._stop_rpc_client:
-                self._stop_rpc_client()
+            try:
+                self._rpc.call_nowait(f"{self._remote_name}/{self._name}", (args, kwargs))  # type: ignore[arg-type]
+            finally:
+                # Always tear down the local RPC client, even if call_nowait
+                # raised (e.g. the worker died first). Otherwise the host-side
+                # LCM listener thread leaks across the test suite.
+                if self._stop_rpc_client:
+                    self._stop_rpc_client()
             return None
 
         result, unsub_fn = self._rpc.call_sync(
