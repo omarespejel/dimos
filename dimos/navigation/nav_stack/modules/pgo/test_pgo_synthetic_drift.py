@@ -252,6 +252,9 @@ class SyntheticDriftPlaybackModule(Module):
         self._playback_task.cancel()
 
     async def _run_playback(self) -> None:
+        # Gate on the coordinator's system-ready barrier so the C++ PGO
+        # subprocess has subscribed before we emit the first scan.
+        await self.wait_for_system_ready()
         for row in self.config.trajectory:
             (
                 timestamp,

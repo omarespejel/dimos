@@ -345,6 +345,12 @@ int main(int argc, char** argv)
     lcm.subscribe(odom_topic, &Handlers::on_odometry, &handlers);
     lcm.subscribe(scan_topic, &Handlers::on_registered_scan, &handlers);
 
+    // NativeModule.start() in Python reads stderr for this marker and only
+    // returns once it sees it. Without this, upstream publishers can race
+    // ahead and emit messages before our LCM subscriptions are live.
+    fprintf(stderr, "[DIMOS_NATIVE_READY]\n");
+    fflush(stderr);
+
     if (debug) {
         fprintf(stderr, "PGO native module started\n");
         fprintf(stderr, "  registered_scan: %s\n", scan_topic.c_str());

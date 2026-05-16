@@ -38,6 +38,9 @@ class PGOConfig(NativeModuleConfig):
     cwd: str | None = str(Path(__file__).resolve().parent / "cpp")
     executable: str = "result/bin/pgo"
     build_command: str | None = "nix build .#default --no-write-lock-file"
+    # The PGO binary emits [DIMOS_NATIVE_READY] after its LCM subscribes are
+    # live; block start() until we see it so upstream publishers don't race.
+    ready_timeout_sec: float = 10.0
 
     frame_id: str = "map"
     child_frame_id: str = "start_point"

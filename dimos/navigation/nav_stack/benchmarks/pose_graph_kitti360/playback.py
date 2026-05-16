@@ -82,6 +82,9 @@ class Kitti360PlaybackModule(Module):
         self._playback_task.cancel()
 
     async def _run_playback(self) -> None:
+        # Wait for the system-ready barrier so PGO has subscribed before
+        # we start streaming scans.
+        await self.wait_for_system_ready()
         for index, frame_id in enumerate(self._frame_ids):
             # ``scan_xyz`` is a blocking np.fromfile — push it to a thread so
             # the event loop (and any concurrent RPC) keeps spinning.
