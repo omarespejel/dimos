@@ -405,11 +405,11 @@ class TestPGOSyntheticDrift:
             f"({LOOP_SEARCH_RADIUS_M}m). Got {position_search_events} events."
         )
 
-    # Flaky after the TF rework merge: passes ~2/6 vs 6/6 on origin/jeff/feat/better_pgo.
-    # Same total keyframes but positions shifted ~0.8m, so scan-context misses the match.
-    # Likely root: Python PGO.start() no longer subscribes to corrected_tf / seeds TF,
-    # so the C++ binary begins processing scans slightly earlier and samples differently.
-    # TODO: restore startup-timing parity (or sample-rate sync) and remove the xfail.
+    # Flaky after the TF rework merge (~2/6 vs 6/6 on origin/jeff/feat/better_pgo).
+    # PGO produces the same keyframe count but positions are shifted ~0.8m, so
+    # scan-context loses the appearance match. A 0.3s settle in PGO.start() helps
+    # but doesn't fully resolve. Real fix likely needs a wait-for-ready handshake
+    # against the C++ subprocess. Tracked separately.
     @pytest.mark.xfail(strict=False, reason="flaky after TF rework — see comment above")
     def test_scan_context_catches_reverse_loop(self) -> None:
         """Robot drives 8m east facing east, turns 180°, drives back facing west.

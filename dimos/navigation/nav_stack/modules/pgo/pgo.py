@@ -20,6 +20,7 @@ Uses GTSAM iSAM2 for pose graph optimization and PCL ICP for loop closure.
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 from dimos.core.core import rpc
 from dimos.core.native_module import NativeModule, NativeModuleConfig
@@ -32,6 +33,8 @@ from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
+
+_STARTUP_SETTLE_SEC = 0.3
 
 
 class PGOConfig(NativeModuleConfig):
@@ -98,6 +101,12 @@ class PGO(NativeModule):
     @rpc
     def start(self) -> None:
         super().start()
+        # Brief settle so the C++ subprocess's LCM subscriptions join the
+        # multicast group before upstream modules begin publishing scans.
+        # Without this, early scans can be missed and scan-context loops
+        # don't trigger reliably.
+        # TODO: switch to wait-for-ready system
+        time.sleep(_STARTUP_SETTLE_SEC)
         if self.config.debug:
             logger.info("PGO native module started (C++ iSAM2 + PCL ICP)")
 
