@@ -26,10 +26,7 @@ trajectory is data-dependent, not a code defect.
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import AsyncIterator
 import math
-from pathlib import Path
 import time
 from typing import Any
 
@@ -40,15 +37,11 @@ from dimos.core.coordination.blueprints import autoconnect
 from dimos.core.coordination.module_coordinator import ModuleCoordinator
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
-from dimos.core.stream import In, Out
-from dimos.msgs.nav_msgs.Odometry import Odometry
+from dimos.core.stream import In
 from dimos.msgs.nav_msgs.Path import Path as NavPath
-from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.navigation.nav_stack.modules.pgo.pgo import PGO
 from dimos.navigation.nav_stack.tests.rosbag_fixtures import (
-    load_rosbag_window,
-    make_odometry_msg,
-    make_pointcloud_msg,
+    RosbagScanOdomPlaybackModule,
 )
 from dimos.utils.logging_config import setup_logger
 
@@ -61,68 +54,6 @@ POLL_INTERVAL_SEC = 0.25
 
 QUATERNION_UNIT_TOL = 0.05
 TRANSLATION_MAX_M = 100.0
-
-
-class RosbagScanOdomPlaybackConfig(ModuleConfig):
-    rosbag_path: str | None = None
-    odom_subsample: int = 4
-
-
-class RosbagScanOdomPlaybackModule(Module):
-    """Replays scan + odom from the ``og_nav_60s`` rosbag at original timing."""
-
-    config: RosbagScanOdomPlaybackConfig
-
-    registered_scan: Out[PointCloud2]
-    odometry: Out[Odometry]
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._frames_published: int = 0
-        self._playback_finished: bool = False
-
-    async def main(self) -> AsyncIterator[None]:
-        rosbag_path = Path(self.config.rosbag_path) if self.config.rosbag_path else None
-        self._window = load_rosbag_window(rosbag_path)
-        self._playback_task = asyncio.create_task(self._run_playback())
-        yield
-        self._playback_task.cancel()
-
-    async def _run_playback(self) -> None:
-        timeline: list[tuple[str, float, Any]] = []
-        for odom_index in range(0, len(self._window.odom), self.config.odom_subsample):
-            row = self._window.odom[odom_index]
-            timeline.append(
-                ("odom", float(row[0]), make_odometry_msg(row[1:4], row[4:8], ts=row[0]))
-            )
-        for timestamp, points in self._window.scans:
-            timeline.append(("scan", float(timestamp), make_pointcloud_msg(points, ts=timestamp)))
-        timeline.sort(key=lambda entry: entry[1])
-        if not timeline:
-            self._playback_finished = True
-            return
-
-        bag_start_time = timeline[0][1]
-        wallclock_start = time.monotonic()
-        for kind, bag_timestamp, message in timeline:
-            target_wallclock = wallclock_start + (bag_timestamp - bag_start_time)
-            now = time.monotonic()
-            if target_wallclock > now:
-                await asyncio.sleep(target_wallclock - now)
-            if kind == "odom":
-                self.odometry.publish(message)
-            else:
-                self.registered_scan.publish(message)
-            self._frames_published += 1
-        self._playback_finished = True
-
-    @rpc
-    def is_finished(self) -> bool:
-        return self._playback_finished
-
-    @rpc
-    def frames_published(self) -> int:
-        return self._frames_published
 
 
 class LoopClosureRecorderConfig(ModuleConfig):
