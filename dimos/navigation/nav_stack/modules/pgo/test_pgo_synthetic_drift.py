@@ -77,8 +77,9 @@ INTER_FRAME_SLEEP_SEC = 0.15
 POST_FEED_DRAIN_SEC = 3.0
 # Poll period when waiting for the playback module to drain.
 POLL_INTERVAL_SEC = 0.25
-# Timing can be sensitive for testing
-PLAYBACK_STARTUP_DELAY_SEC = 2.0
+# After the first scan goes out, wait this long for PGO to emit anything
+# (corrected_odometry) before giving up and flooding the rest of the trajectory.
+PGO_FIRST_RESPONSE_TIMEOUT_SEC = 20.0
 
 
 def _make_room_points(half_size: float = 20.0, density: float = 0.15) -> np.ndarray:
@@ -230,7 +231,7 @@ def _trajectory_payload(
 class SyntheticDriftPlaybackConfig(ModuleConfig):
     trajectory: list[list[float]]
     inter_frame_sleep_sec: float = INTER_FRAME_SLEEP_SEC
-    startup_delay_sec: float = PLAYBACK_STARTUP_DELAY_SEC
+    pgo_first_response_timeout_sec: float = PGO_FIRST_RESPONSE_TIMEOUT_SEC
     room_half_size: float = 20.0
     room_density: float = 0.15
 
@@ -242,15 +243,26 @@ class SyntheticDriftPlaybackModule(Module):
 
     registered_scan: Out[PointCloud2]
     odometry: Out[Odometry]
+    # Subscribed only so we can detect when PGO has come up and processed the
+    # first scan — see _run_playback's "wait for PGO ack" gate.
+    corrected_odometry: In[Odometry]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._frames_published: int = 0
         self._playback_finished: bool = False
         self._playback_error: str | None = None
+        self._pgo_first_response: asyncio.Event | None = None
+
+    async def handle_corrected_odometry(self, value: Odometry) -> None:
+        if self._pgo_first_response is not None:
+            self._pgo_first_response.set()
 
     async def main(self) -> AsyncIterator[None]:
         self._room_points = _make_room_points(self.config.room_half_size, self.config.room_density)
+        # Event lives on self._loop, the same loop _run_playback and
+        # handle_corrected_odometry run on.
+        self._pgo_first_response = asyncio.Event()
         self._playback_task = asyncio.create_task(self._run_playback())
         yield
         self._playback_task.cancel()
@@ -260,9 +272,8 @@ class SyntheticDriftPlaybackModule(Module):
         # publish raises. Without it, _run_pgo's poll loop hangs and
         # the coordinator leaks.
         try:
-            if self.config.startup_delay_sec > 0:
-                await asyncio.sleep(self.config.startup_delay_sec)
-            for row in self.config.trajectory:
+            assert self._pgo_first_response is not None
+            for frame_index, row in enumerate(self.config.trajectory):
                 (
                     timestamp,
                     true_x,
@@ -295,6 +306,21 @@ class SyntheticDriftPlaybackModule(Module):
                 self.odometry.publish(odometry_message)
                 self.registered_scan.publish(scan_message)
                 self._frames_published += 1
+                if frame_index == 0:
+                    # Wait for PGO to publish anything (corrected_odometry)
+                    # so we don't flood it with the rest of the trajectory
+                    # before it has finished starting up.
+                    try:
+                        await asyncio.wait_for(
+                            self._pgo_first_response.wait(),
+                            timeout=self.config.pgo_first_response_timeout_sec,
+                        )
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(
+                            "PGO did not publish corrected_odometry within "
+                            f"{self.config.pgo_first_response_timeout_sec:.1f}s of "
+                            "the first scan — playback aborted"
+                        ) from None
                 if self.config.inter_frame_sleep_sec > 0:
                     await asyncio.sleep(self.config.inter_frame_sleep_sec)
         except Exception as exc:
@@ -350,6 +376,7 @@ def _run_pgo(
         trajectory=_trajectory_payload(trajectory),
     )
     pgo_blueprint = PGO.blueprint(
+        debug=True,
         use_scan_context=use_scan_context,
         key_pose_delta_trans=0.4,
         loop_search_radius=LOOP_SEARCH_RADIUS_M,
