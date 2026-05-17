@@ -78,7 +78,6 @@ POST_FEED_DRAIN_SEC = 3.0
 # Poll period when waiting for the playback module to drain.
 POLL_INTERVAL_SEC = 0.25
 # After the first scan goes out, wait this long for PGO to emit anything
-# (corrected_odometry) before giving up and flooding the rest of the trajectory.
 PGO_FIRST_RESPONSE_TIMEOUT_SEC = 20.0
 
 
@@ -308,8 +307,8 @@ class SyntheticDriftPlaybackModule(Module):
                 self._frames_published += 1
                 if frame_index == 0:
                     # Wait for PGO to publish anything (corrected_odometry)
-                    # so we don't flood it with the rest of the trajectory
-                    # before it has finished starting up.
+                    # before sending the rest of the trajectory, so we don't
+                    # race PGO's startup.
                     try:
                         await asyncio.wait_for(
                             self._pgo_first_response.wait(),
@@ -317,9 +316,11 @@ class SyntheticDriftPlaybackModule(Module):
                         )
                     except asyncio.TimeoutError:
                         raise RuntimeError(
-                            "PGO did not publish corrected_odometry within "
-                            f"{self.config.pgo_first_response_timeout_sec:.1f}s of "
-                            "the first scan — playback aborted"
+                            "PGO didn't start in time: no corrected_odometry "
+                            f"received within {self.config.pgo_first_response_timeout_sec:.1f}s "
+                            "of the first scan. Bump PGO_FIRST_RESPONSE_TIMEOUT_SEC "
+                            "(top of test_pgo_synthetic_drift.py) if PGO needs longer to "
+                            "start on this host."
                         ) from None
                 if self.config.inter_frame_sleep_sec > 0:
                     await asyncio.sleep(self.config.inter_frame_sleep_sec)
