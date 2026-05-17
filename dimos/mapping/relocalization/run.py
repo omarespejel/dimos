@@ -46,13 +46,13 @@ import os
 # non-determinism even at a fixed RNG seed. Must be set before import.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
+from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
+from pathlib import Path
 import pickle
 import random
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from pathlib import Path
-from typing import Callable
 
 import numpy as np
 import open3d as o3d
@@ -60,13 +60,11 @@ from scipy.spatial.transform import Rotation
 
 DATA_DIR = Path(__file__).parent / "data"
 TIME_BUDGET_SEC = 300.0  # 5 minutes wall-clock for the entire run
-SUCCESS_T_M = 1.0        # success threshold: translation error < 1m
-SUCCESS_R_DEG = 15.0     # success threshold: rotation error < 15°
+SUCCESS_T_M = 1.0  # success threshold: translation error < 1m
+SUCCESS_R_DEG = 15.0  # success threshold: rotation error < 15°
 NUM_WORKERS = min(4, os.cpu_count() or 1)  # eval frames in parallel
 
-RelocalizeFn = Callable[
-    [o3d.geometry.PointCloud, o3d.geometry.PointCloud], np.ndarray
-]
+RelocalizeFn = Callable[[o3d.geometry.PointCloud, o3d.geometry.PointCloud], np.ndarray]
 
 # Inherited by fork-child workers (set in evaluate() before pool launch).
 _GLOBAL_MAP_PTS: np.ndarray | None = None
@@ -97,7 +95,7 @@ def _eval_one_frame(frame: dict) -> dict:
     t_call = time.perf_counter()
     try:
         T = _RELOCALIZE_FN(global_map, local_map)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return {
             "frame_idx": int(frame["frame_idx"]),
             "status": "crashed",
@@ -183,7 +181,9 @@ def evaluate(relocalize_fn: RelocalizeFn) -> dict:
                         f"({r['dt']:.2f}s)"
                     )
                 elif r["status"] == "crashed":
-                    print(f"[run] frame {r['frame_idx']}: relocalize() raised {r['error']}, skipping")
+                    print(
+                        f"[run] frame {r['frame_idx']}: relocalize() raised {r['error']}, skipping"
+                    )
                 else:  # bad_shape
                     print(
                         f"[run] frame {r['frame_idx']}: relocalize() returned shape "
@@ -221,7 +221,8 @@ def evaluate(relocalize_fn: RelocalizeFn) -> dict:
     rotations_arr = np.array(rotations) if rotations else np.array([])
     ok = (
         (distances_arr < SUCCESS_T_M) & (rotations_arr < SUCCESS_R_DEG)
-        if distances else np.array([], dtype=bool)
+        if distances
+        else np.array([], dtype=bool)
     )
 
     avg_d = float(distances_arr.mean()) if distances_arr.size else float("nan")
@@ -258,7 +259,9 @@ def evaluate(relocalize_fn: RelocalizeFn) -> dict:
 if __name__ == "__main__":
     # Force line-buffered stdout so progress shows up live in redirected logs.
     import sys
+
     sys.stdout.reconfigure(line_buffering=True)
 
     from relocalize import relocalize
+
     evaluate(relocalize)

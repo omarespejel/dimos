@@ -40,20 +40,18 @@ import open3d as o3d
 _reg = o3d.pipelines.registration
 
 # ---- Tuning knobs ----------------------------------------------------------
-VOXEL_SIZES = [0.2, 0.3, 0.5, 0.8] # coarse voxels for FPFH + RANSAC (multi-scale)
-RANSAC_RESTARTS = 3                # extra RANSAC runs per scale → more candidates to choose from
-RANSAC_ITERS = 500_000             # RANSAC iteration budget per scale
-FINE_VOXEL = 0.1                   # voxel for the final ICP refinement
-RERANK_DIST = FINE_VOXEL * 1.5     # inlier dist for fine-scale candidate scoring
-GRAVITY_TILT_MAX_DEG = 10.0        # reject candidates whose z-axis tilts more than this
+VOXEL_SIZES = [0.2, 0.3, 0.5, 0.8]  # coarse voxels for FPFH + RANSAC (multi-scale)
+RANSAC_RESTARTS = 3  # extra RANSAC runs per scale → more candidates to choose from
+RANSAC_ITERS = 500_000  # RANSAC iteration budget per scale
+FINE_VOXEL = 0.1  # voxel for the final ICP refinement
+RERANK_DIST = FINE_VOXEL * 1.5  # inlier dist for fine-scale candidate scoring
+GRAVITY_TILT_MAX_DEG = 10.0  # reject candidates whose z-axis tilts more than this
 
 
 def _preprocess(pcd: o3d.geometry.PointCloud, voxel_size: float):
     """Downsample, estimate normals, compute FPFH descriptors."""
     down = pcd.voxel_down_sample(voxel_size)
-    down.estimate_normals(
-        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30)
-    )
+    down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
     fpfh = _reg.compute_fpfh_feature(
         down,
         o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 5, max_nn=100),
@@ -184,6 +182,7 @@ def relocalize(
         sub.points = o3d.utility.Vector3dVector(np.asarray(cloud.points)[mask])
         sub.normals = o3d.utility.Vector3dVector(nrm[mask])
         return sub
+
     src_walls = _wall_subset(src_fine)
     tgt_walls = _wall_subset(tgt_fine)
 
