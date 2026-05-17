@@ -40,7 +40,7 @@ import open3d as o3d
 _reg = o3d.pipelines.registration
 
 # ---- Tuning knobs ----------------------------------------------------------
-VOXEL_SIZES = [0.2, 0.3, 0.5, 0.8]  # coarse voxels for FPFH + RANSAC (multi-scale)
+VOXEL_SIZES = [0.15, 0.2, 0.3, 0.5, 0.8]  # coarse voxels for FPFH + RANSAC (multi-scale)
 RANSAC_RESTARTS = 7  # extra RANSAC runs per scale → more candidates to choose from
 RANSAC_ITERS = 500_000  # RANSAC iteration budget per scale
 FINE_VOXEL = 0.1  # voxel for the final ICP refinement
