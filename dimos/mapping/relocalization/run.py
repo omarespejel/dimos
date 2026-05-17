@@ -38,9 +38,19 @@ The transform should map points in `local_map`'s (body) frame into
 
 from __future__ import annotations
 
+import os
+
+# Force single-threaded OpenMP BEFORE importing open3d, so RANSAC's
+# parallel sampling becomes deterministic. `o3d.utility.random.seed()`
+# alone is not enough — thread scheduling order is itself a source of
+# non-determinism even at a fixed RNG seed. Must be set before import.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+import multiprocessing as mp
 import pickle
 import random
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
@@ -52,10 +62,15 @@ DATA_DIR = Path(__file__).parent / "data"
 TIME_BUDGET_SEC = 300.0  # 5 minutes wall-clock for the entire run
 SUCCESS_T_M = 1.0        # success threshold: translation error < 1m
 SUCCESS_R_DEG = 15.0     # success threshold: rotation error < 15°
+NUM_WORKERS = min(4, os.cpu_count() or 1)  # eval frames in parallel
 
 RelocalizeFn = Callable[
     [o3d.geometry.PointCloud, o3d.geometry.PointCloud], np.ndarray
 ]
+
+# Inherited by fork-child workers (set in evaluate() before pool launch).
+_GLOBAL_MAP_PTS: np.ndarray | None = None
+_RELOCALIZE_FN: RelocalizeFn | None = None
 
 
 def _to_o3d_pcd(pts: np.ndarray) -> o3d.geometry.PointCloud:
