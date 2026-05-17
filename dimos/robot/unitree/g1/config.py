@@ -29,6 +29,11 @@ from dimos.utils.data import LfsPath
 # probably only needs to be regenerated on robots that are notably different than the g1 (the go2 in rage mode probably needs different local planning paths)
 G1_LOCAL_PLANNER_PRECOMPUTED_PATHS = LfsPath("unitree_g1_local_planner_precomputed_paths")
 
+# G1 pelvis stands 0.79 m above its feet (menagerie home keyframe). Used by
+# kinematic sims that render the base as `init_z + vehicle_height` so pairing
+# this with the scene's `floor_z` puts the feet on the floor.
+G1_PELVIS_HEIGHT = 0.79
+
 G1 = RobotConfig(
     name="unitree_g1",
     model_path=Path(__file__).parent / "g1.urdf",
