@@ -48,7 +48,6 @@ from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
 from dimos.msgs.nav_msgs.DynamicCloud import DynamicCloud
 from dimos.msgs.nav_msgs.GraphDelta3D import GraphDelta3D
-from dimos.navigation.nav_stack.frames import FRAME_MAP
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
@@ -230,7 +229,7 @@ def apply_closure_to_cloud(
 
 
 class ApplyClosureConfig(ModuleConfig):
-    world_frame: str = FRAME_MAP
+    world_frame: str = "map"
     # Log a one-line summary every time a correction is applied.
     log_each_apply: bool = True
 
