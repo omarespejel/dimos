@@ -54,3 +54,4 @@ ddc3eb6	0.9310	0.033	0.607	64.4	discard	drop yaw-flip variant; lost frame 2153 â
 6598f6e	1.0000	0.029	0.079	60.6	keep	55-frame baseline (exclude 1005/1507/2942); 1.0 success, median 0.029m
 75f0739	0.9636	0.029	0.365	36.7	discard	RANSAC restarts 7->3; -24s but lost frames 1292, 1435 (yaw flips)
 75d2ec4	0.9455	0.029	0.396	49.2	discard	RANSAC restarts 7->5; lost 3 frames (yaw flips, position drift)
+c8c9722	0.9636	0.029	0.370	56.5	discard	RANSAC restarts 7->6; lost 2 frames
