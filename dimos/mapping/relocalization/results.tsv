@@ -85,3 +85,4 @@ b965218	1.0000	0.028	0.087	53.7	keep	0.8m@1 (was 2); identical, 0.8m candidates 
 77a8833	0.9636	0.028	0.216	52.0	discard	0.3m@7; lost 2 frames - 0.3m needs all 8 restarts
 bd46ef5	0.9091	0.034	0.672	49.2	discard	0.3m -> 0.4m; lost 5 frames - 0.3m FPFH descriptors specifically needed
 7792600	1.0000	0.028	0.086	53.4	discard	ICP convergence 1e-5; median slightly worse
+475cde4	1.0000	0.037	0.091	53.7	discard	drop Tukey kernel from polish; median 0.028->0.037 (worse)
