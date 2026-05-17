@@ -237,7 +237,9 @@ class G1QuestTeleopConfig(QuestTeleopConfig):
     yaw_scale: float = 0.3
     strafe_scale: float = 0.3
     right_stick_mode: str = "yaw"
-    deadzone: float = 0.05
+    # Larger than the obvious 0.05 because Quest stick rest values often drift
+    # to ~0.10–0.15 — anything inside this radius is treated as neutral.
+    deadzone: float = 0.18
     workspace_scale: float = 0.7
     waist_offset: tuple[float, float, float] = (0.15, 0.0, 0.45)
     shoulder_y_correction: float = 0.08
@@ -359,7 +361,11 @@ class G1QuestTeleopModule(QuestTeleopModule):
             return 0.0 if abs(value) < self.config.deadzone else value
 
         if right is not None and right.thumbstick_press:
-            self.cmd_vel.publish(Twist.zero())
+            # E-stop: one zero Twist; let downstream re-arming come from a
+            # different source (Babylon WASD, etc.) without us spamming.
+            if self._cmd_vel_moving:
+                self.cmd_vel.publish(Twist.zero())
+                self._cmd_vel_moving = False
             return
 
         left_x = dz(left.thumbstick.x if left is not None else 0.0)
@@ -375,13 +381,22 @@ class G1QuestTeleopModule(QuestTeleopModule):
         else:
             yaw_rate = -right_x * self.config.yaw_scale
 
-        self.cmd_vel.publish(
-            Twist(
-                linear=Vector3(vx, vy, 0.0),
-                angular=Vector3(0.0, 0.0, yaw_rate),
-            )
-        )
         moving = abs(vx) > 0.0 or abs(vy) > 0.0 or abs(yaw_rate) > 0.0
+        # Only publish when there's something to publish (i.e. sticks
+        # actually outside the deadzone), OR on the one tick we transition
+        # from moving back to neutral so the robot gets a definitive stop.
+        # Otherwise we spam /g1/cmd_vel at the control-loop rate with zeros
+        # and clobber other cmd_vel sources (Babylon WASD, agent commands).
+        if moving:
+            self.cmd_vel.publish(
+                Twist(
+                    linear=Vector3(vx, vy, 0.0),
+                    angular=Vector3(0.0, 0.0, yaw_rate),
+                )
+            )
+        elif self._cmd_vel_moving:
+            self.cmd_vel.publish(Twist.zero())
+
         if moving != self._cmd_vel_moving:
             self._cmd_vel_moving = moving
             if moving:
