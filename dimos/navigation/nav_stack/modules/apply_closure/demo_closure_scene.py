@@ -223,6 +223,29 @@ def synthesize_closure_correction(drifted_poses: np.ndarray, true_poses: np.ndar
     return corrected
 
 
+def lerp_pose_arrays(A: np.ndarray, B: np.ndarray, alpha: float) -> np.ndarray:
+    """Per-node lerp/slerp between two pose arrays at fraction ``alpha``.
+
+    Translations are linearly interpolated; rotations use scipy's Slerp on
+    each pair of quaternions independently. Used to animate the closure
+    correction so we can watch the cloud snap from drifted to corrected.
+    """
+    n = A.shape[0]
+    R_A = Rotation.from_matrix(A[:, :3, :3])
+    R_B = Rotation.from_matrix(B[:, :3, :3])
+    out = np.empty_like(A)
+    for i in range(n):
+        key_R = Rotation.concatenate([R_A[i], R_B[i]])
+        slerp = Slerp([0.0, 1.0], key_R)
+        R_blend = slerp([alpha])[0]
+        t_blend = (1.0 - alpha) * A[i, :3, 3] + alpha * B[i, :3, 3]
+        T = np.eye(4)
+        T[:3, :3] = R_blend.as_matrix()
+        T[:3, 3] = t_blend
+        out[i] = T
+    return out
+
+
 def poses_to_path(times: np.ndarray, mats: np.ndarray) -> Path:
     poses: list[PoseStamped] = []
     for ts, T in zip(times, mats, strict=True):
@@ -371,16 +394,15 @@ def run_demo(spawn: bool, step_ms: int) -> None:
             time.sleep(step_ms / 1000.0)
         i += 1
 
-    # ----- after the loop: synthesize the closure correction and apply it -----
+    # ----- closure event: synthesize the target correction and apply it. -----
     rr.set_time("step", sequence=n)
     rr.set_time("sim_time", duration=float(times[-1] - times[0] + 1.0))
 
+    # The per-frame yellow points were temporary; clear them so the voxel
+    # global map is the dominant thing visible after the loop.
+    rr.log("world/observations/this_frame", rr.Clear(recursive=False))
+
     corrected_poses = synthesize_closure_correction(drifted_poses, true_poses)
-    rr.log(
-        "world/trajectory/corrected",
-        rr.LineStrips3D([corrected_poses[:, :3, 3]], colors=[(90, 140, 255)], radii=0.06),
-        static=True,
-    )
     rr.log(
         "world/closure/correction_arrows",
         rr.Arrows3D(
@@ -391,8 +413,8 @@ def run_demo(spawn: bool, step_ms: int) -> None:
         static=True,
     )
 
-    # Materialize the accumulated DynamicCloud (this is what the running
-    # system would have produced).
+    # Materialize the accumulated DynamicCloud — this is what the running
+    # system has produced just before the closure event fires.
     unique = np.array(sorted(voxel_to_idx, key=lambda k: voxel_to_idx[k]), dtype=np.int32)
     drifted_cloud = DynamicCloud(
         voxels=unique,
@@ -404,11 +426,35 @@ def run_demo(spawn: bool, step_ms: int) -> None:
         ts=float(times[-1]),
     )
     prev_graph = poses_to_path(times, drifted_poses)
-    next_graph = poses_to_path(times, corrected_poses)
-    corrected_cloud = apply_closure_to_cloud(drifted_cloud, prev_graph, next_graph)
 
+    # Snapshot the "before" state on the closure step so it's still visible
+    # if you scrub back here.
     log_voxels("world/global_map/drifted", drifted_cloud, (220, 70, 70), radii=0.10)
-    log_voxels("world/global_map/corrected", corrected_cloud, (60, 200, 80), radii=0.10)
+
+    # ----- animate the closure: ramp alpha 0→1 across N_ANIM frames, applying
+    # ApplyClosure each frame so the voxel map visibly snaps into place. -----
+    n_anim = 24
+    for j in range(n_anim + 1):
+        alpha = j / n_anim
+        rr.set_time("step", sequence=n + 1 + j)
+        rr.set_time("sim_time", duration=float(times[-1] - times[0] + 1.0 + alpha))
+
+        interp_poses = lerp_pose_arrays(drifted_poses, corrected_poses, alpha)
+        interp_graph = poses_to_path(times, interp_poses)
+        corrected_at_alpha = apply_closure_to_cloud(drifted_cloud, prev_graph, interp_graph)
+
+        log_voxels("world/global_map/corrected", corrected_at_alpha, (60, 200, 80), radii=0.10)
+        rr.log(
+            "world/trajectory/corrected",
+            rr.LineStrips3D([interp_poses[:, :3, 3]], colors=[(90, 140, 255)], radii=0.06),
+        )
+        if step_ms > 0:
+            time.sleep(step_ms / 1000.0)
+
+    # Final corrected cloud is whatever the last animation frame produced.
+    corrected_cloud = apply_closure_to_cloud(
+        drifted_cloud, prev_graph, poses_to_path(times, corrected_poses)
+    )
 
     # ----- metrics -----
     err_before = mean_nearest_distance(drifted_cloud.world_positions(), gt_points)
