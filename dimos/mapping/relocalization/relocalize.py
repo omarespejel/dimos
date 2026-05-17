@@ -169,23 +169,39 @@ def relocalize(
     upright = [T for T in candidates if _gravity_tilt_deg(T) <= GRAVITY_TILT_MAX_DEG]
     pool = upright if upright else candidates
 
-    # Stage 1: rank all candidates by fine-scale fitness (cheap correspondence
-    # accounting, no refinement). Keep top-5 only — promising ones to refine.
+    # Build WALL-ONLY clouds for scoring + polish. Floor/ceiling points have
+    # vertical normals; they fit equally well in any yaw rotation (flat planes
+    # are rotationally symmetric). Including them in scoring lets a 180°-flipped
+    # candidate hide its wall misalignment behind perfect floor alignment. The
+    # FULL clouds are still used for the final refinement, so the gravity
+    # anchor and inlier density are preserved in the output.
+    def _wall_subset(cloud: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
+        nrm = np.asarray(cloud.normals)
+        mask = np.abs(nrm[:, 2]) < 0.7  # roughly horizontal
+        if mask.sum() < 100:
+            return cloud  # too sparse → fall back to full cloud
+        sub = o3d.geometry.PointCloud()
+        sub.points = o3d.utility.Vector3dVector(np.asarray(cloud.points)[mask])
+        sub.normals = o3d.utility.Vector3dVector(nrm[mask])
+        return sub
+    src_walls = _wall_subset(src_fine)
+    tgt_walls = _wall_subset(tgt_fine)
+
+    # Stage 1: rank all candidates by WALL-only fine-scale fitness.
     def fine_fitness(T: np.ndarray) -> float:
-        r = _reg.evaluate_registration(src_fine, tgt_fine, RERANK_DIST, T)
+        r = _reg.evaluate_registration(src_walls, tgt_walls, RERANK_DIST, T)
         return float(r.fitness)
 
     top_k = sorted(pool, key=fine_fitness, reverse=True)[:10]
 
-    # Stage 2: run a moderate-distance ICP on each top-5 candidate (basin
-    # ≈ RERANK_DIST = 0.15m). A close-to-right candidate snaps to a tight
-    # local minimum; a wrong-room candidate makes no progress. Pick by
-    # post-refinement fitness, which is a much sharper signal than pre-ICP.
+    # Stage 2: run a moderate-distance ICP on each top-10 on WALL clouds.
+    # Wall correspondences drive yaw and xy; the rerank then picks the
+    # candidate whose walls actually align (not the one whose floors agree).
     polished: list[tuple[float, np.ndarray]] = []
     for T0 in top_k:
         r = _reg.registration_icp(
-            src_fine,
-            tgt_fine,
+            src_walls,
+            tgt_walls,
             RERANK_DIST,
             T0,
             _reg.TransformationEstimationPointToPlane(),
