@@ -111,7 +111,15 @@ def score_detected_loops(
     detected_pairs: list[tuple[int, int]],
     groundtruth: LoopGroundtruth,
 ) -> LoopMetrics:
-    """Score detected (query_id, candidate_id) pairs against groundtruth."""
+    """Score detected (query_id, candidate_id) pairs against groundtruth.
+
+    All three counts are query-level so precision/recall stay
+    dimensionally consistent. The "query" of a detected pair is the
+    later frame_id. A query contributes 1 TP if any of its detected
+    edges matched groundtruth, otherwise 1 FP. Duplicate detections
+    for the same query collapse. Match is order-agnostic — PGO may
+    report (target, source) or (source, target).
+    """
     seen_queries_with_hit: set[int] = set()
     seen_queries_without_hit: set[int] = set()
     queries_with_any_groundtruth = {

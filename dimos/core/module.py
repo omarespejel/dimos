@@ -123,12 +123,17 @@ class ModuleBase(Configurable, CompositeResource):
     _main_gen: AsyncGenerator[None, None] | None = None
     _tools: dict[str, Any]
     _tools_lock: threading.Lock
+    # Set by ModuleCoordinator after every module's start() has returned.
+    # Producers that publish into shared streams should await this before
+    # emitting their first message — see ModuleBase.wait_for_system_ready.
+    _system_ready: threading.Event
 
     def __init__(self, config_args: dict[str, Any]) -> None:
         super().__init__(**config_args)
         self._module_closed_lock = threading.Lock()
         self._tools = {}
         self._tools_lock = threading.Lock()
+        self._system_ready = threading.Event()
         self._loop, self._loop_thread = get_loop()
         try:
             self.rpc = self.config.rpc_transport(  # type: ignore[call-arg]
@@ -160,6 +165,23 @@ class ModuleBase(Configurable, CompositeResource):
         Has a very long timeout (24h) so long-running builds don't fail.
         Default is a no-op — override in subclasses that need a build step.
         """
+
+    async def wait_for_system_ready(self) -> None:
+        """Block until every module in the coordinator has finished start().
+
+        Producers (replay modules, sensor drivers, test playback) that emit
+        into shared streams should await this before their first publish, so
+        downstream subscribers (esp. native subprocesses) don't race-miss
+        early messages.
+        """
+        if self._system_ready.is_set():
+            return
+        await asyncio.to_thread(self._system_ready.wait)
+
+    @rpc
+    def on_system_ready(self) -> None:
+        """Coordinator hook: called once every module's start() has returned."""
+        self._system_ready.set()
 
     @rpc
     def start(self) -> None:
@@ -232,6 +254,7 @@ class ModuleBase(Configurable, CompositeResource):
         state.pop("_main_gen", None)
         state.pop("_tools", None)
         state.pop("_tools_lock", None)
+        state.pop("_system_ready", None)
         return state
 
     def __setstate__(self, state) -> None:  # type: ignore[no-untyped-def]
@@ -246,12 +269,16 @@ class ModuleBase(Configurable, CompositeResource):
         self._main_gen = None
         self._tools = {}
         self._tools_lock = threading.Lock()
+        self._system_ready = threading.Event()
+
+    _tf_lock: threading.Lock = threading.Lock()
 
     @property
     def tf(self):  # type: ignore[no-untyped-def]
         if self._tf is None:
-            # self._tf = self.config.tf_transport()
-            self._tf = LCMTF()
+            with self._tf_lock:
+                if self._tf is None:
+                    self._tf = LCMTF()
         return self._tf
 
     @tf.setter

@@ -47,7 +47,6 @@ class TopicCounterModule(Module):
 
     corrected_odometry: In[Odometry]
     global_map: In[PointCloud2]
-    corrected_tf: In[Odometry]
     pose_graph: In[Graph3D]
     loop_closure_event: In[GraphDelta3D]
 
@@ -56,7 +55,6 @@ class TopicCounterModule(Module):
         self._counts: dict[str, int] = {
             "corrected_odometry": 0,
             "global_map": 0,
-            "corrected_tf": 0,
             "pose_graph": 0,
             "loop_closure_event": 0,
         }
@@ -125,7 +123,6 @@ def main() -> None:
     for name in (
         "corrected_odometry",
         "global_map",
-        "corrected_tf",
         "pose_graph",
         "loop_closure_event",
     ):

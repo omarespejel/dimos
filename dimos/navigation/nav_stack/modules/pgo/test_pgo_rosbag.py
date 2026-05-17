@@ -46,18 +46,13 @@ POLL_INTERVAL_SEC = 0.25
 
 
 class PgoOutputCollectorModule(Module):
-    """Captures PGO's corrected_odometry, global_map, and corrected_tf streams."""
-
     corrected_odometry: In[Odometry]
     global_map: In[PointCloud2]
-    corrected_tf: In[Odometry]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._corrected_positions: list[list[float]] = []
         self._global_map_point_counts: list[int] = []
-        self._last_tf_translation: list[float] = [0.0, 0.0, 0.0]
-        self._tf_count: int = 0
 
     @rpc
     def start(self) -> None:
@@ -66,7 +61,6 @@ class PgoOutputCollectorModule(Module):
             Disposable(self.corrected_odometry.subscribe(self._on_corrected_odometry))
         )
         self.register_disposable(Disposable(self.global_map.subscribe(self._on_global_map)))
-        self.register_disposable(Disposable(self.corrected_tf.subscribe(self._on_corrected_tf)))
 
     def _on_corrected_odometry(self, message: Odometry) -> None:
         self._corrected_positions.append(
@@ -78,14 +72,6 @@ class PgoOutputCollectorModule(Module):
         if points is not None:
             self._global_map_point_counts.append(len(points))
 
-    def _on_corrected_tf(self, message: Odometry) -> None:
-        self._last_tf_translation = [
-            message.pose.position.x,
-            message.pose.position.y,
-            message.pose.position.z,
-        ]
-        self._tf_count += 1
-
     @rpc
     def corrected_positions(self) -> list[list[float]]:
         return list(self._corrected_positions)
@@ -93,14 +79,6 @@ class PgoOutputCollectorModule(Module):
     @rpc
     def global_map_point_counts(self) -> list[int]:
         return list(self._global_map_point_counts)
-
-    @rpc
-    def tf_count(self) -> int:
-        return self._tf_count
-
-    @rpc
-    def last_tf_translation(self) -> list[float]:
-        return list(self._last_tf_translation)
 
 
 class TestPGORosbag:
@@ -113,7 +91,6 @@ class TestPGORosbag:
         - PGO produces corrected odometry messages
         - Corrected odometry tracks the input trajectory (no wild divergence)
         - Global map is published with non-zero points
-        - TF corrections are published
         """
         window = load_rosbag_window()
         assert len(window.scans) > 0, "No scans in rosbag fixture"
@@ -145,12 +122,9 @@ class TestPGORosbag:
             time.sleep(POST_FEED_DRAIN_SEC)
             corrected_positions = np.array(collector.corrected_positions())
             global_map_point_counts = collector.global_map_point_counts()
-            tf_count = collector.tf_count()
-            last_tf_translation = collector.last_tf_translation()
         finally:
             coordinator.stop()
 
-        # -- Analysis --
         corrected_count = len(corrected_positions)
         global_map_count = len(global_map_point_counts)
 
@@ -160,11 +134,9 @@ class TestPGORosbag:
         logger.info(f"  Input odom messages:     {len(window.odom)}")
         logger.info(f"  Corrected odom outputs:  {corrected_count}")
         logger.info(f"  Global map outputs:      {global_map_count}")
-        logger.info(f"  TF outputs:              {tf_count}")
 
         assert corrected_count > 0, "PGO produced no corrected odometry"
         assert global_map_count > 0, "PGO produced no global map messages"
-        assert tf_count > 0, "PGO produced no TF messages"
 
         input_positions = window.odom[:, 1:4]
 
@@ -186,14 +158,10 @@ class TestPGORosbag:
         )
         last_map_points = global_map_point_counts[-1] if global_map_point_counts else 0
 
-        # TF should be near-identity for a short recording without loop closures.
-        tf_translation_norm = float(np.linalg.norm(last_tf_translation))
-
         logger.info(f"  Centroid error:           {centroid_error:.3f} m")
         logger.info(f"  Extent ratio (XY):        {extent_ratio_xy:.3f}")
         logger.info(f"  Mean global map points:   {mean_map_points:.0f}")
         logger.info(f"  Last global map points:   {last_map_points}")
-        logger.info(f"  Final TF translation:     {tf_translation_norm:.4f} m")
         logger.info(f"{'=' * 60}\n")
 
         assert centroid_error < 5.0, (

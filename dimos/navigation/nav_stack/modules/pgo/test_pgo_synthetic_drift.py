@@ -289,12 +289,14 @@ class SyntheticDriftPlaybackModule(Module):
                 body_points = _world_to_body(self._room_points, true_position, true_yaw)
                 world_points = _body_to_world(body_points, drifted_position, drifted_yaw)
                 scan_message = PointCloud2.from_numpy(
-                    world_points.astype(np.float32), frame_id="map", timestamp=timestamp
+                    world_points.astype(np.float32),
+                    frame_id="map",  # FIXME: this should be derived from something
+                    timestamp=timestamp,
                 )
                 odometry_message = Odometry(
                     ts=timestamp,
-                    frame_id="odom",
-                    child_frame_id="base_link",
+                    frame_id="odom",  # FIXME: this should be derived from something
+                    child_frame_id="base_link",  # FIXME: this should be derived from something
                     pose=_make_pose(
                         float(drifted_position[0]),
                         float(drifted_position[1]),

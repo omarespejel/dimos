@@ -28,6 +28,9 @@
 #include "geometry_msgs/PoseStamped.hpp"
 #include "geometry_msgs/Quaternion.hpp"
 #include "geometry_msgs/Point.hpp"
+#include "geometry_msgs/Transform.hpp"
+#include "geometry_msgs/TransformStamped.hpp"
+#include "tf2_msgs/TFMessage.hpp"
 
 static std::atomic<bool> g_running{true};
 static void signal_handler(int) { g_running.store(false); }
@@ -95,6 +98,40 @@ public:
         g_cloud_buffer.push(cloud_with_pose);
     }
 };
+
+static geometry_msgs::TransformStamped build_tf(const M3D& r, const V3D& t, double ts,
+                                                  const std::string& frame_id,
+                                                  const std::string& child_frame_id) {
+    geometry_msgs::TransformStamped ts_msg;
+    ts_msg.header = dimos::make_header(frame_id, ts);
+    ts_msg.child_frame_id = child_frame_id;
+    Eigen::Quaterniond q(r);
+    ts_msg.transform.translation.x = t.x();
+    ts_msg.transform.translation.y = t.y();
+    ts_msg.transform.translation.z = t.z();
+    ts_msg.transform.rotation.x = q.x();
+    ts_msg.transform.rotation.y = q.y();
+    ts_msg.transform.rotation.z = q.z();
+    ts_msg.transform.rotation.w = q.w();
+    return ts_msg;
+}
+
+static tf2_msgs::TFMessage build_tf_message(const M3D& correction_r,
+                                              const V3D& correction_t,
+                                              double ts,
+                                              const std::string& parent_frame,
+                                              const std::string& world_frame,
+                                              const std::string& local_frame) {
+    tf2_msgs::TFMessage msg;
+    // Identity anchor parent_frame -> world_frame.
+    msg.transforms.push_back(
+        build_tf(M3D::Identity(), V3D::Zero(), ts, parent_frame, world_frame));
+    // SLAM correction world_frame -> local_frame.
+    msg.transforms.push_back(
+        build_tf(correction_r, correction_t, ts, world_frame, local_frame));
+    msg.transforms_length = static_cast<int32_t>(msg.transforms.size());
+    return msg;
+}
 
 static nav_msgs::Odometry build_odometry(const M3D& r, const V3D& t, double ts,
                                           const std::string& frame_id,
@@ -209,7 +246,7 @@ int main(int argc, char** argv)
     std::string odom_topic = native_module.topic("odometry");
     std::string corrected_odom_topic = native_module.topic("corrected_odometry");
     std::string global_map_topic = native_module.topic("global_map");
-    std::string tf_topic = native_module.topic("corrected_tf");
+    std::string tf_channel = native_module.arg("tf_channel", "/tf#tf2_msgs.TFMessage");
     std::string pose_graph_topic = native_module.topic("pose_graph");
     std::string loop_closure_event_topic = native_module.topic("loop_closure_event");
 
@@ -232,8 +269,10 @@ int main(int argc, char** argv)
     config.scan_context_lidar_height_m = native_module.arg_float("scan_context_lidar_height_m", 2.0f);
 
     // Node-level config
+    std::string parent_frame = native_module.arg("parent_frame", "world");
     std::string world_frame = native_module.arg("world_frame", "map");
     std::string local_frame = native_module.arg("local_frame", "odom");
+    std::string body_frame = native_module.arg("body_frame", "base_link");
     float global_map_voxel_size = native_module.arg_float("global_map_voxel_size", 0.1f);
     float global_map_publish_rate = native_module.arg_float("global_map_publish_rate", 1.0f);
     double global_map_interval = global_map_publish_rate > 0
@@ -259,15 +298,32 @@ int main(int argc, char** argv)
     lcm.subscribe(odom_topic, &Handlers::on_odometry, &handlers);
     lcm.subscribe(scan_topic, &Handlers::on_registered_scan, &handlers);
 
+    // NativeModule.start() in Python reads stderr for this marker and only
+    // returns once it sees it. Without this, upstream publishers can race
+    // ahead and emit messages before our LCM subscriptions are live.
+    fprintf(stderr, "[DIMOS_NATIVE_READY]\n");
+    fflush(stderr);
+
     if (debug) {
         fprintf(stderr, "PGO native module started\n");
         fprintf(stderr, "  registered_scan: %s\n", scan_topic.c_str());
         fprintf(stderr, "  odometry: %s\n", odom_topic.c_str());
         fprintf(stderr, "  corrected_odometry: %s\n", corrected_odom_topic.c_str());
         fprintf(stderr, "  global_map: %s\n", global_map_topic.c_str());
-        fprintf(stderr, "  corrected_tf: %s\n", tf_topic.c_str());
+        fprintf(stderr, "  tf_channel: %s\n", tf_channel.c_str());
         fprintf(stderr, "  pose_graph: %s\n", pose_graph_topic.c_str());
         fprintf(stderr, "  loop_closure_event: %s\n", loop_closure_event_topic.c_str());
+    }
+    // Seed identity TF so consumers can query the chain before the first
+    // odom message arrives.
+    {
+        double seed_ts =
+            std::chrono::duration<double>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        auto seed = build_tf_message(M3D::Identity(), V3D::Zero(), seed_ts,
+                                     parent_frame, world_frame, local_frame);
+        lcm.publish(tf_channel, &seed);
     }
 
     double last_global_map_time = 0.0;
@@ -323,12 +379,12 @@ int main(int argc, char** argv)
             V3D corr_t = pgo.offsetR() * cloud_with_pose.pose.t + pgo.offsetT();
 
             nav_msgs::Odometry corrected = build_odometry(
-                corr_r, corr_t, cur_time, world_frame, "base_link");
+                corr_r, corr_t, cur_time, world_frame, body_frame);
             lcm.publish(corrected_odom_topic, &corrected);
 
-            nav_msgs::Odometry tf_msg = build_odometry(
-                pgo.offsetR(), pgo.offsetT(), cur_time, world_frame, local_frame);
-            lcm.publish(tf_topic, &tf_msg);
+            auto tf_msg = build_tf_message(
+                pgo.offsetR(), pgo.offsetT(), cur_time, parent_frame, world_frame, local_frame);
+            lcm.publish(tf_channel, &tf_msg);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(timer_period_ms));
             continue;
@@ -371,13 +427,12 @@ int main(int argc, char** argv)
         M3D corr_r = pgo.offsetR() * cloud_with_pose.pose.r;
         V3D corr_t = pgo.offsetR() * cloud_with_pose.pose.t + pgo.offsetT();
         nav_msgs::Odometry corrected = build_odometry(
-            corr_r, corr_t, cur_time, world_frame, "base_link");
+            corr_r, corr_t, cur_time, world_frame, body_frame);
         lcm.publish(corrected_odom_topic, &corrected);
 
-        // Publish TF correction (map -> odom offset)
-        nav_msgs::Odometry tf_msg = build_odometry(
-            pgo.offsetR(), pgo.offsetT(), cur_time, world_frame, local_frame);
-        lcm.publish(tf_topic, &tf_msg);
+        auto tf_msg = build_tf_message(
+            pgo.offsetR(), pgo.offsetT(), cur_time, parent_frame, world_frame, local_frame);
+        lcm.publish(tf_channel, &tf_msg);
 
         // Publish pose graph (on every keyframe — iSAM2 may have
         // re-optimized prior poses on loop closure).

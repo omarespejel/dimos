@@ -15,9 +15,6 @@
 """Module that streams a KITTI-360 sequence as scan + odometry messages.
 
 Pairs with any module satisfying ``LoopClosure``
-(see ``dimos/navigation/nav_stack/specs.py``); autoconnect wires the
-``registered_scan: In[PointCloud2]`` and ``odometry: In[Odometry]``
-streams by name.
 """
 
 from __future__ import annotations
@@ -25,7 +22,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -63,7 +59,7 @@ class Kitti360PlaybackModule(Module):
     odometry: Out[Odometry]
     corrected_odometry: In[Odometry]
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)
         self._frame_ids: list[int] = []
         self._send_timestamps: list[float] = []
@@ -96,6 +92,8 @@ class Kitti360PlaybackModule(Module):
         try:
             assert self._first_response_event is not None
             for index, frame_id in enumerate(self._frame_ids):
+                # scan_xyz is a blocking np.fromfile — push it to a thread so
+                # the event loop (and any concurrent RPC) keeps spinning.
                 scan_xyz = await asyncio.to_thread(self._sequence.scan_xyz, frame_id)
                 pose = self._sequence.lidar_pose(frame_id)
                 position = pose[:3, 3]
@@ -107,7 +105,8 @@ class Kitti360PlaybackModule(Module):
                 cloud_array = np.column_stack([world_xyz, scan_xyz[:, 3:4]]).astype(np.float32)
                 cloud_message = make_pointcloud_msg(cloud_array, ts=timestamp)
 
-                # Odometry first so the receiver can stash the latest pose before the matching scan arrives.
+                # Odometry first so the receiver can stash the latest pose
+                # before the matching scan arrives.
                 self.odometry.publish(odometry_message)
                 self.registered_scan.publish(cloud_message)
 

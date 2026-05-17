@@ -36,10 +36,14 @@ class FarPlannerConfig(NativeModuleConfig):
     build_command: str | None = (
         "nix build github:dimensionalOS/dimos-module-far-planner/v0.7.0 --no-write-lock-file"
     )
+    # The binary emits [DIMOS_NATIVE_READY] after LCM subscribes are live.
+    ready_timeout_sec: float = 10.0
 
-    # C++ binary uses snake_case CLI args.
+    # C++ binary uses snake_case CLI args. frame_id -> --world_frame maps
+    # the new Python builtin name back to the legacy C++ arg.
     cli_name_override: dict[str, str] = {
         "robot_dimension": "robot_dim",
+        "frame_id": "world_frame",
     }
 
     update_rate: float = 5.0
@@ -54,7 +58,7 @@ class FarPlannerConfig(NativeModuleConfig):
     is_multi_layer: bool = False
     is_debug_output: bool = False
     is_attempt_autoswitch: bool = True
-    world_frame: str = "map"
+    frame_id: str = "map"
 
     converge_dist: float = 1.5
     goal_adjust_radius: float = 10.0
