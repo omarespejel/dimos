@@ -197,7 +197,7 @@ class MarkerTfModuleConfig(ModuleConfig):
     marker_length_m: float = Field(
         ..., gt=0.0, description="Physical square marker edge length in meters."
     )
-    max_freq: float = 15.0
+    max_freq: float = 5.0
     tf_lookup_tolerance: float = 0.5
 
 
