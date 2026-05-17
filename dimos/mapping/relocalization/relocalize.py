@@ -175,7 +175,7 @@ def relocalize(
         r = _reg.evaluate_registration(src_fine, tgt_fine, RERANK_DIST, T)
         return float(r.fitness)
 
-    top_k = sorted(pool, key=fine_fitness, reverse=True)[:5]
+    top_k = sorted(pool, key=fine_fitness, reverse=True)[:10]
 
     # Stage 2: run a moderate-distance ICP on each top-5 candidate (basin
     # ≈ RERANK_DIST = 0.15m). A close-to-right candidate snaps to a tight
