@@ -606,4 +606,5 @@ ignore = [
     "dimos/manipulation/manipulation_module.py",
     "dimos/navigation/nav_stack/modules/*/main.cpp",
     "dimos/navigation/nav_stack/common/*.hpp",
+    "dimos/experimental/pimsim/module.py",
 ]
