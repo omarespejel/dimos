@@ -26,7 +26,6 @@
 #include "geometry_msgs/PoseStamped.hpp"
 #include "geometry_msgs/Quaternion.hpp"
 #include "geometry_msgs/Point.hpp"
-#include "std_msgs/String.hpp"
 
 static std::atomic<bool> g_running{true};
 static void signal_handler(int) { g_running.store(false); }
@@ -244,27 +243,6 @@ static nav_msgs::Path build_graph_edges(const std::vector<KeyPoseWithCloud>& key
     return msg;
 }
 
-class ReadyHandshake {
-public:
-    ReadyHandshake(lcm::LCM* lcm, const std::string& ready_topic)
-        : m_lcm(lcm), m_ready_topic(ready_topic) {}
-
-    void on_ping(const lcm::ReceiveBuffer*, const std::string&,
-                 const std_msgs::String* msg) {
-        static const std::string python_prefix = "python:";
-        if (msg->data.compare(0, python_prefix.size(), python_prefix) != 0) {
-            return;
-        }
-        std_msgs::String ack;
-        ack.data = "native:" + msg->data.substr(python_prefix.size());
-        m_lcm->publish(m_ready_topic, &ack);
-    }
-
-private:
-    lcm::LCM* m_lcm;
-    std::string m_ready_topic;
-};
-
 int main(int argc, char** argv)
 {
     signal(SIGTERM, signal_handler);
@@ -281,7 +259,6 @@ int main(int argc, char** argv)
     std::string graph_nodes_topic = native_module.topic("pose_graph_nodes");
     std::string graph_edges_topic = native_module.topic("pose_graph_edges");
     std::string loop_closure_topic = native_module.topic("loop_closure");
-    std::string ready_topic = native_module.topic("ready");
 
     // Config parameters
     Config config;
@@ -329,13 +306,6 @@ int main(int argc, char** argv)
     lcm.subscribe(odom_topic, &Handlers::on_odometry, &handlers);
     lcm.subscribe(scan_topic, &Handlers::on_registered_scan, &handlers);
 
-    // Startup handshake: Python publishes "python:{nonce}" repeatedly on the
-    // ``ready`` topic; we echo back "native:{nonce}". Python blocks its
-    // ``def start()`` until the ack lands, so any publishers wired to PGO's
-    // inputs don't race the LCM subscriptions above.
-    ReadyHandshake ready_handshake{&lcm, ready_topic};
-    lcm.subscribe(ready_topic, &ReadyHandshake::on_ping, &ready_handshake);
-
     if (debug) {
         fprintf(stderr, "PGO native module started\n");
         fprintf(stderr, "  registered_scan: %s\n", scan_topic.c_str());
@@ -346,7 +316,6 @@ int main(int argc, char** argv)
         fprintf(stderr, "  pose_graph_nodes: %s\n", graph_nodes_topic.c_str());
         fprintf(stderr, "  pose_graph_edges: %s\n", graph_edges_topic.c_str());
         fprintf(stderr, "  loop_closure: %s\n", loop_closure_topic.c_str());
-        fprintf(stderr, "  ready: %s\n", ready_topic.c_str());
     }
 
     double last_global_map_time = 0.0;

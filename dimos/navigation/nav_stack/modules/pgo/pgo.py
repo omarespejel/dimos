@@ -20,9 +20,7 @@ Uses GTSAM iSAM2 for pose graph optimization and PCL ICP for loop closure.
 from __future__ import annotations
 
 from pathlib import Path
-import threading
 import time
-import uuid
 
 from reactivex.disposable import Disposable
 
@@ -35,7 +33,6 @@ from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.nav_msgs.Path import Path as NavPath
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
-from dimos.msgs.std_msgs.String import String
 from dimos.navigation.nav_stack.frames import FRAME_MAP, FRAME_ODOM
 from dimos.utils.logging_config import setup_logger
 
@@ -96,16 +93,10 @@ class PGO(NativeModule):
     pose_graph_nodes: Out[NavPath]
     pose_graph_edges: Out[NavPath]
     loop_closure: Out[NavPath]
-    # Startup handshake — see _wait_for_native_ready().
-    ready: Out[String]
-
-    READY_HANDSHAKE_TIMEOUT_SEC = 30.0
-    READY_HANDSHAKE_PING_INTERVAL_SEC = 0.1
 
     @rpc
     def start(self) -> None:
         super().start()
-        self._wait_for_native_ready()
         self.register_disposable(
             Disposable(
                 self.corrected_tf.transport.subscribe(self._on_tf_correction, self.corrected_tf)
@@ -119,43 +110,6 @@ class PGO(NativeModule):
         )
         if self.config.debug:
             logger.info("PGO native module started (C++ iSAM2 + PCL ICP)")
-
-    def _wait_for_native_ready(self) -> None:
-        """Block until the C++ binary has subscribed to its LCM topics.
-
-        Subprocess.Popen returns as soon as the binary is launched, but
-        the C++ side needs ~100ms-2s to actually subscribe to LCM. If
-        any publisher (rosbag playback, KITTI360 playback, etc.) starts
-        firing during that window the messages are lost.
-
-        We do a ping/pong on the ``ready`` topic: Python publishes
-        ``python:{nonce}`` repeatedly; the C++ binary subscribes to
-        ``ready`` and responds with ``native:{nonce}`` once it sees the
-        ping. We block ``start()`` until the ack arrives.
-        """
-        nonce = uuid.uuid4().hex
-        expected_ack = f"native:{nonce}".encode()
-        ping = String(data=f"python:{nonce}")
-        acked = threading.Event()
-
-        def on_ready(message: String) -> None:
-            if message.data.encode() == expected_ack:
-                acked.set()
-
-        unsubscribe = self.ready.transport.subscribe(on_ready, self.ready)
-        try:
-            deadline = time.monotonic() + self.READY_HANDSHAKE_TIMEOUT_SEC
-            while not acked.is_set():
-                if time.monotonic() > deadline:
-                    raise RuntimeError(
-                        f"PGO native process did not ack ready handshake "
-                        f"within {self.READY_HANDSHAKE_TIMEOUT_SEC}s "
-                        f"(nonce={nonce})"
-                    )
-                self.ready.publish(ping)
-                acked.wait(timeout=self.READY_HANDSHAKE_PING_INTERVAL_SEC)
-        finally:
-            unsubscribe()
 
     @rpc
     def stop(self) -> None:
