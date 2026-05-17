@@ -168,20 +168,20 @@ def step_drift(
     noisy = body_step.copy()
     noisy[:3, :3] = R_bias @ noisy[:3, :3]
     noisy[:3, 3] += rng.normal(0.0, TRANSLATION_NOISE_STD, 3)
-    return prev_drifted @ noisy
+    return prev_drifted @ noisy  # type: ignore[no-any-return]
 
 
 def visible_points(true_pose: np.ndarray, gt_points: np.ndarray) -> np.ndarray:
     """Return GT points within ``LIDAR_MAX_RANGE`` of the pose origin."""
     origin = true_pose[:3, 3]
     d = np.linalg.norm(gt_points - origin, axis=1)
-    return gt_points[d <= LIDAR_MAX_RANGE]
+    return gt_points[d <= LIDAR_MAX_RANGE]  # type: ignore[no-any-return]
 
 
 def apply_delta(delta: np.ndarray, points: np.ndarray) -> np.ndarray:
     """Apply a 4x4 transform to (M, 3) points."""
     homog = np.concatenate([points, np.ones((points.shape[0], 1))], axis=1)
-    return (homog @ delta.T)[:, :3]
+    return (homog @ delta.T)[:, :3]  # type: ignore[no-any-return]
 
 
 def synthesize_closure_correction(drifted_poses: np.ndarray, true_poses: np.ndarray) -> np.ndarray:
@@ -301,7 +301,7 @@ def mean_nearest_distance(cloud_points: np.ndarray, target_points: np.ndarray) -
         block = cloud_points[i : i + chunk]
         d2 = ((block[:, None, :] - target_points[None, :, :]) ** 2).sum(axis=2)
         total += float(np.sqrt(d2.min(axis=1)).sum())
-    return total / cloud_points.shape[0]
+    return total / cloud_points.shape[0]  # type: ignore[no-any-return]
 
 
 def run_demo(spawn: bool, step_ms: int) -> None:

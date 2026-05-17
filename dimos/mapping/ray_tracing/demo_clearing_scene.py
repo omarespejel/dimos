@@ -168,7 +168,7 @@ def _occluded_by_box(origin: np.ndarray, targets: np.ndarray) -> np.ndarray:
     # The box is in front of the target if it enters at t < 1, after the
     # origin (t > 0). A 1e-4 margin keeps box-surface points themselves
     # from being flagged as occluded.
-    return hits_box & (t_enter > 1e-4) & (t_enter < 1.0 - 1e-4)
+    return hits_box & (t_enter > 1e-4) & (t_enter < 1.0 - 1e-4)  # type: ignore[no-any-return]
 
 
 def _occluded_by_person(origin: np.ndarray, targets: np.ndarray, person_y: float) -> np.ndarray:
@@ -191,7 +191,7 @@ def _occluded_by_person(origin: np.ndarray, targets: np.ndarray, person_y: float
     inside_person = (
         (np.abs(y_at - person_y) < PERSON_HALF_WIDTH) & (z_at >= 0.0) & (z_at < PERSON_HEIGHT)
     )
-    return crosses_in_front & inside_person
+    return crosses_in_front & inside_person  # type: ignore[no-any-return]
 
 
 def _visible_points(person_y: float | None) -> np.ndarray:
@@ -208,16 +208,16 @@ def _visible_points(person_y: float | None) -> np.ndarray:
     box_occ_wall = _occluded_by_box(SENSOR_ORIGIN, wall)
 
     if person_y is None:
-        return np.concatenate([floor[~box_occ_floor], wall[~box_occ_wall], box], axis=0).astype(
-            np.float32
-        )
+        return np.concatenate(  # type: ignore[no-any-return]
+            [floor[~box_occ_floor], wall[~box_occ_wall], box], axis=0
+        ).astype(np.float32)
 
     person_occ_floor = _occluded_by_person(SENSOR_ORIGIN, floor, person_y)
     person_occ_wall = _occluded_by_person(SENSOR_ORIGIN, wall, person_y)
     person_occ_box = _occluded_by_person(SENSOR_ORIGIN, box, person_y)
 
     person = _person_points(person_y)
-    return np.concatenate(
+    return np.concatenate(  # type: ignore[no-any-return]
         [
             floor[~(box_occ_floor | person_occ_floor)],
             wall[~(box_occ_wall | person_occ_wall)],

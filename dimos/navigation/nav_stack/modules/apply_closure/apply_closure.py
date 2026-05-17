@@ -109,7 +109,7 @@ def _dedupe_times(times: np.ndarray) -> np.ndarray:
     for i in range(1, out.size):
         if out[i] <= out[i - 1]:
             out[i] = out[i - 1] + _TIME_DEDUP_EPS
-    return out
+    return out  # type: ignore[no-any-return]
 
 
 def lbs_warp_positions(
@@ -143,7 +143,7 @@ def lbs_warp_positions(
         homog = np.concatenate(
             [positions, np.ones((positions.shape[0], 1), dtype=positions.dtype)], axis=1
         )
-        return (homog @ delta.T)[:, :3]
+        return (homog @ delta.T)[:, :3]  # type: ignore[no-any-return]
 
     node_times_safe = _dedupe_times(node_times)
     clipped = np.clip(position_times, node_times_safe[0], node_times_safe[-1])
@@ -158,7 +158,7 @@ def lbs_warp_positions(
     tz = np.interp(clipped, node_times_safe, node_t[:, 2])
     translation = np.stack([tx, ty, tz], axis=1)
 
-    return point_R.apply(positions.astype(np.float64)) + translation
+    return point_R.apply(positions.astype(np.float64)) + translation  # type: ignore[no-any-return]
 
 
 def merge_duplicate_voxels(
