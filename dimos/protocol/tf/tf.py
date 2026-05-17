@@ -18,6 +18,7 @@ from abc import abstractmethod
 from collections import deque
 from dataclasses import field
 from functools import reduce
+import time
 
 from dimos.memory.timeseries.inmemory import InMemoryStore
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
@@ -141,6 +142,13 @@ class MultiTBuffer:
         time_point: float | None = None,
         time_tolerance: float | None = None,
     ) -> Transform | None:
+        if parent_frame == child_frame:
+            return Transform(
+                frame_id=parent_frame,
+                child_frame_id=child_frame,
+                ts=time_point if time_point is not None else time.time(),
+            )
+
         # Check forward direction
         key = (parent_frame, child_frame)
         if key in self.buffers:

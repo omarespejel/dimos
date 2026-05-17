@@ -60,8 +60,8 @@ unitree_go2_markers = autoconnect(
 ).global_config(n_workers=11, robot_model="unitree_go2")
 
 unitree_go2_memory = autoconnect(
-    unitree_go2,
+    unitree_go2_markers,
     Go2Memory.blueprint(),
-).global_config(n_workers=11)
+).global_config(n_workers=12)
 
 __all__ = ["unitree_go2", "unitree_go2_markers", "unitree_go2_memory"]
