@@ -79,100 +79,144 @@ def _to_o3d_pcd(pts: np.ndarray) -> o3d.geometry.PointCloud:
     return pcd
 
 
-def _load_data() -> tuple[o3d.geometry.PointCloud, list[dict]]:
-    if not (DATA_DIR / "global_map.npy").exists():
-        raise FileNotFoundError(
-            f"Missing {DATA_DIR / 'global_map.npy'}. "
-            "Run `uv run python -m dimos.mapping.prepare` to generate the data files."
-        )
-    if not (DATA_DIR / "test_frames.pkl").exists():
-        raise FileNotFoundError(
-            f"Missing {DATA_DIR / 'test_frames.pkl'}. "
-            "Run `uv run python -m dimos.mapping.prepare` to generate the data files."
-        )
-    global_map_pts = np.load(DATA_DIR / "global_map.npy")
-    global_map = _to_o3d_pcd(global_map_pts)
-    test_frames = pickle.loads((DATA_DIR / "test_frames.pkl").read_bytes())
-    return global_map, test_frames
+def _eval_one_frame(frame: dict) -> dict:
+    """Worker: evaluate a single frame. Runs in a fork-child process.
+
+    Inherits ``_GLOBAL_MAP_PTS`` and ``_RELOCALIZE_FN`` from the parent
+    via fork. Returns a flat dict (picklable) — no Open3D objects cross
+    the process boundary.
+    """
+    seed = int(frame["frame_idx"])
+    o3d.utility.random.seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    global_map = _to_o3d_pcd(_GLOBAL_MAP_PTS)
+    local_map = _to_o3d_pcd(frame["body_pts"])
+
+    t_call = time.perf_counter()
+    try:
+        T = _RELOCALIZE_FN(global_map, local_map)
+    except Exception as e:  # noqa: BLE001
+        return {
+            "frame_idx": int(frame["frame_idx"]),
+            "status": "crashed",
+            "error": repr(e),
+            "dt": 0.0,
+        }
+    dt = time.perf_counter() - t_call
+
+    T = np.asarray(T, dtype=np.float64)
+    if T.shape != (4, 4):
+        return {
+            "frame_idx": int(frame["frame_idx"]),
+            "status": "bad_shape",
+            "shape": tuple(T.shape),
+            "dt": dt,
+        }
+
+    gt_R = np.asarray(frame["gt_R"], dtype=np.float64)
+    gt_t = np.asarray(frame["gt_t"], dtype=np.float64)
+    err_t = float(np.linalg.norm(T[:3, 3] - gt_t))
+    err_r = float(Rotation.from_matrix(T[:3, :3] @ gt_R.T).magnitude() * 180.0 / np.pi)
+    return {
+        "frame_idx": int(frame["frame_idx"]),
+        "status": "ok",
+        "err_t": err_t,
+        "err_r": err_r,
+        "dt": dt,
+    }
 
 
 def evaluate(relocalize_fn: RelocalizeFn) -> dict:
     """Run ``relocalize_fn`` on the test set under a fixed 5-minute budget.
 
-    Prints a summary block and returns the same metrics as a dict.
-    The text label rows printed are stable and grep-friendly:
+    Evaluates frames in parallel across ``NUM_WORKERS`` fork-child
+    processes (each child runs single-threaded RANSAC — see
+    ``OMP_NUM_THREADS`` above — and reseeds RNGs from ``frame_idx`` so
+    per-frame results are reproducible). Prints a summary block and
+    returns the same metrics as a dict. Grep-friendly label rows:
         ``^average_distance:``  ``^median_distance:``  ``^success_rate:``
         ``^total_seconds:``  ``^num_frames_done:``  ``^num_frames_total:``
         ``^all_distances:``  ``^all_rotations:``
     """
-    global_map, test_frames = _load_data()
-    # Deterministic eval order: same prefix evaluated even when the time
-    # budget cuts a run short.
+    global _GLOBAL_MAP_PTS, _RELOCALIZE_FN
+    for fname in ("global_map.npy", "test_frames.pkl"):
+        if not (DATA_DIR / fname).exists():
+            raise FileNotFoundError(
+                f"Missing {DATA_DIR / fname}. "
+                "Run `uv run python -m dimos.mapping.prepare` to generate the data files."
+            )
+    global_map_pts = np.load(DATA_DIR / "global_map.npy")
+    test_frames = pickle.loads((DATA_DIR / "test_frames.pkl").read_bytes())
+    # Deterministic eval order: same frame_idx → same seed → same result,
+    # regardless of which worker happens to pick it up.
     test_frames = sorted(test_frames, key=lambda f: f["frame_idx"])
+
+    _GLOBAL_MAP_PTS = global_map_pts
+    _RELOCALIZE_FN = relocalize_fn
+
     print(
-        f"[run] global_map={len(global_map.points)} pts, "
-        f"test_frames={len(test_frames)}, time_budget={TIME_BUDGET_SEC:.0f}s"
+        f"[run] global_map={len(global_map_pts)} pts, "
+        f"test_frames={len(test_frames)}, workers={NUM_WORKERS}, "
+        f"time_budget={TIME_BUDGET_SEC:.0f}s"
     )
 
     t_start = time.perf_counter()
+    results: dict[int, dict] = {}
+
+    # fork keeps `_GLOBAL_MAP_PTS` and `_RELOCALIZE_FN` available in the
+    # children without IPC. Required: parent must not have touched any
+    # Open3D thread pool that doesn't survive fork (we set OMP=1, so OK).
+    ctx = mp.get_context("fork")
+    pool = ProcessPoolExecutor(max_workers=NUM_WORKERS, mp_context=ctx)
+    try:
+        futures = {pool.submit(_eval_one_frame, f): int(f["frame_idx"]) for f in test_frames}
+        try:
+            for future in as_completed(futures, timeout=TIME_BUDGET_SEC):
+                r = future.result()
+                results[r["frame_idx"]] = r
+                if r["status"] == "ok":
+                    print(
+                        f"[run] frame {r['frame_idx']:>5}: "
+                        f"err_t={r['err_t']:7.3f}m  err_r={r['err_r']:6.1f}°  "
+                        f"({r['dt']:.2f}s)"
+                    )
+                elif r["status"] == "crashed":
+                    print(f"[run] frame {r['frame_idx']}: relocalize() raised {r['error']}, skipping")
+                else:  # bad_shape
+                    print(
+                        f"[run] frame {r['frame_idx']}: relocalize() returned shape "
+                        f"{r['shape']}, expected (4, 4) — skipping"
+                    )
+        except TimeoutError:
+            done = len(results)
+            print(
+                f"[run] time budget exceeded after {done}/{len(test_frames)} frames "
+                f"({time.perf_counter() - t_start:.1f}s)"
+            )
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    t_end = time.perf_counter()
+
+    # Reassemble in frame_idx order so all_distances / all_rotations are
+    # stable across runs even though completion order isn't.
     distances: list[float] = []
     rotations: list[float] = []
     per_call_times: list[float] = []
     crashed: list[int] = []
+    for f in test_frames:
+        r = results.get(int(f["frame_idx"]))
+        if r is None:
+            continue  # never finished (budget killed)
+        if r["status"] == "ok":
+            distances.append(r["err_t"])
+            rotations.append(r["err_r"])
+            per_call_times.append(r["dt"])
+        else:
+            crashed.append(r["frame_idx"])
 
-    for i, frame in enumerate(test_frames):
-        elapsed = time.perf_counter() - t_start
-        if elapsed > TIME_BUDGET_SEC:
-            print(
-                f"[run] time budget exceeded after {i}/{len(test_frames)} frames "
-                f"({elapsed:.1f}s)"
-            )
-            break
-
-        local_map = _to_o3d_pcd(frame["body_pts"])
-        gt_R = np.asarray(frame["gt_R"], dtype=np.float64)
-        gt_t = np.asarray(frame["gt_t"], dtype=np.float64)
-
-        # Reseed every stochastic source the agent could possibly touch,
-        # before every frame, so two runs of the same relocalize.py
-        # produce identical metrics. The agent's signal is then pure
-        # algorithm delta, not RNG luck.
-        seed = int(frame["frame_idx"])
-        o3d.utility.random.seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-
-        t_call = time.perf_counter()
-        try:
-            T = relocalize_fn(global_map, local_map)
-        except Exception as e:  # noqa: BLE001
-            print(f"[run] frame {frame['frame_idx']}: relocalize() raised {e!r}, skipping")
-            crashed.append(frame["frame_idx"])
-            continue
-        dt = time.perf_counter() - t_call
-        per_call_times.append(dt)
-
-        T = np.asarray(T, dtype=np.float64)
-        if T.shape != (4, 4):
-            print(
-                f"[run] frame {frame['frame_idx']}: relocalize() returned shape "
-                f"{T.shape}, expected (4, 4) — skipping"
-            )
-            crashed.append(frame["frame_idx"])
-            continue
-
-        reg_R = T[:3, :3]
-        reg_t = T[:3, 3]
-        err_t = float(np.linalg.norm(reg_t - gt_t))
-        err_r = float(Rotation.from_matrix(reg_R @ gt_R.T).magnitude() * 180.0 / np.pi)
-        distances.append(err_t)
-        rotations.append(err_r)
-        print(
-            f"[run] frame {frame['frame_idx']:>5} ({i+1}/{len(test_frames)}): "
-            f"err_t={err_t:7.3f}m  err_r={err_r:6.1f}°  ({dt:.2f}s)"
-        )
-
-    t_end = time.perf_counter()
     distances_arr = np.array(distances) if distances else np.array([])
     rotations_arr = np.array(rotations) if rotations else np.array([])
     ok = (
