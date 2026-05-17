@@ -209,7 +209,20 @@ def create_nav_stack(
     if use_tare:
         modules.append(TarePlanner.blueprint(**(tare_planner or {})))
     if use_ray_tracing:
-        modules.append(RayTracingVoxelMap.blueprint(**(ray_tracing or {})))
+        modules.append(
+            RayTracingVoxelMap.blueprint(**(ray_tracing or {})).remappings(
+                [
+                    # Use the deskewed, world-frame scan that PGO/FastLio publishes
+                    # rather than the raw sensor frames.
+                    (RayTracingVoxelMap, "lidar", "registered_scan"),
+                    # ApplyClosure publishes the warped map on ``corrected_global_map``;
+                    # feeding it into ``map_override`` snaps the ray-tracer's internal
+                    # voxel state to the post-closure map so future scans accumulate
+                    # on top of the corrected world.
+                    (RayTracingVoxelMap, "map_override", "corrected_global_map"),
+                ]
+            )
+        )
     if use_apply_closure:
         # ApplyClosure transitively imports GraphDelta3D → Graph3D. Defer the
         # import so callers that explicitly disable apply_closure don't hit

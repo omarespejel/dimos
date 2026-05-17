@@ -34,6 +34,7 @@ from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
 from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+from dimos.msgs.nav_msgs.DynamicCloud import DynamicCloud
 from dimos.msgs.nav_msgs.Path import Path
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.utils.logging_config import setup_logger
@@ -312,7 +313,7 @@ class SimplePlanner(Module):
 
     config: SimplePlannerConfig
 
-    terrain_map_ext: In[PointCloud2]
+    global_map: In[DynamicCloud]
     terrain_map: In[PointCloud2]
     goal: In[PointStamped]
     stop_movement: In[Bool]
@@ -365,9 +366,7 @@ class SimplePlanner(Module):
         super().start()
         self.register_disposable(Disposable(self.goal.subscribe(self._on_goal)))
         self.register_disposable(Disposable(self.stop_movement.subscribe(self._on_stop_movement)))
-        self.register_disposable(
-            Disposable(self.terrain_map_ext.subscribe(self._on_terrain_map_ext))
-        )
+        self.register_disposable(Disposable(self.global_map.subscribe(self._on_global_map)))
         self.register_disposable(Disposable(self.terrain_map.subscribe(self._on_terrain_map)))
         self._running = True
         self._thread = threading.Thread(target=self._planning_loop, daemon=True)
@@ -520,16 +519,17 @@ class SimplePlanner(Module):
             inflation_radius=self.config.inflation_radius,
         )
 
-    def _on_terrain_map_ext(self, msg: PointCloud2) -> None:
-        """Rebuild the costmap from scratch using the persistent world view.
+    def _on_global_map(self, msg: DynamicCloud) -> None:
+        """Rebuild the costmap from scratch using the persistent voxel world.
 
-        ``terrain_map_ext`` applies a decay window (8 s by default) on
-        the producer side, so each message represents the current world
-        state. Resetting here prevents stale obstacles from piling up
-        forever.
+        ``global_map`` is the DynamicCloud produced by the ray-tracing voxel
+        map (post-closure-correction via ApplyClosure). Each message is
+        authoritative for the current world state, so the costmap is rebuilt
+        from scratch rather than accumulated — that way obstacles cleared by
+        raycasting on the producer side don't linger here.
         """
-        points, _ = msg.as_numpy()
-        if points is None or len(points) == 0:
+        points = msg.world_positions()
+        if len(points) == 0:
             return
         new_cm = self._fresh_costmap()
         self._classify_points(points, new_cm)
@@ -539,8 +539,8 @@ class SimplePlanner(Module):
     def _on_terrain_map(self, msg: PointCloud2) -> None:
         """Layer fresh local terrain on top of the current costmap.
 
-        ``terrain_map`` is faster than ``terrain_map_ext`` so dynamic obstacles
-        appear here first; additions are wiped on the next ``terrain_map_ext`` rebuild.
+        ``terrain_map`` is faster than ``global_map`` so dynamic obstacles
+        appear here first; additions are wiped on the next ``global_map`` rebuild.
         """
         points, _ = msg.as_numpy()
         if points is None or len(points) == 0:
