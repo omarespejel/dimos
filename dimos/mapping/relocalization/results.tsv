@@ -80,3 +80,4 @@ d50b94f	0.9455	0.029	0.407	54.9	discard	FPFH radius voxel*5 -> voxel*4; lost 3 f
 1353587	1.0000	0.028	0.087	54.2	keep	0.8m@4 (was 8); same accuracy, -1.3s — coarse scale needs fewer restarts
 3ad7718	1.0000	0.028	0.087	53.9	keep	0.8m@3 (was 4); identical all_distances, -0.3s
 ef3f830	1.0000	0.028	0.087	53.9	keep	0.8m@2 (was 3); identical, no time change but no regression
+b965218	1.0000	0.028	0.087	53.7	keep	0.8m@1 (was 2); identical, 0.8m candidates never win rerank on this dataset
