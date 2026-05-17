@@ -262,6 +262,9 @@ class G1QuestTeleopModule(QuestTeleopModule):
         self._have_head = False
         self._have_left = False
         self._have_right = False
+        # Track engage transitions so we log the state change exactly once and
+        # the operator can confirm the X+A handshake worked.
+        self._arms_engaged_state = False
 
         self._state_lock = threading.Lock()
         self._latest_arm_q: np.ndarray | None = None
@@ -379,7 +382,14 @@ class G1QuestTeleopModule(QuestTeleopModule):
         left: QuestControllerState | None,
         right: QuestControllerState | None,
     ) -> None:
-        if not self._arms_engaged(left, right):
+        engaged = self._arms_engaged(left, right)
+        if engaged != self._arms_engaged_state:
+            self._arms_engaged_state = engaged
+            if engaged:
+                logger.info("G1 Quest arms engaged (X+A held)")
+            else:
+                logger.info("G1 Quest arms disengaged")
+        if not engaged:
             return
         if self._ik is None:
             try:
