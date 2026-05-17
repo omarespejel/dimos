@@ -40,8 +40,13 @@ import open3d as o3d
 _reg = o3d.pipelines.registration
 
 # ---- Tuning knobs ----------------------------------------------------------
-VOXEL_SIZES = [0.2, 0.3, 0.8]  # coarse voxels for FPFH + RANSAC (multi-scale)
-RANSAC_RESTARTS = 7  # extra RANSAC runs per scale → more candidates to choose from
+# (voxel_size, total RANSAC runs at that scale). 0.8m is the coarsest, cheapest
+# scale; it provides anchor candidates that don't need as many restarts.
+SCALE_PLAN: list[tuple[float, int]] = [
+    (0.2, 8),
+    (0.3, 8),
+    (0.8, 4),
+]
 RANSAC_ITERS = 500_000  # RANSAC iteration budget per scale
 FINE_VOXEL = 0.1  # voxel for the final ICP refinement
 RERANK_DIST = FINE_VOXEL * 1.5  # inlier dist for fine-scale candidate scoring
@@ -139,10 +144,10 @@ def relocalize(
     tgt_fine = _global_fine(global_map, FINE_VOXEL)
 
     candidates: list[np.ndarray] = []  # 4x4 transforms
-    for vs in VOXEL_SIZES:
+    for vs, n_runs in SCALE_PLAN:
         src_down, src_fpfh = _preprocess(local_map, vs)
         tgt_down, tgt_fpfh = _global_preprocess(global_map, vs)
-        for _ in range(1 + RANSAC_RESTARTS):
+        for _ in range(n_runs):
             # Successive calls advance Open3D's RNG state (seeded per-frame in
             # run.py), so each restart explores a different sample sequence.
             result = _ransac(src_down, tgt_down, src_fpfh, tgt_fpfh, vs)
