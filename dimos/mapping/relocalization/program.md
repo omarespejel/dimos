@@ -110,8 +110,19 @@ equal-or-better results is a win on its own.
 
 Always begin by running `run.py` against an unmodified `relocalize.py` to
 establish a baseline. The shipped baseline (multi-scale FPFH+RANSAC + ICP
-+ gravity prior) gets roughly `success_rate ≈ 0.45` (9/20 frames),
-`median_distance ≈ 1.07m`, `average_distance ≈ 4.36m` on this dataset.
++ gravity prior) gets `success_rate ≈ 0.25` (5/20 frames),
+`median_distance ≈ 5.51m`, `average_distance ≈ 7.30m` in ~45s on this
+dataset. Eval is deterministic, so this exact baseline reproduces on
+every run.
+
+### Parallelism
+
+`run.py` evaluates frames in parallel across 4 fork-child workers. Each
+worker is **pinned to single-threaded execution** (`OMP_NUM_THREADS=1`
+is set before Open3D import) so RANSAC sampling is reproducible. Do not
+spawn threads/processes inside `relocalize()`; you'll just contend for
+the same cores the harness already saturates. Your function should
+behave as if it owns one CPU.
 
 ## `relocalize()` signature contract
 
@@ -179,9 +190,9 @@ Example:
 
 ```
 commit	success_rate	median_distance	average_distance	total_seconds	status	description
-a1b2c3d	0.4500	1.073	4.359	64.4	keep	baseline multi-scale ransac
-b2c3d4e	0.6000	0.812	3.110	240.3	keep	added FGR + filter ICP at 0.2
-c3d4e5f	0.4000	1.450	5.220	298.0	discard	dropped FGR (made it worse)
+a1b2c3d	0.2500	5.514	7.305	45.1	keep	baseline multi-scale ransac
+b2c3d4e	0.4500	1.073	4.359	120.2	keep	tighter edge-length checker + 2x RANSAC iters
+c3d4e5f	0.4000	1.450	5.220	150.0	discard	dropped FGR (made it worse)
 d4e5f6g	0.0	0.0	0.0	0.0	crash	teaser++ import (not installed)
 ```
 
