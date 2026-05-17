@@ -1,114 +1,241 @@
-# autoresearch
+# Autoresearch: relocalization
 
-This is an experiment to have the LLM do its own research.
+Have the LLM iteratively improve a point-cloud relocalization algorithm.
+
+## Task
+
+Given a global indoor 3D map and a local body-frame submap (pose cleared),
+estimate the rigid transform that places the local submap into the global
+map's world frame. This is the kidnapped-robot global relocalization problem.
+
+The dataset is 20 pre-built test centers from a Unitree Go2 lidar log
+(`go2_hongkong_office.db`) with PGO-corrected groundtruth poses.
 
 ## Setup
 
-To set up a new experiment, work with the user to:
+1. **Agree on a run tag** with the user (e.g. `mar5`). The branch
+   `autoresearch/<tag>` must not already exist.
+2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current
+   master.
+3. **Read the in-scope files** (full paths, repo-relative):
+   - `dimos/mapping/relocalization/program.md` — this file.
+   - `dimos/mapping/relocalization/relocalize.py` — **the only file you modify**. Defines
+     `relocalize(global_map, local_map) -> 4x4 numpy.ndarray`. Calls
+     `evaluate()` from run.py at the bottom.
+   - `dimos/mapping/relocalization/run.py` — **READ ONLY.** Fixed evaluation harness,
+     data loading, success thresholds, time budget enforcement.
+4. **Verify data exists**: `dimos/mapping/relocalization/data/global_map.npy` and
+   `dimos/mapping/relocalization/data/test_frames.pkl` must be present. If
+   missing, ask the human — the data was generated from upstream PGO assets
+   that aren't included in this repo.
+5. **Initialize `dimos/mapping/relocalization/results.tsv`** with just the header row.
+   The baseline numbers will be recorded after the first run. Do **not**
+   commit this file — keep it untracked.
+6. **Confirm setup looks good** with the user, then start the loop.
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+## File layout
 
-Once you get confirmation, kick off the experimentation.
+```
+dimos/mapping/relocalization/
+├── program.md                  this file
+├── relocalize.py               MODIFIABLE — agent edits here
+├── run.py                      read-only harness
+├── results.tsv                 your experiment log (gitignored)
+└── data/
+    ├── global_map.npy          (N, 3) float32, PGO two-pass global map
+    └── test_frames.pkl         list[dict] — 20 test centers with body
+                                submap + SLERP-PGO groundtruth pose
+```
 
 ## Experimentation
 
-Relocalization script runs for a **fixed time budget of 5 minutes** (wall clock, excluding startup). You launch it simply as: `uv run relocalize.py`.
+Each run has a **fixed 5-minute wall-clock budget** (enforced inside
+`run.py`). Launch it as:
 
-**What you CAN do:**
-- Modify `relocalize.py` — this is the only file you edit. Everything is fair game: architecture, optimizer, hyperparameters, training loop, batch size, etc.
+```
+uv run dimos/mapping/relocalization/relocalize.py > dimos/mapping/relocalization/run.log 2>&1
+```
 
-TODO: insert docs links f
+Do **not** use `tee`. Redirect stdout+stderr to `run.log`. Don't let the
+script output flood your context.
 
-**What you CANNOT do:**
-- Modify `run.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+### What you CAN do
 
-**The goal is simple: get the best relocalization match, in shortest time.** (prioritize relocalization quality to a reasonable degree here) Since the time budget is fixed, you don't need to worry about time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+- Modify `dimos/mapping/relocalization/relocalize.py`. Anything in there is fair game:
+  voxel sizes, descriptor choice, RANSAC params, multi-restart, multi-scale,
+  ICP variants, candidate pruning, alternative algorithms (FGR, etc.). The
+  function signature `relocalize(global_map, local_map) -> 4x4 ndarray`
+  must stay.
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+### What you CANNOT do
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+- Modify `run.py` or anything in `data/`. The evaluation
+  function, success thresholds (1m / 15°), and time budget are fixed.
+- Add new package dependencies. Use only what's already in
+  `pyproject.toml` (notably `open3d`, `numpy`, `scipy`).
+- Pre-compute results outside `relocalize()` (e.g. caching the global
+  map's FPFH features across calls is fine *within one run*; the
+  evaluator instantiates fresh state per process).
+
+### Goal
+
+Minimize **`average_distance`** (mean per-frame translation error in
+meters) across the 20 test frames, within the 5-minute total budget.
+Lower is better. Secondary signal: **`success_rate`** (fraction of frames
+within 1m translation AND 15° rotation of groundtruth).
+
+### Simplicity criterion
+
+All else being equal, simpler is better. A 0.01m improvement that adds
+30 lines of duct tape isn't worth it. Removing complexity and getting
+equal-or-better results is a win on its own.
+
+### First run
+
+Always begin by running `relocalize.py` unchanged to establish a baseline.
+The shipped baseline (multi-scale FPFH+RANSAC + ICP + gravity prior) gets
+roughly `average_distance ≈ 8m` / `success_rate ≈ 0.3` on this dataset.
+
+## `relocalize()` signature contract
+
+```python
+def relocalize(
+    global_map: open3d.geometry.PointCloud,   # target, in world frame
+    local_map:  open3d.geometry.PointCloud,   # source, in body frame
+) -> numpy.ndarray:                            # shape (4, 4), homogeneous
+    ...
+```
+
+The returned 4x4 matrix `T` must transform body-frame points to world-frame:
+`world = T @ [body; 1]`. If your code returns a wrong shape or raises, the
+evaluator logs `crash` and skips that frame.
+
+The function may take seconds per call — that's expected. The 5-minute
+budget covers *all* 20 calls; if it expires mid-run, the evaluator stops
+and reports metrics over whatever frames completed. So you can also
+spend more time per frame at the cost of fewer frames evaluated; the
+average is over those completed.
 
 ## Output format
 
-Once the script finishes it prints a summary like this:
+After the run, `run.py` prints a summary block:
 
 ```
 ---
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+average_distance:    8.142347
+median_distance:     6.886670
+average_rotation:    78.51
+success_rate:        0.3000
+total_seconds:       20.0
+avg_call_seconds:    1.00
+num_frames_done:     20
+num_frames_total:    20
+num_crashed:         0
+all_distances:       [15.477, 0.255, ...]
+all_rotations:       [95.8, 4.2, ...]
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+Extract the headline metric:
 
 ```
-grep "^val_bpb:" run.log
+grep "^average_distance:" dimos/mapping/relocalization/run.log
 ```
 
 ## Logging results
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
-
-The TSV has a header row and 5 columns:
+After each run, append one TSV row to `dimos/mapping/relocalization/results.tsv`
+(tab-separated; commas occur inside descriptions and will break CSV):
 
 ```
-commit	val_bpb	memory_gb	status	description
+commit	average_distance	success_rate	total_seconds	status	description
 ```
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+1. git commit hash (7 chars)
+2. `average_distance` (e.g. `5.234`) — `0.000000` for crashes
+3. `success_rate` (e.g. `0.45`) — `0.0` for crashes
+4. `total_seconds` (e.g. `289.4`) — `0.0` for crashes
+5. status: `keep`, `discard`, or `crash`
+6. short text description of what was tried
 
 Example:
 
 ```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+commit	average_distance	success_rate	total_seconds	status	description
+a1b2c3d	8.142347	0.3000	20.0	keep	baseline multi-scale ransac
+b2c3d4e	6.523000	0.4500	240.3	keep	added FGR + filter ICP at 0.2
+c3d4e5f	7.891000	0.3500	298.0	discard	dropped FGR (made it worse)
+d4e5f6g	0.000000	0.0	0.0	crash	teaser++ import (not installed)
 ```
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
-
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. Inspect git state — which branch + commit you're on.
+2. Edit `relocalize.py` with one experimental idea. Keep changes focused.
+3. `git add dimos/mapping/relocalization/relocalize.py && git commit -m "<idea>"`
+4. Run: `uv run dimos/mapping/relocalization/relocalize.py > dimos/mapping/relocalization/run.log 2>&1`
+5. Pull the metric: `grep "^average_distance:\|^success_rate:" dimos/mapping/relocalization/run.log`
+6. If the grep is empty, the run crashed. `tail -n 50 dimos/mapping/relocalization/run.log`
+   to read the traceback and try to fix.
+7. Append a row to `results.tsv`.
+8. If `average_distance` improved, **advance** — keep the commit.
+9. If equal or worse, `git reset --hard HEAD~1` and try a different idea.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+**Timeout:** Each run should finish in ~5 minutes (enforced inside run.py).
+If a run exceeds 10 minutes wall-clock (e.g. you accidentally disabled the
+budget), kill it and treat as failure.
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+**Crashes:** If the crash is dumb (typo, missing import you can fix
+without adding a dependency), fix and re-run. If the idea is fundamentally
+broken (e.g. needs a non-installed package), log `crash` and move on.
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+**NEVER STOP**: once the loop has begun, do **not** pause to ask the human
+whether to continue. The user may be asleep. You are autonomous. If you
+run out of ideas, re-read this file, re-read `relocalize.py`, re-read the
+Open3D docs linked below, look for combinations of previous near-misses,
+or try a more radical change (different solver, different descriptor,
+multi-restart, candidate re-ranking). The loop runs until manually
+interrupted.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+## References
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+Open3D point-cloud registration:
+
+- **RANSAC with feature matching** (the baseline's core call):
+  https://www.open3d.org/docs/latest/python_api/open3d.registration.registration_ransac_based_on_feature_matching.html
+- **Global registration tutorial** (FPFH preprocessing, RANSAC, FGR, ICP refinement):
+  https://www.open3d.org/docs/release/tutorial/pipelines/global_registration.html
+- **ICP variants** (point-to-point, point-to-plane, generalized ICP / GICP):
+  https://www.open3d.org/docs/latest/python_api/open3d.pipelines.registration.registration_icp.html
+- **FPFH feature**:
+  https://www.open3d.org/docs/latest/python_api/open3d.pipelines.registration.compute_fpfh_feature.html
+- **FGR (Fast Global Registration)**:
+  https://www.open3d.org/docs/release/python_api/open3d.pipelines.registration.registration_fgr_based_on_feature_matching.html
+
+Failure modes you'll likely see on this dataset:
+
+- **180° yaw flips** — the office has corridor symmetry. RANSAC happily
+  matches walls running in either direction.
+- **Wrong-room matches** — repetitive layout means FPFH descriptors
+  aren't globally unique.
+- **High RANSAC fitness paired with low ICP fitness at fine scale** —
+  coarse-scale "perfect match" collapses to <5% inliers at 2cm. Use
+  fine-ICP fitness (or stricter inlier ratio) for candidate ranking
+  rather than RANSAC's own fitness.
+
+Ideas worth trying (not exhaustive):
+
+- Multi-restart RANSAC with different seeds; rank by ICP fitness at a tight
+  threshold rather than by RANSAC's report.
+- FGR alone or in parallel with RANSAC; pick best by ICP fitness.
+- Tighter / looser `CorrespondenceCheckerBasedOnEdgeLength`.
+- Reject obviously-wrong yaws via a gravity / ground-plane prior
+  (currently a simple z-tilt filter — could be tightened).
+- Pre-extract a single set of FPFH features on `global_map` and cache it
+  in a module-level variable so repeat calls are cheaper. (Within one
+  process; new runs always re-import.)
+- Different voxel sizes for the FPFH/RANSAC stage vs ICP refinement.
+- Increase RANSAC iterations (currently 500k).
+- Different `ransac_n` (3 vs 4).
+- Different ICP variants (point-to-plane, generalized ICP, colored ICP).
