@@ -58,10 +58,6 @@ from dimos.navigation.nav_stack.modules.apply_closure.apply_closure import (
     apply_closure_to_cloud,
 )
 
-# ---------------------------------------------------------------------------
-# Scene geometry: a 20m × 20m room with four interior columns
-# ---------------------------------------------------------------------------
-
 ROOM_SIZE = 20.0
 WALL_HEIGHT = 3.0
 COLUMN_RADIUS = 0.4
@@ -117,10 +113,6 @@ def build_ground_truth() -> np.ndarray:
     return np.concatenate([walls, columns], axis=0)
 
 
-# ---------------------------------------------------------------------------
-# Trajectory: a closed rectangle ~2m inside the walls
-# ---------------------------------------------------------------------------
-
 PATH_INSET = 2.0
 KEYFRAMES_PER_SIDE = 12  # 48 keyframes total around the perimeter
 
@@ -158,10 +150,6 @@ def build_true_poses() -> tuple[np.ndarray, np.ndarray]:
     return times, poses
 
 
-# ---------------------------------------------------------------------------
-# Drift, observations, and per-step helpers
-# ---------------------------------------------------------------------------
-
 YAW_BIAS_PER_STEP_DEG = 0.35
 TRANSLATION_NOISE_STD = 0.02  # m per step
 LIDAR_MAX_RANGE = 6.0
@@ -193,14 +181,12 @@ def apply_delta(delta: np.ndarray, points: np.ndarray) -> np.ndarray:
     return (homog @ delta.T)[:, :3]
 
 
-# ---------------------------------------------------------------------------
-# Pose-graph "loop closure": blend drifted toward true, linearly along the
-# trajectory. In real life this is what GTSAM+ICP produces after the closing
-# edge nails the endpoint to the start.
-# ---------------------------------------------------------------------------
-
-
 def synthesize_closure_correction(drifted_poses: np.ndarray, true_poses: np.ndarray) -> np.ndarray:
+    """Blend drifted toward true linearly along the trajectory.
+
+    Mimics what GTSAM + ICP produces after the closing edge nails the endpoint
+    back to the start: alpha = i / (N-1), slerp on rotation, lerp on translation.
+    """
     n = drifted_poses.shape[0]
     corrected = np.empty_like(drifted_poses)
     alphas = np.linspace(0.0, 1.0, n)
@@ -261,11 +247,6 @@ def poses_to_path(times: np.ndarray, mats: np.ndarray) -> Path:
     return Path(ts=float(times[-1]), frame_id="map", poses=poses)
 
 
-# ---------------------------------------------------------------------------
-# Rerun logging helpers
-# ---------------------------------------------------------------------------
-
-
 def log_pose_arrow(name: str, T: np.ndarray, color: tuple[int, int, int]) -> None:
     origin = T[:3, 3]
     forward = T[:3, :3] @ np.array([0.6, 0.0, 0.0])
@@ -285,11 +266,6 @@ def log_voxels(
     rr.log(name, rr.Points3D(pts, colors=[color], radii=r))
 
 
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-
 def mean_nearest_distance(cloud_points: np.ndarray, target_points: np.ndarray) -> float:
     """Mean nearest-neighbor distance from cloud_points to target_points."""
     if cloud_points.shape[0] == 0 or target_points.shape[0] == 0:
@@ -303,15 +279,9 @@ def mean_nearest_distance(cloud_points: np.ndarray, target_points: np.ndarray) -
     return total / cloud_points.shape[0]
 
 
-# ---------------------------------------------------------------------------
-# Main streaming demo
-# ---------------------------------------------------------------------------
-
-
 def run_demo(spawn: bool, step_ms: int) -> None:
     rr.init("apply_closure_demo", spawn=spawn)
 
-    # ----- static layers -----
     gt_points = build_ground_truth()
     rr.log(
         "world/ground_truth",
@@ -327,7 +297,7 @@ def run_demo(spawn: bool, step_ms: int) -> None:
         static=True,
     )
 
-    # ----- streaming state, built up step by step inside the while loop -----
+    # Streaming state built up step by step inside the while loop below.
     rng = np.random.default_rng(7)
     drifted_poses = np.empty_like(true_poses)
     drifted_poses[0] = true_poses[0]
@@ -343,7 +313,7 @@ def run_demo(spawn: bool, step_ms: int) -> None:
         rr.set_time("step", sequence=i)
         rr.set_time("sim_time", duration=float(times[i] - times[0]))
 
-        # 1. drifted pose: identity at i=0, accumulate noisy body steps otherwise
+        # Drifted pose: identity at i=0, accumulate noisy body steps otherwise.
         if i > 0:
             body_step = np.linalg.inv(true_poses[i - 1]) @ true_poses[i]
             drifted_poses[i] = step_drift(drifted_poses[i - 1], body_step, rng)
@@ -351,9 +321,9 @@ def run_demo(spawn: bool, step_ms: int) -> None:
         true_T = true_poses[i]
         drifted_T = drifted_poses[i]
 
-        # 2. visible GT points from the TRUE pose (what the robot actually sees);
-        #    project into world using the DRIFTED pose (what the robot thinks);
-        #    voxelize and accumulate.
+        # Visible GT points from the TRUE pose (what the robot actually sees);
+        # project into world using the DRIFTED pose (what the robot thinks);
+        # voxelize and accumulate.
         seen = visible_points(true_T, gt_points)
         log_pose_arrow("world/pose/true", true_T, (60, 200, 80))
         log_pose_arrow("world/pose/drifted", drifted_T, (220, 70, 70))
@@ -394,7 +364,7 @@ def run_demo(spawn: bool, step_ms: int) -> None:
             time.sleep(step_ms / 1000.0)
         i += 1
 
-    # ----- closure event: synthesize the target correction and apply it. -----
+    # Closure event: synthesize the target correction and apply it.
     rr.set_time("step", sequence=n)
     rr.set_time("sim_time", duration=float(times[-1] - times[0] + 1.0))
 
@@ -431,8 +401,8 @@ def run_demo(spawn: bool, step_ms: int) -> None:
     # if you scrub back here.
     log_voxels("world/global_map/drifted", drifted_cloud, (220, 70, 70), radii=0.10)
 
-    # ----- animate the closure: ramp alpha 0→1 across N_ANIM frames, applying
-    # ApplyClosure each frame so the voxel map visibly snaps into place. -----
+    # Animate the closure: ramp alpha 0→1 across n_anim frames, applying
+    # ApplyClosure each frame so the voxel map visibly snaps into place.
     n_anim = 24
     for j in range(n_anim + 1):
         alpha = j / n_anim
@@ -456,7 +426,6 @@ def run_demo(spawn: bool, step_ms: int) -> None:
         drifted_cloud, prev_graph, poses_to_path(times, corrected_poses)
     )
 
-    # ----- metrics -----
     err_before = mean_nearest_distance(drifted_cloud.world_positions(), gt_points)
     err_after = mean_nearest_distance(corrected_cloud.world_positions(), gt_points)
     endpoint_drift = float(np.linalg.norm(drifted_poses[-1, :3, 3] - true_poses[0, :3, 3]))
