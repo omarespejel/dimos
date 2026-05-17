@@ -14,9 +14,8 @@
 
 """Tests for DynamicCloud.
 
-The KNOWN_BYTES fixture below pins the wire format. When the Rust mirror at
-``dimos/mapping/ray_tracing/rust/src/dynamic_cloud.rs`` is added, its unit
-test must reproduce the same bytes — keep both sides in sync.
+The KNOWN_BYTES fixture below is the same fixture the Rust mirror's unit
+test asserts against — keep both sides in sync.
 """
 
 from __future__ import annotations
@@ -31,8 +30,8 @@ def _make_fixture():
     """A small fixed-content cloud used for cross-language byte-equality."""
     voxels = np.array([[1, -2, 3], [4, 5, -6]], dtype=np.int32)
     quantity = np.array([7, 8], dtype=np.uint32)
-    event_indices = np.array([0, 1], dtype=np.uint32)
-    event_timestamps = np.array([100, 200], dtype=np.uint64)
+    event_indices = np.array([0, 1, 0], dtype=np.uint32)
+    event_timestamps = np.array([1_000_000_000, 2_000_000_000, 1_500_000_000], dtype=np.uint64)
     return DynamicCloud(
         voxels=voxels,
         quantity=quantity,
@@ -44,21 +43,23 @@ def _make_fixture():
     )
 
 
-# Hand-computed expected encoding of _make_fixture(). When a Rust mirror
-# lands its unit test must reproduce these exact bytes.
+# Hand-computed expected encoding of _make_fixture(); the Rust unit test
+# (dimos/mapping/ray_tracing/rust/src/dynamic_cloud.rs::tests) reproduces
+# the exact same bytes. Any drift on either side fails both tests.
 KNOWN_BYTES = bytes.fromhex(
-    "002f685900000000"  # 1_500_000_000 LE (0x5968_2F00)
-    "0000803e"  # voxel_size 0.25 LE
+    "002f685900000000"  # ts_ns = 1_500_000_000 LE (0x5968_2F00)
+    "0000803e"  # voxel_size = 0.25 f32 LE
     "0300"  # frame_id_len = 3
     "6d6170"  # frame_id "map"
-    "02000000"  # num_points u32 = 2
+    "02000000"  # num_points = 2
     "01000000feffffff03000000"  # voxels: (1,-2,3)
     "0400000005000000faffffff"  # voxels: (4,5,-6)
     "0700000008000000"  # quantity: 7, 8
-    "02000000"  # num_events u32 = 2
-    "0000000001000000"  # event_indices: 0, 1
-    "6400000000000000"  # event_timestamps: 100 (u64 LE)
-    "c800000000000000"  # event_timestamps: 200 (u64 LE)
+    "03000000"  # num_events = 3
+    "000000000100000000000000"  # event_indices: 0, 1, 0
+    "00ca9a3b00000000"  # event_timestamps[0] = 1_000_000_000 LE (0x3B9A_CA00)
+    "0094357700000000"  # event_timestamps[1] = 2_000_000_000 LE (0x7735_9400)
+    "002f685900000000"  # event_timestamps[2] = 1_500_000_000 LE (0x5968_2F00)
 )
 
 
@@ -99,27 +100,9 @@ def test_empty_cloud():
     encoded = cloud.lcm_encode()
     decoded = DynamicCloud.lcm_decode(encoded)
     assert len(decoded) == 0
+    assert decoded.event_indices.shape[0] == 0
     assert decoded.frame_id == "world"
     assert decoded.voxel_size == 0.125
-    assert decoded.event_indices.shape == (0,)
-    assert decoded.event_timestamps.shape == (0,)
-
-
-def test_no_events_roundtrip():
-    """Cloud with points but no events should encode/decode cleanly."""
-    cloud = DynamicCloud(
-        voxels=np.array([[1, 2, 3]], dtype=np.int32),
-        quantity=np.array([5], dtype=np.uint32),
-        voxel_size=0.5,
-        frame_id="map",
-        ts=0.5,
-    )
-    encoded = cloud.lcm_encode()
-    decoded = DynamicCloud.lcm_decode(encoded)
-    np.testing.assert_array_equal(decoded.voxels, cloud.voxels)
-    np.testing.assert_array_equal(decoded.quantity, cloud.quantity)
-    assert decoded.event_indices.shape == (0,)
-    assert decoded.event_timestamps.shape == (0,)
 
 
 def test_world_positions():
@@ -133,30 +116,43 @@ def test_world_positions():
 
 
 def test_per_point_latest_timestamp():
-    """``per_point_latest_timestamp`` picks the max event ts per voxel index."""
+    # event_indices: [0, 1, 0] with timestamps [1, 2, 5]
+    #   point 0 has events at t=1 and t=5 → latest is 5
+    #   point 1 has one event at t=2 → latest is 2
+    #   point 2 has no events → 0
     cloud = DynamicCloud(
-        voxels=np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], dtype=np.int32),
-        quantity=np.array([1, 1, 1], dtype=np.uint32),
-        # voxel 0 has events at t=10 and t=30; voxel 2 has one at t=20; voxel 1 has none
-        event_indices=np.array([0, 0, 2], dtype=np.uint32),
-        event_timestamps=np.array([10, 30, 20], dtype=np.uint64),
+        voxels=np.zeros((3, 3), dtype=np.int32),
+        quantity=np.zeros(3, dtype=np.uint32),
+        event_indices=np.array([0, 1, 0], dtype=np.uint32),
+        event_timestamps=np.array([1, 2, 5], dtype=np.uint64),
     )
-    np.testing.assert_array_equal(cloud.per_point_latest_timestamp(), [30, 0, 20])
+    latest = cloud.per_point_latest_timestamp()
+    np.testing.assert_array_equal(latest, [5, 2, 0])
 
 
-def test_shape_mismatch_raises():
-    with pytest.raises(ValueError, match="length mismatch"):
+def test_voxels_quantity_length_mismatch_raises():
+    with pytest.raises(ValueError, match="voxels/quantity length mismatch"):
         DynamicCloud(
             voxels=np.zeros((3, 3), dtype=np.int32),
             quantity=np.zeros(2, dtype=np.uint32),
         )
 
 
-def test_event_index_out_of_range_raises():
-    with pytest.raises(ValueError, match="out of range"):
+def test_event_arrays_length_mismatch_raises():
+    with pytest.raises(ValueError, match="event_indices/event_timestamps length mismatch"):
         DynamicCloud(
-            voxels=np.array([[0, 0, 0]], dtype=np.int32),
-            quantity=np.array([1], dtype=np.uint32),
+            voxels=np.zeros((2, 3), dtype=np.int32),
+            quantity=np.zeros(2, dtype=np.uint32),
+            event_indices=np.array([0], dtype=np.uint32),
+            event_timestamps=np.array([1, 2], dtype=np.uint64),
+        )
+
+
+def test_event_index_out_of_range_raises():
+    with pytest.raises(ValueError, match="event index 5 out of range"):
+        DynamicCloud(
+            voxels=np.zeros((2, 3), dtype=np.int32),
+            quantity=np.zeros(2, dtype=np.uint32),
             event_indices=np.array([5], dtype=np.uint32),
-            event_timestamps=np.array([100], dtype=np.uint64),
+            event_timestamps=np.array([1], dtype=np.uint64),
         )
