@@ -44,3 +44,4 @@ a935b4b	0.9000	0.036	1.086	84.7	discard	FINE_VOXEL 0.1->0.05; denser cloud shift
 bc5c53c	0.8448	0.033	1.134	64.4	discard	consensus selection over polished top-10; cluster picked wrong pose on 5 frames
 9e9f242	0.9483	0.033	0.538	64.5	discard	edge-length 0.9 -> 0.85; tied success+median, swapped 2942 fixed for 2153 broken; tertiary timing noise
 7cc5ecf	0.9138	0.034	0.855	80.2	discard	combo edge 0.85 + iters 1M; broke 1292, 1579, 2153 — interactions bad
+48f77b2	0.9483	0.033	0.663	68.7	discard	FGR-per-scale candidate aug; tied success+median, +3s; FGR candidates lost in rerank
