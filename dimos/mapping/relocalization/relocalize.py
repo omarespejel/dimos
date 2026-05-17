@@ -150,6 +150,21 @@ def relocalize(
             result = _ransac(src_down, tgt_down, src_fpfh, tgt_fpfh, vs)
             candidates.append(np.asarray(result.transformation))
 
+    # Centroid-aware yaw flip: for every candidate, add the variant where the
+    # body cloud is rotated 180° around its OWN xy-centroid (not body origin).
+    # A naive `T @ Rz_180` rotates around body origin, which moves the entire
+    # cloud across the world when lidar coverage isn't centered on the robot.
+    # Rotating around the cloud centroid keeps the flipped cloud in the same
+    # approximate world location — the right reading of "same place, opposite
+    # heading" for an indoor submap.
+    src_pts = np.asarray(src_fine.points)
+    c_body = np.array([src_pts[:, 0].mean(), src_pts[:, 1].mean(), 0.0])
+    rz180 = np.diag([-1.0, -1.0, 1.0])
+    t_body_flip = np.eye(4)
+    t_body_flip[:3, :3] = rz180
+    t_body_flip[:3, 3] = c_body - rz180 @ c_body  # = (2*Cx, 2*Cy, 0)
+    candidates = candidates + [T @ t_body_flip for T in candidates]
+
     # Gravity filter; fall back to all if everything is tilted (degenerate clouds).
     upright = [T for T in candidates if _gravity_tilt_deg(T) <= GRAVITY_TILT_MAX_DEG]
     pool = upright if upright else candidates
