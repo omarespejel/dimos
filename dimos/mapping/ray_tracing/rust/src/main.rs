@@ -256,10 +256,8 @@ fn walk_ray(
     );
     let shadow_sq = shadow_depth.max(0.0).powi(2);
 
-    // FIXME: I don't know if we really need this
-    let max_iter = 4096;
     let mut past_endpoint = false;
-    for _ in 0..max_iter {
+    loop {
         if tx < ty {
             if tx < tz {
                 x += step_x;
@@ -276,14 +274,12 @@ fn walk_ray(
             tz += dt_z;
         }
 
-        // FIXME: I don't like how this is written, come back and change this.
-        // It would be more clear to do this in two loops, one for the normal tracing
-        // and a second for the shadow clearing
         if (x, y, z) == endpoint {
             past_endpoint = true;
             continue;
         }
 
+        // continue past the endpoint and in to the shadow realm
         if past_endpoint {
             let cx = x as f32 * voxel_size + half;
             let cy = y as f32 * voxel_size + half;
