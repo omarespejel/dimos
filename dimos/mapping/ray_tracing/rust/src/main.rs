@@ -325,6 +325,11 @@ fn extract_xyz(msg: &PointCloud2) -> Result<Vec<(f32, f32, f32)>, ExtractError> 
             "data buffer shorter than width*height*point_step",
         ));
     }
+    if xo + 4 > step || yo + 4 > step || zo + 4 > step {
+        return Err(ExtractError(
+            "xyz field offsets do not fit within point_step",
+        ));
+    }
     if msg.is_bigendian {
         return Err(ExtractError("big-endian point data not supported"));
     }
