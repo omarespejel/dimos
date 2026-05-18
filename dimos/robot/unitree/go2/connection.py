@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from enum import Enum
-from importlib.resources import as_file as _resource_as_file, files as _resource_files
+from importlib import resources
 import sys
 from threading import Thread
 import time
@@ -84,13 +84,13 @@ class Go2ConnectionProtocol(Protocol):
     def publish_request(self, topic: str, data: dict) -> dict: ...  # type: ignore[type-arg]
 
 
-_FRONT_CAMERA_720_YAML = _resource_files("dimos.robot.unitree.go2").joinpath(
+_FRONT_CAMERA_720_YAML = resources.files("dimos.robot.unitree.go2").joinpath(
     "front_camera_720.yaml"
 )
 
 
 def _camera_info_static() -> CameraInfo:
-    with _resource_as_file(_FRONT_CAMERA_720_YAML) as yaml_path:
+    with resources.as_file(_FRONT_CAMERA_720_YAML) as yaml_path:
         return CameraInfo.from_yaml(str(yaml_path))
 
 
