@@ -64,4 +64,4 @@ mid360_fastlio_ray_trace = autoconnect(
             },
         },
     ),
-).global_config(n_workers=3, robot_model="mid360_fastlio2_ray_trace")
+).global_config(n_workers=5, robot_model="mid360_fastlio2_ray_trace")
