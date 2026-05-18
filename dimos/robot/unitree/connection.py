@@ -450,9 +450,4 @@ class UnitreeWebRTCConnection(Resource):
 
         if hasattr(self, "thread") and self.thread.is_alive():
             self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-            self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
             self.loop.call_soon_threadsafe(self.loop.stop)
-
-        if hasattr(self, "thread") and self.thread.is_alive():
-            self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-            self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
