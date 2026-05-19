@@ -22,6 +22,11 @@ pub struct Config {
     pub max_correspondence_distance: f64,
     pub transform_epsilon: f64,
     pub min_correspondences: usize,
+    /// Initial alignment transform applied to the source cloud before the
+    /// iteration loop starts. Defaults to identity. The PGO loop search seeds
+    /// this from the scan-context column-shift's implied yaw rotation, which
+    /// dramatically improves convergence on revisits at different headings.
+    pub initial_transform: Isometry3<f64>,
 }
 
 impl Default for Config {
@@ -31,6 +36,7 @@ impl Default for Config {
             max_correspondence_distance: 10.0,
             transform_epsilon: 1e-6,
             min_correspondences: 10,
+            initial_transform: Isometry3::identity(),
         }
     }
 }
@@ -84,7 +90,7 @@ pub fn align(source: &[[f64; 3]], target: &[[f64; 3]], config: &Config) -> IcpRe
     }
     let max_sq_dist = config.max_correspondence_distance * config.max_correspondence_distance;
 
-    let mut current = Isometry3::<f64>::identity();
+    let mut current = config.initial_transform;
     let mut last_correspondences = 0usize;
     let mut last_mse = f64::INFINITY;
     let mut termination = TerminationReason::MaxIterations;

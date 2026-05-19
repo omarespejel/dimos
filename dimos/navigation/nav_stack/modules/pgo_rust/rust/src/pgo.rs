@@ -162,7 +162,12 @@ impl PgoState {
     ///   3. Otherwise (or if SC fails), do position-radius search
     ///   4. Require time gap > loop_time_thresh between candidate and query
     pub fn search_loop_candidate(&mut self) -> Option<LoopPair> {
-        if self.keyframes.len() < 2 {
+        // Mirror cpp/simple_pgo.cpp:212 — require ≥10 keyframes before any
+        // loop search. Under 10 keyframes the trajectory is too short to be
+        // a meaningful revisit, and scan-context "best match" can pass the
+        // threshold accidentally on near-empty descriptors → false positives.
+        const MIN_KEYFRAMES_BEFORE_LOOP_SEARCH: usize = 10;
+        if self.keyframes.len() < MIN_KEYFRAMES_BEFORE_LOOP_SEARCH {
             return None;
         }
         let query_index = self.keyframes.len() - 1;
@@ -180,25 +185,46 @@ impl PgoState {
         }
         self.last_loop_check_time = query.timestamp;
 
-        let candidate_index = if self.config.use_scan_context {
+        let (candidate_index, sector_shift) = if self.config.use_scan_context {
             self.search_by_scan_context(query_index)
-                .or_else(|| self.search_by_position(query_index))
+                .or_else(|| self.search_by_position(query_index).map(|index| (index, 0)))
         } else {
-            self.search_by_position(query_index)
+            self.search_by_position(query_index).map(|index| (index, 0))
         }?;
 
-        // Refine via ICP on the candidate's submap vs query body cloud.
+        // Refine via ICP. Both source and target submaps live in the WORLD
+        // frame (mirroring cpp/simple_pgo.cpp:260-261, which uses each
+        // keyframe's t_global/r_global to bake bodies into world coords).
+        // Running ICP on body-frame data on the source side and world-frame on
+        // the target side would land ICP on a wrong basin every time.
         let target_cloud = self.submap(candidate_index);
-        let icp_result = icp::align(&query.body_cloud, &target_cloud, &icp::Config::default());
-        if !matches!(
-            icp_result.reason,
-            icp::TerminationReason::Converged | icp::TerminationReason::MaxIterations
-        ) {
+        let source_cloud = self.submap(query_index);
+
+        // Seed ICP from the scan-context column shift's implied yaw rotation,
+        // about the query's global position (NOT the world origin — see cpp
+        // comment at simple_pgo.cpp:244-247).
+        let mut init_guess = Isometry3::<f64>::identity();
+        if sector_shift != 0 {
+            let yaw = scan_context::yaw_from_shift(sector_shift, self.config.scan_context.n_sectors);
+            let rotation = nalgebra::UnitQuaternion::from_axis_angle(&nalgebra::Vector3::z_axis(), yaw);
+            let source_world_pos = (self.pose_offset * self.keyframes[query_index].raw_pose).translation.vector;
+            // init = T(p) · Rz(yaw) · T(-p)
+            let translation = source_world_pos - rotation * source_world_pos;
+            init_guess = Isometry3::from_parts(
+                nalgebra::Translation3::from(translation),
+                rotation,
+            );
+        }
+
+        let mut icp_cfg = icp::Config::default();
+        icp_cfg.initial_transform = init_guess;
+        let icp_result = icp::align(&source_cloud, &target_cloud, &icp_cfg);
+        // C++ requires hasConverged() AND fitness ≤ threshold to accept. Drop
+        // results that hit max_iterations without converging — those are the
+        // ICP runs that didn't find a stable basin.
+        if icp_result.reason != icp::TerminationReason::Converged {
             return None;
         }
-        // Drop high-MSE matches — pure point-to-point ICP can land on a local
-        // minimum that satisfies the iteration count but isn't actually a good
-        // alignment.  Score below threshold = trust the result.
         let score = icp_result.mean_squared_error as f32;
         if score > self.config.loop_score_thresh {
             return None;
@@ -211,21 +237,21 @@ impl PgoState {
         })
     }
 
-    fn search_by_scan_context(&self, query_index: usize) -> Option<usize> {
+    fn search_by_scan_context(&self, query_index: usize) -> Option<(usize, i64)> {
         let query = &self.keyframes[query_index];
-        let mut best: Option<(usize, f32)> = None;
+        let mut best: Option<(usize, f32, i64)> = None;
         for (candidate_index, candidate) in self.keyframes.iter().enumerate() {
-            if !self.is_time_eligible(query, candidate) {
+            if candidate_index == query_index || !self.is_time_eligible(query, candidate) {
                 continue;
             }
-            let (distance, _shift) = scan_context::best_distance(&query.descriptor, &candidate.descriptor);
+            let (distance, shift) = scan_context::best_distance(&query.descriptor, &candidate.descriptor);
             if distance < self.config.scan_context.match_threshold
-                && best.is_none_or(|(_, best_distance)| distance < best_distance)
+                && best.is_none_or(|(_, best_distance, _)| distance < best_distance)
             {
-                best = Some((candidate_index, distance));
+                best = Some((candidate_index, distance, shift));
             }
         }
-        best.map(|(index, _)| index)
+        best.map(|(index, _, shift)| (index, shift))
     }
 
     fn search_by_position(&self, query_index: usize) -> Option<usize> {
@@ -252,19 +278,21 @@ impl PgoState {
     }
 
     /// Concatenate body clouds from neighbouring keyframes around `index` into
-    /// a single voxel-downsampled submap, expressed in `index`'s frame.
+    /// a single voxel-downsampled submap, expressed in the **world** frame
+    /// (mirrors cpp/simple_pgo.cpp::getSubMap which transforms each body
+    /// cloud by its keyframe's `r_global`/`t_global`).  ICP runs on submaps
+    /// in the same coordinate frame, so source and target must both come
+    /// through here.
     pub fn submap(&self, index: usize) -> Vec<[f64; 3]> {
         let half_range = self.config.loop_submap_half_range;
         let start = index.saturating_sub(half_range);
         let end = (index + half_range + 1).min(self.keyframes.len());
-        let center_pose = self.keyframes[index].raw_pose;
-        let inverse_center = center_pose.inverse();
 
         let mut combined: Vec<[f64; 3]> = Vec::new();
         for keyframe in &self.keyframes[start..end] {
-            let relative = inverse_center * keyframe.raw_pose;
+            let world_pose = self.pose_offset * keyframe.raw_pose;
             for point in &keyframe.body_cloud {
-                let p = relative * nalgebra::Point3::new(point[0], point[1], point[2]);
+                let p = world_pose * nalgebra::Point3::new(point[0], point[1], point[2]);
                 combined.push([p.x, p.y, p.z]);
             }
         }
@@ -273,12 +301,25 @@ impl PgoState {
 
     /// Add a loop closure as a BetweenFactor on the optimizer.  Stores
     /// pending pairs so iSAM2 can be invoked in a batch on `flush()`.
+    ///
+    /// Noise sigma is scaled by the ICP fitness score (mirrors
+    /// cpp/simple_pgo.cpp:296: `Variances(Vector6::Ones() * pair.score)`).
+    /// Higher MSE → looser noise → less weight in iSAM2, so a borderline /
+    /// false-positive closure can't yank the trajectory the way a tight prior
+    /// would. We clamp to the configured `loop_noise` floor so good loops
+    /// still get the minimum tightness from config, and to a 1.0 ceiling so
+    /// catastrophic fits don't go infinite-sigma.
     pub fn enqueue_loop(&mut self, pair: LoopPair) {
+        let score_sigma = (pair.score as f64).clamp(
+            self.config.loop_noise.translation_sigma.min(self.config.loop_noise.rotation_sigma),
+            1.0,
+        );
+        let scaled_noise = PoseNoise::isotropic(score_sigma, score_sigma);
         self.optimizer.add_between(
             pair.target_index as u64,
             pair.source_index as u64,
             pair.relative_pose,
-            self.config.loop_noise,
+            scaled_noise,
         );
         self.pending_loops.push(pair);
         self.history_pairs.push((pair.target_index, pair.source_index));
