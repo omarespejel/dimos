@@ -74,6 +74,31 @@ _DEFAULT_CAMERA_JPEG_QUALITY = 75
 _WS_MSG_CAMERA = 0x01
 _WS_MSG_POINTCLOUD = 0x02
 _WS_POINTCLOUD_HEADER_BYTES = 8
+_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
+def _asset_token(path: Path) -> str:
+    stat = path.stat()
+    return f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+
+
+def _versioned_asset_name(prefix: str, path: Path) -> str:
+    return f"{prefix}-{_asset_token(path)}{path.suffix.lower()}"
+
+
+def _legacy_asset_name(prefix: str, path: Path) -> str:
+    return f"{prefix}{path.suffix.lower()}"
+
+
+def _matches_asset_name(asset_name: str, prefix: str, path: Path) -> bool:
+    suffix = path.suffix.lower()
+    return asset_name == _legacy_asset_name(prefix, path) or (
+        asset_name.startswith(f"{prefix}-") and asset_name.endswith(suffix)
+    )
 
 
 class BabylonSceneViewerModule(Module):
@@ -230,17 +255,30 @@ class BabylonSceneViewerModule(Module):
     async def _arms_json(self, request: Request) -> JSONResponse:
         """Joint-limit catalogue so the page can build sliders with real range."""
         if self._robot_ctrl is None:
-            return JSONResponse({"joints": []})
+            return JSONResponse({"joints": []}, headers=_NO_CACHE_HEADERS)
         try:
             limits = self._robot_ctrl.arm_joint_limits()
         except Exception as exc:
             logger.warning("BabylonViewer: arm_joint_limits() failed: %s", exc)
-            return JSONResponse({"joints": []})
+            return JSONResponse({"joints": []}, headers=_NO_CACHE_HEADERS)
         joints = [{"name": name, "min": float(lo), "max": float(hi)} for (name, lo, hi) in limits]
-        return JSONResponse({"joints": joints})
+        return JSONResponse({"joints": joints}, headers=_NO_CACHE_HEADERS)
 
     async def _index(self, request: Request) -> HTMLResponse:
-        return HTMLResponse(index_html())
+        html = index_html()
+        app_js = STATIC_DIR / "app.js"
+        style_css = STATIC_DIR / "style.css"
+        if app_js.exists():
+            html = html.replace(
+                'src="/static/app.js"',
+                f'src="/static/app.js?v={_asset_token(app_js)}"',
+            )
+        if style_css.exists():
+            html = html.replace(
+                'href="/static/style.css"',
+                f'href="/static/style.css?v={_asset_token(style_css)}"',
+            )
+        return HTMLResponse(html, headers=_NO_CACHE_HEADERS)
 
     async def _config(self, request: Request) -> JSONResponse:
         scene_file = None
@@ -252,10 +290,10 @@ class BabylonSceneViewerModule(Module):
             rotation_zyx_deg=self._scene_rotation_zyx_deg,
         )
         if self._scene_path is not None and self._scene_path.exists():
-            scene_file = f"scene{self._scene_path.suffix.lower()}"
+            scene_file = _versioned_asset_name("scene", self._scene_path)
             scene_bytes = self._scene_path.stat().st_size
         if self._browser_collision_path is not None and self._browser_collision_path.exists():
-            collision_file = f"collision{self._browser_collision_path.suffix.lower()}"
+            collision_file = _versioned_asset_name("collision", self._browser_collision_path)
             collision_bytes = self._browser_collision_path.stat().st_size
         return JSONResponse(
             {
@@ -266,13 +304,14 @@ class BabylonSceneViewerModule(Module):
                 "sceneScale": self._scene_scale,
                 "scenePosition": list(self._scene_translation),
                 "sceneWxyz": list(scene_wxyz),
-            }
+            },
+            headers=_NO_CACHE_HEADERS,
         )
 
     async def _robot_json(self, request: Request) -> JSONResponse:
         robot = self._robot
         if robot is None:
-            return JSONResponse({"bodyNames": [], "geoms": []})
+            return JSONResponse({"bodyNames": [], "geoms": []}, headers=_NO_CACHE_HEADERS)
 
         geoms: list[dict[str, Any]] = []
         for index, geom in enumerate(robot.geoms):
@@ -287,7 +326,10 @@ class BabylonSceneViewerModule(Module):
                     "rgba": [float(value) for value in geom.rgba],
                 }
             )
-        return JSONResponse({"bodyNames": robot.body_names, "geoms": geoms})
+        return JSONResponse(
+            {"bodyNames": robot.body_names, "geoms": geoms},
+            headers=_NO_CACHE_HEADERS,
+        )
 
     async def _asset(self, request: Request) -> Response:
         if (self._scene_path is None or not self._scene_path.exists()) and (
@@ -296,26 +338,34 @@ class BabylonSceneViewerModule(Module):
             return Response("scene asset not configured", status_code=404)
 
         asset_name = request.path_params["asset_name"]
-        if self._scene_path is not None:
-            scene_asset_name = f"scene{self._scene_path.suffix.lower()}"
-        else:
-            scene_asset_name = ""
-        if self._scene_path is not None and asset_name == scene_asset_name:
-            return FileResponse(self._scene_path, media_type=media_type(self._scene_path))
+        if self._scene_path is not None and _matches_asset_name(
+            asset_name,
+            "scene",
+            self._scene_path,
+        ):
+            return FileResponse(
+                self._scene_path,
+                media_type=media_type(self._scene_path),
+                headers=_NO_CACHE_HEADERS,
+            )
 
-        if (
-            self._browser_collision_path is not None
-            and asset_name == f"collision{self._browser_collision_path.suffix.lower()}"
+        if self._browser_collision_path is not None and _matches_asset_name(
+            asset_name, "collision", self._browser_collision_path
         ):
             return FileResponse(
                 self._browser_collision_path,
                 media_type=media_type(self._browser_collision_path),
+                headers=_NO_CACHE_HEADERS,
             )
 
         if self._scene_path is not None and self._scene_path.suffix.lower() == ".gltf":
             candidate = self._scene_path.parent / asset_name
             if path_contains(self._scene_path.parent, candidate) and candidate.exists():
-                return FileResponse(candidate, media_type=media_type(candidate))
+                return FileResponse(
+                    candidate,
+                    media_type=media_type(candidate),
+                    headers=_NO_CACHE_HEADERS,
+                )
 
         if (
             self._browser_collision_path is not None
@@ -323,7 +373,11 @@ class BabylonSceneViewerModule(Module):
         ):
             candidate = self._browser_collision_path.parent / asset_name
             if path_contains(self._browser_collision_path.parent, candidate) and candidate.exists():
-                return FileResponse(candidate, media_type=media_type(candidate))
+                return FileResponse(
+                    candidate,
+                    media_type=media_type(candidate),
+                    headers=_NO_CACHE_HEADERS,
+                )
 
         return Response("asset not found", status_code=404)
 

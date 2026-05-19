@@ -15,13 +15,17 @@
 const canvas = document.getElementById("renderCanvas");
 const statusEl = document.getElementById("status");
 const engine = new BABYLON.Engine(canvas, true, {
-  preserveDrawingBuffer: true,
-  stencil: true,
-  antialias: true,
+  preserveDrawingBuffer: false,
+  stencil: false,
+  antialias: false,
 });
 const scene = new BABYLON.Scene(engine);
 scene.useRightHandedSystem = true;
 scene.clearColor = new BABYLON.Color4(0.055, 0.063, 0.078, 1);
+scene.skipPointerMovePicking = true;
+if (BABYLON.ScenePerformancePriority) {
+  scene.performancePriority = BABYLON.ScenePerformancePriority.Aggressive;
+}
 
 const camera = new BABYLON.ArcRotateCamera(
   "camera",
@@ -109,6 +113,49 @@ function setLidarVisibility(visible) {
   lidarVisible = visible;
   if (lidarMesh) lidarMesh.setEnabled(visible);
   setButtonActive("toggleLidar", visible);
+}
+
+function sceneMaterials() {
+  const visited = new Set();
+  const materials = [];
+  for (const mesh of sceneMeshes) {
+    const material = mesh.material;
+    if (!material || visited.has(material.uniqueId)) continue;
+    visited.add(material.uniqueId);
+    materials.push(material);
+  }
+  return materials;
+}
+
+function ensureMaterialDefaults(material) {
+  material.metadata = material.metadata || {};
+  if (material.metadata.dimosDefaults) return material.metadata.dimosDefaults;
+  material.metadata.dimosDefaults = {
+    alpha: material.alpha,
+    backFaceCulling: material.backFaceCulling,
+    disableDepthWrite: material.disableDepthWrite,
+    forceDepthWrite: material.forceDepthWrite,
+    transparencyMode: material.transparencyMode,
+    needDepthPrePass: material.needDepthPrePass,
+    metallic: material.metallic,
+    roughness: material.roughness,
+    environmentIntensity: material.environmentIntensity,
+  };
+  return material.metadata.dimosDefaults;
+}
+
+function editMaterial(material, apply) {
+  if (material.unfreeze) material.unfreeze();
+  apply(material, ensureMaterialDefaults(material));
+  if (material.freeze) material.freeze();
+}
+
+function configureStaticSceneMaterial(material) {
+  editMaterial(material, (mat) => {
+    mat.disableDepthWrite = false;
+    mat.forceDepthWrite = true;
+    mat.needDepthPrePass = false;
+  });
 }
 
 function setClickMode(mode) {
@@ -236,51 +283,53 @@ function setDriveEnabled(enabled) {
 
 function setSceneDepthWrite(enabled) {
   sceneDepthEnabled = enabled;
-  const visited = new Set();
-  for (const mesh of sceneMeshes) {
-    const material = mesh.material;
-    if (!material || visited.has(material.uniqueId)) continue;
-    visited.add(material.uniqueId);
-    material.disableDepthWrite = !enabled;
-    material.needDepthPrePass = enabled;
+  for (const material of sceneMaterials()) {
+    editMaterial(material, (mat) => {
+      mat.disableDepthWrite = !enabled;
+      mat.needDepthPrePass = false;
+    });
   }
   setButtonActive("toggleDepth", enabled);
 }
 
 function setSceneWireframe(enabled) {
   sceneWireEnabled = enabled;
-  const visited = new Set();
-  for (const mesh of sceneMeshes) {
-    const material = mesh.material;
-    if (!material || visited.has(material.uniqueId)) continue;
-    visited.add(material.uniqueId);
-    material.wireframe = enabled;
+  for (const material of sceneMaterials()) {
+    editMaterial(material, (mat) => {
+      mat.wireframe = enabled;
+    });
   }
   setButtonActive("toggleWire", enabled);
 }
 
 function setForceVisible(enabled) {
   forceVisibleEnabled = enabled;
-  const visited = new Set();
-  for (const mesh of sceneMeshes) {
-    const material = mesh.material;
-    if (!material || visited.has(material.uniqueId)) continue;
-    visited.add(material.uniqueId);
-    material.backFaceCulling = false;
-    material.alpha = 1;
-    material.disableDepthWrite = false;
-    material.forceDepthWrite = true;
-    material.transparencyMode = enabled
-      ? BABYLON.Material.MATERIAL_OPAQUE
-      : material.transparencyMode;
-    if (enabled && material.albedoColor) {
-      material.metallic = 0;
-      material.roughness = 0.9;
-      material.environmentIntensity = 1;
-    }
-    if (enabled && material.diffuseColor) {
-      material.diffuseColor = material.diffuseColor || new BABYLON.Color3(0.8, 0.8, 0.8);
-    }
+  for (const material of sceneMaterials()) {
+    editMaterial(material, (mat, defaults) => {
+      if (!enabled) {
+        mat.alpha = defaults.alpha;
+        mat.backFaceCulling = defaults.backFaceCulling;
+        mat.disableDepthWrite = false;
+        mat.forceDepthWrite = true;
+        mat.transparencyMode = defaults.transparencyMode;
+        mat.needDepthPrePass = false;
+        return;
+      }
+      mat.backFaceCulling = false;
+      mat.alpha = 1;
+      mat.disableDepthWrite = false;
+      mat.forceDepthWrite = true;
+      mat.needDepthPrePass = false;
+      mat.transparencyMode = BABYLON.Material.MATERIAL_OPAQUE;
+      if (mat.albedoColor) {
+        mat.metallic = 0;
+        mat.roughness = 0.9;
+        mat.environmentIntensity = 1;
+      }
+      if (mat.diffuseColor) {
+        mat.diffuseColor = mat.diffuseColor || new BABYLON.Color3(0.8, 0.8, 0.8);
+      }
+    });
   }
   setButtonActive("forceVisible", enabled);
 }
@@ -354,11 +403,15 @@ async function loadSceneAsset(config) {
     mesh.isPickable = true;
     mesh.metadata = { dimosSceneMesh: true };
     if (mesh.getTotalVertices && mesh.getTotalVertices() > 0) sceneMeshes.push(mesh);
-    if (mesh.material) {
-      mesh.material.backFaceCulling = false;
-      mesh.material.forceDepthWrite = true;
+    if (mesh.material) configureStaticSceneMaterial(mesh.material);
+    if (mesh.getTotalVertices && mesh.getTotalVertices() > 0) {
+      mesh.computeWorldMatrix(true);
+      mesh.refreshBoundingInfo(true);
+      mesh.freezeWorldMatrix();
+      mesh.doNotSyncBoundingInfo = true;
     }
   }
+  root.freezeWorldMatrix();
   setSceneDepthWrite(sceneDepthEnabled);
   setSceneWireframe(sceneWireEnabled);
   setForceVisible(forceVisibleEnabled);
@@ -391,10 +444,12 @@ async function loadCollisionAsset(config) {
     if (!mesh.getTotalVertices || mesh.getTotalVertices() === 0) continue;
     mesh.isPickable = true;
     mesh.visibility = 0;
+    mesh.setEnabled(false);
     mesh.metadata = { dimosCollisionMesh: true };
     collisionMeshes.push(mesh);
   }
   if (sceneMeshes.length === 0) fitCameraToMeshes(collisionMeshes);
+  setStatus("live");
 }
 
 function pickScenePoint() {
@@ -405,7 +460,13 @@ function pickScenePoint() {
     camera,
   );
   const meshes = collisionMeshes.length > 0 ? collisionMeshes : sceneMeshes;
+  if (collisionMeshes.length > 0) {
+    for (const mesh of collisionMeshes) mesh.setEnabled(true);
+  }
   const pick = scene.pickWithRay(ray, (mesh) => meshes.includes(mesh));
+  if (collisionMeshes.length > 0) {
+    for (const mesh of collisionMeshes) mesh.setEnabled(false);
+  }
   if (pick && pick.hit && pick.pickedPoint) return pick.pickedPoint;
   if (Math.abs(ray.direction.z) < 1e-6) return null;
   const distance = -ray.origin.z / ray.direction.z;

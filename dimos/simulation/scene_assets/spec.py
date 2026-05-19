@@ -34,8 +34,16 @@ class BrowserVisualSpec:
 
     enabled: bool = True
     output_name: str = "visual.glb"
+    optimizer: str = "gltfpack"
+    simplify_ratio: float = 0.3
+    simplify_error: float = 0.02
+    texture_format: str | None = None
+    max_texture_size: int | None = None
     max_meshes: int = 200
     max_materials: int = 50
+    max_textures: int = 750
+    max_vertices: int = 750_000
+    max_vertex_growth_ratio: float = 1.25
 
 
 @dataclass(frozen=True)

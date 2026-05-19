@@ -193,6 +193,19 @@ def cli_main() -> None:
     parser.add_argument("--rotation-zyx-deg", type=_parse_xyz, default=(0.0, 0.0, 0.0))
     parser.add_argument("--no-y-up", action="store_true")
     parser.add_argument("--no-visual", action="store_true")
+    parser.add_argument(
+        "--visual-optimizer",
+        choices=("gltfpack", "blender", "copy"),
+        default="gltfpack",
+    )
+    parser.add_argument("--visual-simplify-ratio", type=float, default=0.3)
+    parser.add_argument("--visual-simplify-error", type=float, default=0.02)
+    parser.add_argument("--visual-max-texture-size", type=int)
+    parser.add_argument(
+        "--visual-texture-format",
+        choices=("none", "webp", "ktx2"),
+        default="none",
+    )
     parser.add_argument("--no-browser-collision", action="store_true")
     parser.add_argument("--browser-collision-target-faces", type=int, default=100_000)
     parser.add_argument("--no-mujoco", action="store_true")
@@ -211,7 +224,16 @@ def cli_main() -> None:
         ),
         robot_mjcf_path=None if args.no_mujoco else args.robot_mjcf,
         meshdir=args.meshdir,
-        visual_spec=BrowserVisualSpec(enabled=not args.no_visual),
+        visual_spec=BrowserVisualSpec(
+            enabled=not args.no_visual,
+            optimizer=args.visual_optimizer,
+            simplify_ratio=args.visual_simplify_ratio,
+            simplify_error=args.visual_simplify_error,
+            texture_format=(
+                None if args.visual_texture_format == "none" else args.visual_texture_format
+            ),
+            max_texture_size=args.visual_max_texture_size,
+        ),
         browser_collision_spec=BrowserCollisionSpec(
             enabled=not args.no_browser_collision,
             target_faces=args.browser_collision_target_faces,
