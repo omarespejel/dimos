@@ -17,8 +17,10 @@
 
 from pathlib import Path
 
-from dimos.control.blueprints.teleop import coordinator_teleop_sim_xarm7
+from dimos.constants import DIMOS_PROJECT_ROOT
+from dimos.control.blueprints.teleop import coordinator_teleop_xarm7
 from dimos.core.coordination.blueprints import autoconnect
+from dimos.core.core import rpc
 from dimos.core.stream import In
 from dimos.core.transport import LCMTransport
 from dimos.memory2.module import Recorder, RecorderConfig
@@ -31,10 +33,11 @@ from dimos.teleop.quest_hosted.hosted_extensions import (
     HostedTwistTeleopModule,
 )
 
-# Single XArm7 teleop in MuJoCo sim, using the hosted (WebRTC) client.
-teleop_hosted_xarm7_sim = autoconnect(
+# Single XArm7 teleop via the hosted (WebRTC) client. Pass `--simulation` to
+# run the coordinator inside MuJoCo, omit it for real hardware.
+teleop_hosted_xarm7 = autoconnect(
     HostedArmTeleopModule.blueprint(task_names={"right": "teleop_xarm"}),
-    coordinator_teleop_sim_xarm7,
+    coordinator_teleop_xarm7,
 ).transports(
     {
         ("right_controller_output", PoseStamped): LCMTransport(
@@ -48,25 +51,26 @@ teleop_hosted_xarm7_sim = autoconnect(
 # over WebRTC → HostedTwistTeleopModule scales by linear/angular_speed and
 # publishes Twist on cmd_vel → GO2Connection.cmd_vel (via unitree_go2_basic,
 # which also brings in vis + clock sync; no coordinator in path).
+
 teleop_hosted_go2 = autoconnect(
     HostedTwistTeleopModule.blueprint(),
     unitree_go2_basic,
-)
+).global_config(n_workers=8)
 
 
 class HostedTeleopRecorderConfig(RecorderConfig):
-    db_path: str | Path = "recording_hosted_3.db"
+    db_path: str | Path = DIMOS_PROJECT_ROOT / "data/hosted_teleop/recordings/recording_hosted.db"
 
 
 class HostedTeleopRecorder(Recorder):
     """Records hosted teleop streams. Captures whatever the connected blueprint
-    produces — VR controller poses + buttons (xarm7 sim), or cmd_vel_stamped
+    produces — VR controller poses + buttons (xarm7), or cmd_vel_stamped
     (go2). Unconnected ports stay empty in the DB.
 
     Compose at the CLI::
 
-        dimos run teleop-hosted-xarm7-sim hosted-teleop-recorder
-        dimos run teleop-hosted-go2       hosted-teleop-recorder
+        dimos run teleop-hosted-xarm7 hosted-teleop-recorder
+        dimos run teleop-hosted-go2   hosted-teleop-recorder
     """
 
     right_controller_output: In[PoseStamped]
@@ -75,10 +79,16 @@ class HostedTeleopRecorder(Recorder):
     cmd_vel_stamped: In[TwistStamped]
     config: HostedTeleopRecorderConfig
 
+    @rpc
+    def start(self) -> None:
+        # SqliteStore (sqlite3.connect) won't create the parent dir — ensure it.
+        Path(self.config.db_path).parent.mkdir(parents=True, exist_ok=True)
+        super().start()
+
 
 __all__ = [
     "HostedTeleopRecorder",
     "HostedTeleopRecorderConfig",
     "teleop_hosted_go2",
-    "teleop_hosted_xarm7_sim",
+    "teleop_hosted_xarm7",
 ]
