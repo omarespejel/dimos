@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import statistics
+import time
 from typing import Any
 
 from pydantic import Field
@@ -38,6 +40,7 @@ from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In
 from dimos.msgs.nav_msgs.Graph3D import Graph3D
 from dimos.msgs.nav_msgs.GraphDelta3D import GraphDelta3D
+from dimos.msgs.nav_msgs.Odometry import Odometry
 
 # edge-type enum (matches build_pose_graph in pgo/cpp/main.cpp).
 EDGE_LOOP_CLOSURE = 1
@@ -71,15 +74,24 @@ class PoseGraphScoringConfig(ModuleConfig):
     frame_ids: list[int] = Field(default_factory=list)
     send_timestamps: list[float] = Field(default_factory=list)
     valid_loops_per_query: dict[int, list[int]] = Field(default_factory=dict)
+    # Ground-truth lidar positions per frame_id, used to compute ATE against
+    # the corrected_odometry stream.  Empty by default — the runner fills it
+    # in when constructing the blueprint so the module stays self-contained.
+    groundtruth_positions: dict[int, list[float]] = Field(default_factory=dict)
 
 
 class PoseGraphScoringModule(Module):
-    """Accumulates loop-closure detections and scores them against KITTI groundtruth."""
+    """Accumulates loop-closure detections and scores them against KITTI groundtruth.
+
+    Also captures corrected_odometry to compute per-frame median latency (from
+    inter-arrival times) and ATE against ground-truth positions.
+    """
 
     config: PoseGraphScoringConfig
 
     pose_graph: In[Graph3D]
     loop_closure_event: In[GraphDelta3D]
+    corrected_odometry: In[Odometry]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -91,6 +103,12 @@ class PoseGraphScoringModule(Module):
                 self.config.frame_ids, self.config.send_timestamps, strict=True
             )
         }
+        # Per-arrival wall-clock timestamps of corrected_odometry messages.
+        # Inter-arrival deltas approximate per-frame processing latency when
+        # the binary keeps up with the playback module's publish cadence.
+        self._corrected_arrival_times: list[float] = []
+        # (frame_id, predicted_xyz, gt_xyz) triples for ATE.
+        self._predicted_vs_gt: list[tuple[int, tuple[float, float, float], tuple[float, float, float]]] = []
 
     @rpc
     def start(self) -> None:
@@ -99,6 +117,24 @@ class PoseGraphScoringModule(Module):
             Disposable(self.loop_closure_event.subscribe(self._on_loop_closure_event))
         )
         self.register_disposable(Disposable(self.pose_graph.subscribe(self._on_pose_graph)))
+        self.register_disposable(
+            Disposable(self.corrected_odometry.subscribe(self._on_corrected_odometry))
+        )
+
+    def _on_corrected_odometry(self, message: Odometry) -> None:
+        self._corrected_arrival_times.append(time.monotonic())
+        # Map the message's stamp back to its source frame_id.  Same ±1ms slop
+        # heuristic as _timestamp_to_frame uses for pose-graph node times.
+        frame_id = self._timestamp_to_frame(message.ts)
+        if frame_id is None:
+            return
+        gt = self.config.groundtruth_positions.get(frame_id)
+        if gt is None or len(gt) != 3:
+            return
+        position = message.pose.pose.position
+        self._predicted_vs_gt.append(
+            (frame_id, (position.x, position.y, position.z), (gt[0], gt[1], gt[2]))
+        )
 
     def _on_loop_closure_event(self, message: GraphDelta3D) -> None:
         del message
@@ -150,7 +186,44 @@ class PoseGraphScoringModule(Module):
             "precision": (metrics.precision if math.isfinite(metrics.precision) else None),
             "recall": metrics.recall if math.isfinite(metrics.recall) else None,
             "f1": metrics.f1,
+            "per_frame_median_ms": _median_inter_arrival_ms(self._corrected_arrival_times),
+            "corrected_odometry_samples": len(self._corrected_arrival_times),
+            "ate_meters": _absolute_trajectory_error(self._predicted_vs_gt),
+            "ate_samples": len(self._predicted_vs_gt),
         }
+
+
+def _median_inter_arrival_ms(arrival_times: list[float]) -> float | None:
+    """Median inter-arrival time (ms) of consecutive samples, proxy for per-frame
+    processing latency when the producer keeps up with playback cadence."""
+    if len(arrival_times) < 2:
+        return None
+    deltas_ms = [
+        (arrival_times[i] - arrival_times[i - 1]) * 1000.0
+        for i in range(1, len(arrival_times))
+    ]
+    return statistics.median(deltas_ms)
+
+
+def _absolute_trajectory_error(
+    predicted_vs_gt: list[tuple[int, tuple[float, float, float], tuple[float, float, float]]],
+) -> float | None:
+    """ATE = RMSE of (predicted - groundtruth) position over the trajectory.
+
+    Both predicted and groundtruth are in the world frame already (playback
+    publishes ground-truth-derived odometry as input; corrected_odometry is
+    the producer's adjusted version of it). No alignment step; if the producer
+    didn't drift, ATE should be near zero.
+    """
+    if not predicted_vs_gt:
+        return None
+    total_sq = 0.0
+    for _frame_id, predicted, gt in predicted_vs_gt:
+        dx = predicted[0] - gt[0]
+        dy = predicted[1] - gt[1]
+        dz = predicted[2] - gt[2]
+        total_sq += dx * dx + dy * dy + dz * dz
+    return math.sqrt(total_sq / len(predicted_vs_gt))
 
 
 def _score_pairs(

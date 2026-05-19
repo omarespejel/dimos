@@ -40,6 +40,8 @@ LOOP_RECALL_DELTA = 0.02
 SCAN_CONTEXT_AP_DELTA = 0.02
 SCAN_CONTEXT_AP_BAND = (0.65, 0.78)
 SMOKE_WALL_CLOCK_MAX_SECONDS = 600.0  # 10 minutes, from the DoD's smoke gate.
+PEAK_RSS_RATIO_MAX = 1.10  # rust ≤ 1.10 × cpp
+ATE_RATIO_MAX = 1.05  # rust ATE ≤ 1.05 × cpp ATE
 
 
 @dataclass
@@ -77,15 +79,7 @@ def _delta_ge(name: str, rust: float, cpp: float, delta: float, unit: str) -> Ga
     )
 
 
-def _skip(name: str, reason: str) -> GateResult:
-    return GateResult(name=name, status="skip", detail=reason)
-
-
 def check_kitti360(cpp: dict[str, Any], rust: dict[str, Any]) -> list[GateResult]:
-    # The existing KITTI-360 benchmark runner emits wall_clock + loop p/r/f1
-    # only.  Per-frame median latency, peak RSS, and ATE are not emitted —
-    # those gates are reported as SKIP (not PASS) so they don't contribute to
-    # OVERALL: PASS.  A future runner change can fill them in.
     gates: list[GateResult] = [
         _strict_le(
             "end-to-end wall clock", rust["wallclock_seconds"], cpp["wallclock_seconds"], "s"
@@ -115,8 +109,93 @@ def check_kitti360(cpp: dict[str, Any], rust: dict[str, Any]) -> list[GateResult
     gates.append(_delta_ge(
         "loop recall", rust["recall"], cpp["recall"], LOOP_RECALL_DELTA, "",
     ))
-    for unmeasured in ("per-frame median latency", "peak RSS", "ATE"):
-        gates.append(_skip(unmeasured, "not emitted by current runner.py"))
+
+    # Per-frame median latency: rust ≤ cpp (strict).  Source: median inter-
+    # arrival time of corrected_odometry samples at PoseGraphScoringModule.
+    # `null` from the runner means too few samples to compute (<2); treat
+    # symmetric-null as PASS and asymmetric-null as FAIL.
+    cpp_latency = cpp.get("per_frame_median_ms")
+    rust_latency = rust.get("per_frame_median_ms")
+    if cpp_latency is None and rust_latency is None:
+        gates.append(GateResult(
+            name="per-frame median latency",
+            status="pass",
+            detail="both backends emitted <2 corrected_odometry samples → latency undefined",
+        ))
+    elif cpp_latency is None or rust_latency is None:
+        gates.append(GateResult(
+            name="per-frame median latency",
+            status="fail",
+            detail=f"asymmetry: cpp={cpp_latency}, rust={rust_latency}",
+        ))
+    else:
+        gates.append(_strict_le(
+            "per-frame median latency", rust_latency, cpp_latency, "ms",
+        ))
+
+    # Peak RSS: rust ≤ 1.10 × cpp.  Sampled by the runner on its own process
+    # tree at 4 Hz; the PGO native subprocess is captured as a descendant.
+    cpp_rss = cpp.get("peak_rss_mb")
+    rust_rss = rust.get("peak_rss_mb")
+    if cpp_rss is None or rust_rss is None:
+        gates.append(GateResult(
+            name="peak RSS",
+            status="fail",
+            detail=f"missing measurement: cpp={cpp_rss}, rust={rust_rss}",
+        ))
+    elif cpp_rss <= 0:
+        gates.append(GateResult(
+            name="peak RSS",
+            status="fail",
+            detail=f"cpp peak_rss_mb = {cpp_rss}, can't form a ratio",
+        ))
+    else:
+        ratio = rust_rss / cpp_rss
+        gates.append(GateResult(
+            name="peak RSS",
+            status="pass" if ratio <= PEAK_RSS_RATIO_MAX else "fail",
+            detail=(
+                f"rust={rust_rss:.2f}MB, cpp={cpp_rss:.2f}MB, "
+                f"ratio={ratio:.3f} (≤ {PEAK_RSS_RATIO_MAX})"
+            ),
+        ))
+
+    # ATE: rust ≤ 1.05 × cpp.  RMSE of (corrected_odometry - groundtruth)
+    # positions, computed inside the scoring module.  If both backends report
+    # 0 (no drift correction needed → predicted == GT exactly), the ratio is
+    # 0/0 — treat as PASS.
+    cpp_ate = cpp.get("ate_meters")
+    rust_ate = rust.get("ate_meters")
+    if cpp_ate is None or rust_ate is None:
+        gates.append(GateResult(
+            name="ATE",
+            status="fail",
+            detail=f"missing measurement: cpp={cpp_ate}, rust={rust_ate}",
+        ))
+    elif cpp_ate == 0.0 and rust_ate == 0.0:
+        gates.append(GateResult(
+            name="ATE",
+            status="pass",
+            detail="both backends report ATE=0 (predicted matches GT exactly)",
+        ))
+    elif cpp_ate == 0.0:
+        # cpp is perfect, rust must also be perfect to pass.
+        gates.append(GateResult(
+            name="ATE",
+            status="pass" if rust_ate == 0.0 else "fail",
+            detail=f"cpp=0, rust={rust_ate:.4f}m",
+        ))
+    else:
+        ratio = rust_ate / cpp_ate
+        gates.append(GateResult(
+            name="ATE",
+            status="pass" if ratio <= ATE_RATIO_MAX else "fail",
+            detail=(
+                f"rust={rust_ate:.4f}m, cpp={cpp_ate:.4f}m, "
+                f"ratio={ratio:.3f} (≤ {ATE_RATIO_MAX})"
+            ),
+        ))
+
     return gates
 
 

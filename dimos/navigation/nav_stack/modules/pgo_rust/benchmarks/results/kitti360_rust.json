@@ -10,7 +10,12 @@
   "precision": null,
   "recall": 0.0,
   "f1": 0.0,
-  "wallclock_seconds": 24.956072294851765,
+  "per_frame_median_ms": 0.22399192675948143,
+  "corrected_odometry_samples": 241,
+  "ate_meters": 0.0,
+  "ate_samples": 241,
+  "wallclock_seconds": 26.110414267983288,
   "sequence_id": 2,
-  "git_sha": "541e8a44774a90fc64224a4e74abe12b5346bb49"
+  "peak_rss_mb": 2710.8671875,
+  "git_sha": "9fd6d3f7d61999d08d7ec2e71b825d6a199beb4a"
 }

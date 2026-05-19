@@ -22,10 +22,12 @@ the runner doesn't care which implementation it is.
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 import time
 from typing import Any
 
 import numpy as np
+import psutil
 
 from dimos.core.coordination.blueprints import autoconnect
 from dimos.core.coordination.module_coordinator import ModuleCoordinator
@@ -99,16 +101,48 @@ def run_benchmark(
         max_scans=max_scans,
         publish_interval_sec=publish_interval_sec,
     )
+    # Ground-truth positions per frame_id, passed into the scoring module so it
+    # can compute ATE against corrected_odometry samples.
+    groundtruth_positions = {
+        int(frame_id): [float(positions[index][0]), float(positions[index][1]), float(positions[index][2])]
+        for index, frame_id in enumerate(frame_ids)
+    }
     scoring_blueprint = PoseGraphScoringModule.blueprint(
         frame_ids=frame_ids,
         send_timestamps=send_timestamps,
         valid_loops_per_query={
             frame_id: list(valid) for frame_id, valid in groundtruth.valid_loops_per_query.items()
         },
+        groundtruth_positions=groundtruth_positions,
     )
 
     sut_blueprint = module_under_test.blueprint(**(module_kwargs or {}))
     blueprint = autoconnect(playback_blueprint, scoring_blueprint, sut_blueprint)
+
+    # Sample peak RSS across this process tree (runner + worker forks + the
+    # PGO native subprocess) on a background thread.  We don't have a clean
+    # handle on the binary's PID from here, so the process-tree max RSS is a
+    # tight upper bound on the binary's footprint.
+    rss_stop_event = threading.Event()
+    rss_state = {"peak_bytes": 0}
+
+    def _sample_rss() -> None:
+        self_proc = psutil.Process()
+        while not rss_stop_event.wait(0.25):
+            try:
+                total = self_proc.memory_info().rss
+                for child in self_proc.children(recursive=True):
+                    try:
+                        total += child.memory_info().rss
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                if total > rss_state["peak_bytes"]:
+                    rss_state["peak_bytes"] = total
+            except psutil.NoSuchProcess:
+                return
+
+    rss_thread = threading.Thread(target=_sample_rss, name="rss-sampler", daemon=True)
+    rss_thread.start()
 
     wallclock_start = time.monotonic()
     coordinator = ModuleCoordinator.build(blueprint)
@@ -139,7 +173,10 @@ def run_benchmark(
         results: dict[str, Any] = scoring.get_results()
     finally:
         coordinator.stop()
+        rss_stop_event.set()
+        rss_thread.join(timeout=1.0)
 
     results["wallclock_seconds"] = time.monotonic() - wallclock_start
     results["sequence_id"] = sequence_id
+    results["peak_rss_mb"] = rss_state["peak_bytes"] / (1024.0 * 1024.0)
     return results
