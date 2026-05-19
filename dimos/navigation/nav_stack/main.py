@@ -62,7 +62,7 @@ def create_nav_stack(
     pgo: dict[str, Any] | None = None,
     tare_planner: dict[str, Any] | None = None,
     nav_record: dict[str, Any] | None = None,
-    loop_closure: str = "pgo_cpp",
+    loop_closure: str = "pgo_rust",
 ) -> Blueprint:
     """Compose a nav stack Blueprint.
 
