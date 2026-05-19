@@ -64,7 +64,7 @@ from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
 
-_DEFAULT_BROADCAST_HZ = 20.0
+_DEFAULT_BROADCAST_HZ = 30.0
 _DEFAULT_PORT = 8091
 _DEFAULT_POINTCLOUD_HZ = 2.0
 _DEFAULT_POINTCLOUD_MAX_POINTS = 70000
@@ -164,6 +164,7 @@ class BabylonSceneViewerModule(Module):
         self._latest_base_pos: np.ndarray | None = None
         self._latest_base_wxyz: np.ndarray | None = None
         self._latest_path: list[list[float]] = []
+        self._latest_path_version = 0
         self._pointcloud_lock = threading.Lock()
         self._latest_pointcloud_payload: bytes | None = None
         self._pointcloud_pending_lock = threading.Lock()
@@ -533,13 +534,23 @@ class BabylonSceneViewerModule(Module):
     def _make_state_payload(self) -> dict[str, Any]:
         robot = self._robot
         if robot is None:
-            return {"type": "state", "time": time.time(), "bodies": [], "path": []}
+            with self._state_lock:
+                path_version = self._latest_path_version
+            return {
+                "type": "state",
+                "time": time.time(),
+                "bodies": [],
+                "path": [],
+                "path_version": path_version,
+                "joints": {},
+            }
 
         with self._state_lock:
             joints = dict(self._latest_joints)
             base_pos = None if self._latest_base_pos is None else self._latest_base_pos.copy()
             base_wxyz = None if self._latest_base_wxyz is None else self._latest_base_wxyz.copy()
             path_points = [point[:] for point in self._latest_path]
+            path_version = self._latest_path_version
 
         apply_state(
             robot,
@@ -576,6 +587,7 @@ class BabylonSceneViewerModule(Module):
             "time": time.time(),
             "bodies": bodies,
             "path": path_points,
+            "path_version": path_version,
             "joints": joint_positions,
         }
 
@@ -602,6 +614,7 @@ class BabylonSceneViewerModule(Module):
     def _on_path(self, msg: PathMsg) -> None:
         with self._state_lock:
             self._latest_path = [[pose.x, pose.y, pose.z] for pose in msg.poses]
+            self._latest_path_version += 1
 
     def _on_pointcloud_overlay(self, msg: PointCloud2) -> None:
         now = time.monotonic()

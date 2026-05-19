@@ -88,6 +88,19 @@ const driveSendPeriod = 0.08;
 const driveLinearSpeed = 0.35;
 const driveStrafeSpeed = 0.25;
 const driveAngularSpeed = 0.8;
+const stateQueueMaxLength = 8;
+const stateImmediateDeltaMs = 100;
+const stateMaxLagMs = 100;
+const stateEarlyThresholdMs = 3;
+const statePacingDamping = 0.95;
+const robotRootBodyNames = new Set(["pelvis", "torso_link", "body_1"]);
+const queuedStateFrames = [];
+const stateTiming = {
+  previousSourceMs: null,
+  lastIdealJsMs: null,
+  jsMinusSourceMs: Number.POSITIVE_INFINITY,
+};
+let lastPathVersion = null;
 
 const vec3 = (values) => new BABYLON.Vector3(values[0], values[1], values[2]);
 const quatWxyz = (values) =>
@@ -569,13 +582,49 @@ function ensureBodyNode(bodyName) {
   return node;
 }
 
-function updateState(payload) {
+function copyVec3ToNode(node, values) {
+  node.position.copyFromFloats(values[0], values[1], values[2]);
+}
+
+function copyQuatWxyzToNode(node, values) {
+  if (!node.rotationQuaternion) {
+    node.rotationQuaternion = BABYLON.Quaternion.Identity();
+  }
+  node.rotationQuaternion.copyFromFloats(values[1], values[2], values[3], values[0]);
+}
+
+function updateLatestRootPosition(position) {
+  if (!latestRootPosition) latestRootPosition = BABYLON.Vector3.Zero();
+  latestRootPosition.copyFrom(position);
+}
+
+function updatePath(path, pathVersion) {
+  const hasVersion = Number.isFinite(pathVersion);
+  if (hasVersion && pathVersion === lastPathVersion) return;
+  if (hasVersion) lastPathVersion = pathVersion;
+
+  if (pathMesh) {
+    pathMesh.dispose();
+    pathMesh = null;
+  }
+  if (!path || path.length <= 1) return;
+
+  pathMesh = BABYLON.MeshBuilder.CreateLines(
+    "navPath",
+    { points: path.map((point) => vec3([point[0], point[1], point[2] + 0.08])) },
+    scene,
+  );
+  pathMesh.color = new BABYLON.Color3(0.15, 0.95, 0.68);
+  pathMesh.isPickable = false;
+}
+
+function applyState(payload) {
   for (const body of payload.bodies) {
     const node = ensureBodyNode(body.name);
-    node.position = vec3(body.position);
-    node.rotationQuaternion = quatWxyz(body.wxyz);
-    if (body.name === "pelvis" || body.name === "torso_link" || body.name === "body_1") {
-      latestRootPosition = node.position.clone();
+    copyVec3ToNode(node, body.position);
+    copyQuatWxyzToNode(node, body.wxyz);
+    if (robotRootBodyNames.has(body.name)) {
+      updateLatestRootPosition(node.position);
     }
   }
 
@@ -583,19 +632,55 @@ function updateState(payload) {
     latestRootPosition = vec3(payload.bodies[1].position);
   }
 
-  if (pathMesh) {
-    pathMesh.dispose();
-    pathMesh = null;
+  updatePath(payload.path, payload.path_version);
+  _updateSlidersFromState(payload.joints);
+}
+
+function queueState(payload) {
+  const nowMs = performance.now();
+  const sourceMs = Number.isFinite(payload.time) ? payload.time * 1000 : nowMs;
+  stateTiming.jsMinusSourceMs = Math.min(
+    nowMs - sourceMs,
+    stateTiming.jsMinusSourceMs,
+  );
+
+  const previousSourceMs = stateTiming.previousSourceMs ?? sourceMs;
+  const sourceDeltaMs = sourceMs - previousSourceMs;
+  stateTiming.previousSourceMs = sourceMs;
+
+  let targetMs = nowMs;
+  const sourceLagMs = nowMs - stateTiming.jsMinusSourceMs - sourceMs;
+  if (
+    stateTiming.lastIdealJsMs === null ||
+    sourceDeltaMs <= 0 ||
+    sourceDeltaMs > stateImmediateDeltaMs ||
+    sourceLagMs > stateMaxLagMs
+  ) {
+    stateTiming.lastIdealJsMs = nowMs;
+  } else {
+    const idealNextMs = stateTiming.lastIdealJsMs + sourceDeltaMs;
+    const timeUntilIdealMs = idealNextMs - nowMs;
+    if (timeUntilIdealMs > stateEarlyThresholdMs) {
+      targetMs = nowMs + timeUntilIdealMs * statePacingDamping;
+      stateTiming.lastIdealJsMs += sourceDeltaMs * statePacingDamping;
+    } else {
+      stateTiming.lastIdealJsMs = nowMs;
+    }
   }
-  if (payload.path && payload.path.length > 1) {
-    pathMesh = BABYLON.MeshBuilder.CreateLines(
-      "navPath",
-      { points: payload.path.map((point) => vec3([point[0], point[1], point[2] + 0.08])) },
-      scene,
-    );
-    pathMesh.color = new BABYLON.Color3(0.15, 0.95, 0.68);
-    pathMesh.isPickable = false;
+
+  queuedStateFrames.push({ targetMs, payload });
+  while (queuedStateFrames.length > stateQueueMaxLength) {
+    queuedStateFrames.shift();
   }
+}
+
+function applyQueuedState() {
+  const nowMs = performance.now();
+  let frame = null;
+  while (queuedStateFrames.length > 0 && queuedStateFrames[0].targetMs <= nowMs) {
+    frame = queuedStateFrames.shift();
+  }
+  if (frame) applyState(frame.payload);
 }
 
 function createLidarMaterial() {
@@ -691,8 +776,7 @@ function connectWebSocket(socketRef) {
     if (typeof event.data === "string") {
       const payload = JSON.parse(event.data);
       if (payload.type === "state") {
-        updateState(payload);
-        _updateSlidersFromState(payload.joints);
+        queueState(payload);
       }
       if (payload.type === "pointcloud") updatePointCloud(payload);
     } else {
@@ -1107,6 +1191,7 @@ window.addEventListener("blur", () => {
 });
 
 function renderFrame() {
+  applyQueuedState();
   updateKeyboardCamera();
   sendDriveCommand(false);
   scene.render();
