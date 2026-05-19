@@ -38,7 +38,10 @@ logger = setup_logger()
 class PGORustConfig(NativeModuleConfig):
     cwd: str | None = str(Path(__file__).resolve().parent / "rust")
     executable: str = "target/release/pgo_rust"
-    build_command: str | None = "cargo build --release"
+    # Uses `nix develop --command` so the cxx FFI build sees the gtsam +
+    # cephes-gtsam + tbb + eigen include / lib paths from the per-module
+    # flake. A bare `cargo build` fails outside nix (missing gtsam headers).
+    build_command: str | None = "nix develop --command cargo build --release"
     stdin_config: bool = True
     ready_timeout_sec: float = 10.0
 

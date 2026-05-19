@@ -14,7 +14,12 @@ use kiddo::float::kdtree::KdTree;
 use kiddo::SquaredEuclidean;
 use nalgebra::{Isometry3, Matrix3, Translation3, UnitQuaternion, Vector3};
 
-const KD_BUCKET_SIZE: usize = 32;
+// kiddo panics when more than 2 × bucket_size points share the same value on
+// any one axis (= fall on the same splitting plane). LiDAR scans routinely
+// have thousands of ground-plane points with identical z, so the default 32
+// triggers the panic on real data. 4096 is large enough that no realistic
+// scan hits the limit, and the per-node memory cost is small (a few KB).
+const KD_BUCKET_SIZE: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -69,12 +74,11 @@ pub fn align(source: &[[f64; 3]], target: &[[f64; 3]], config: &Config) -> IcpRe
         };
     }
 
-    // kiddo panics if more than 2 × bucket_size points share identical
-    // coordinates on any single axis ("Too many items with the same position
-    // on one axis"). LiDAR scans routinely produce coincident points (sensor
-    // noise floor, ground-plane returns, voxel-grid pre-downsampling).
-    // Dedupe by quantizing to a 1 µm grid before tree insertion — far below
-    // sensor noise, harmless for correspondence search, and idempotent.
+    // kiddo panics if more than 2 × bucket_size points share the same
+    // coordinate on any single axis (ground-plane scans easily blow the
+    // default 32-point limit). KD_BUCKET_SIZE is bumped above; we also
+    // dedupe at a 1 µm grid (well below sensor noise) so identical-XYZ
+    // duplicates from voxel pre-downsampling don't burn bucket capacity.
     let mut tree: KdTree<f64, u32, 3, KD_BUCKET_SIZE, u32> = KdTree::with_capacity(target.len());
     let mut seen: std::collections::HashSet<(i64, i64, i64)> = std::collections::HashSet::with_capacity(target.len());
     let scale = 1.0e6_f64;
