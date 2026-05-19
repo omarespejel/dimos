@@ -290,6 +290,33 @@ navigation = [
     "gtsam-extended>=4.3a1.post1",
 ]
 
+# Pimsim browser viewer + offline scene-asset cooker.  Opt-in.
+# Powers dimos.experimental.pimsim (browser-based MuJoCo viewer at :8091)
+# and dimos.simulation.scene_assets.cook (cook a source mesh into a
+# browser visual GLB, a browser collision GLB, and a MuJoCo wrapper).
+#
+# Heavy native deps (open3d for collision simplification, mujoco for the
+# wrapper compile, trimesh + usd-core + vhacdx + coacd for scene bake)
+# come through [sim].  Starlette/uvicorn for the in-process viewer HTTP
+# server come through [web].
+#
+# IMPORTANT: the visual GLB cooker shells out to `gltfpack` for the
+# default optimizer (draw-call merging, mesh decimation, KTX2/WebP
+# texture compression).  gltfpack is a C++ CLI from the meshoptimizer
+# project -- it is NOT pip-installable.  Install it separately:
+#
+#     npm install -g gltfpack
+#     # or download a binary from
+#     # https://github.com/zeux/meshoptimizer/releases
+#
+# Without gltfpack the cooker still runs via `--visual-optimizer copy`
+# (no simplification, source GLB only) or `--visual-optimizer blender`
+# (which requires `blender` on PATH for the format conversion path).
+pimsim = [
+    "dimos[sim,web]",
+    "websockets>=13",
+]
+
 # NOTE: jetson-jp6-cuda126 extra is disabled due to 404 errors from wheel URLs
 # The pypi.jetson-ai-lab.io URLs are currently unavailable. Update with working URLs when available.
 # jetson-jp6-cuda126 = [

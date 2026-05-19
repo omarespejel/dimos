@@ -2092,6 +2092,24 @@ perception = [
     { name = "transformers", extra = ["torch"] },
     { name = "ultralytics" },
 ]
+pimsim = [
+    { name = "coacd" },
+    { name = "fastapi" },
+    { name = "ffmpeg-python" },
+    { name = "jinja2" },
+    { name = "mujoco" },
+    { name = "playground" },
+    { name = "pygame" },
+    { name = "python-multipart" },
+    { name = "python-socketio" },
+    { name = "soundfile" },
+    { name = "sse-starlette" },
+    { name = "trimesh" },
+    { name = "usd-core" },
+    { name = "uvicorn" },
+    { name = "vhacdx" },
+    { name = "websockets" },
+]
 psql = [
     { name = "psycopg2-binary" },
 ]
@@ -2343,6 +2361,7 @@ requires-dist = [
     { name = "dimos", extras = ["agents", "apriltag", "base", "cpu", "cuda", "docker", "drone", "manipulation", "misc", "perception", "psql", "sim", "unitree", "visualization", "web"], marker = "extra == 'all'" },
     { name = "dimos", extras = ["agents", "web", "visualization"], marker = "extra == 'base'" },
     { name = "dimos", extras = ["base"], marker = "extra == 'unitree'" },
+    { name = "dimos", extras = ["sim", "web"], marker = "extra == 'pimsim'" },
     { name = "dimos", extras = ["unitree"], marker = "extra == 'unitree-dds'" },
     { name = "dimos", extras = ["viz"], marker = "extra == 'splat'" },
     { name = "dimos-lcm" },
@@ -2471,13 +2490,14 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'web'", specifier = ">=0.34.0" },
     { name = "vhacdx", marker = "extra == 'sim'" },
     { name = "viser", marker = "extra == 'viz'", specifier = ">=1.0.26" },
+    { name = "websockets", marker = "extra == 'pimsim'", specifier = ">=13" },
     { name = "xacro", marker = "extra == 'manipulation'" },
     { name = "xarm-python-sdk", marker = "extra == 'manipulation'", specifier = ">=1.17.0" },
     { name = "xarm-python-sdk", marker = "extra == 'misc'", specifier = ">=1.17.0" },
     { name = "xformers", marker = "platform_machine == 'x86_64' and extra == 'cuda'", specifier = ">=0.0.20" },
     { name = "yapf", marker = "extra == 'misc'", specifier = "==0.40.2" },
 ]
-provides-extras = ["misc", "visualization", "agents", "web", "perception", "unitree", "unitree-dds", "manipulation", "cpu", "cuda", "psql", "sim", "viz", "splat", "navigation", "drone", "dds", "docker", "base", "apriltag", "all"]
+provides-extras = ["misc", "visualization", "agents", "web", "perception", "unitree", "unitree-dds", "manipulation", "cpu", "cuda", "psql", "sim", "viz", "splat", "navigation", "pimsim", "drone", "dds", "docker", "base", "apriltag", "all"]
 
 [package.metadata.requires-dev]
 autofix = [{ name = "ruff", specifier = "==0.14.3" }]
