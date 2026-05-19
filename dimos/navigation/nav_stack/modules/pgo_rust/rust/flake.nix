@@ -36,7 +36,7 @@
           pkgs.eigen
           pkgs.boost
           pkgs.glib
-          pkgs.tbb_2021
+          pkgs.onetbb
         ];
       in {
         # `nix build .#default` produces the compiled binary alongside the
@@ -60,7 +60,7 @@
           GTSAM_LIB_DIR = "${gtsam}/lib";
           EIGEN_INCLUDE_DIR = "${pkgs.eigen}/include/eigen3";
           BOOST_INCLUDE_DIR = "${pkgs.boost.dev}/include";
-          TBB_LIB_DIR = "${pkgs.tbb_2021}/lib";
+          TBB_LIB_DIR = "${pkgs.onetbb}/lib";
 
           doCheck = false;  # unit tests run separately via `cargo test`
         };
@@ -80,7 +80,7 @@
           GTSAM_LIB_DIR = "${gtsam}/lib";
           EIGEN_INCLUDE_DIR = "${pkgs.eigen}/include/eigen3";
           BOOST_INCLUDE_DIR = "${pkgs.boost.dev}/include";
-          TBB_LIB_DIR = "${pkgs.tbb_2021}/lib";
+          TBB_LIB_DIR = "${pkgs.onetbb}/lib";
 
           shellHook = ''
             echo "dimos-pgo-rust dev shell"

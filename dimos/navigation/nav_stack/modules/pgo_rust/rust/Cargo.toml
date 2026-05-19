@@ -1,0 +1,26 @@
+[package]
+name = "dimos-pgo"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust PGO (pose graph optimization) module for dimos"
+license = "Apache-2.0"
+
+[[bin]]
+name = "pgo_rust"
+path = "src/main.rs"
+
+[dependencies]
+dimos-module = { path = "../../../../../../native/rust/dimos-module" }
+lcm-msgs = { git = "https://github.com/dimensionalOS/dimos-lcm.git", branch = "rust-codegen" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+serde = { version = "1", features = ["derive"] }
+nalgebra = "0.33"
+kiddo = "5"
+cxx = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
