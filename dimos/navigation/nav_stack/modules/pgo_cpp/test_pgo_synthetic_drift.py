@@ -24,7 +24,7 @@ scan), but the reported odom pose is offset by several metres. With
 the two visits; Scan Context, which works on the appearance of the
 scan rather than the pose, can.
 
-This test runs PGO twice with the same input via the DimOS Module +
+This test runs PGOCpp twice with the same input via the DimOS Module +
 Blueprint pipeline (no direct LCM topic strings here):
 
 1. ``use_scan_context=true``  → expect ≥1 loop_closure_event message.
@@ -54,7 +54,7 @@ from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.nav_msgs.GraphDelta3D import GraphDelta3D
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
-from dimos.navigation.nav_stack.modules.pgo.pgo import PGO
+from dimos.navigation.nav_stack.modules.pgo_cpp.pgo_cpp import PGOCpp
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
@@ -72,12 +72,12 @@ MIN_LOOP_DETECT_DURATION_S = 1.0
 
 # Per-frame publish interval driving the synthetic playback module.
 INTER_FRAME_SLEEP_SEC = 0.15
-# Drain after the playback module reports finished, so PGO can flush
+# Drain after the playback module reports finished, so PGOCpp can flush
 # any pending loop closure events before the coordinator stops.
 POST_FEED_DRAIN_SEC = 3.0
 # Poll period when waiting for the playback module to drain.
 POLL_INTERVAL_SEC = 0.25
-# After the first scan goes out, wait this long for PGO to emit anything
+# After the first scan goes out, wait this long for PGOCpp to emit anything
 PGO_FIRST_RESPONSE_TIMEOUT_SEC = 20.0
 
 
@@ -148,7 +148,7 @@ def _trajectory_with_drift(
     samples: list[tuple[float, np.ndarray, float, np.ndarray, float]] = []
     # Start at timestamp=1.0 because Odometry(ts=0.0) is treated as "now" by
     # the constructor — using 0.0 would inject wall-clock time and break the
-    # monotonic-ts assumption in PGO's on_registered_scan.
+    # monotonic-ts assumption in PGOCpp's on_registered_scan.
     timestamp = 1.0
     time_step = 0.5
     total_steps = num_outbound + num_inbound
@@ -242,8 +242,8 @@ class SyntheticDriftPlaybackModule(Module):
 
     registered_scan: Out[PointCloud2]
     odometry: Out[Odometry]
-    # Subscribed only so we can detect when PGO has come up and processed the
-    # first scan — see _run_playback's "wait for PGO ack" gate.
+    # Subscribed only so we can detect when PGOCpp has come up and processed the
+    # first scan — see _run_playback's "wait for PGOCpp ack" gate.
     corrected_odometry: In[Odometry]
 
     def __init__(self, **kwargs: Any) -> None:
@@ -308,9 +308,9 @@ class SyntheticDriftPlaybackModule(Module):
                 self.registered_scan.publish(scan_message)
                 self._frames_published += 1
                 if frame_index == 0:
-                    # Wait for PGO to publish anything (corrected_odometry)
+                    # Wait for PGOCpp to publish anything (corrected_odometry)
                     # before sending the rest of the trajectory, so we don't
-                    # race PGO's startup.
+                    # race PGOCpp's startup.
                     try:
                         await asyncio.wait_for(
                             self._pgo_first_response.wait(),
@@ -318,10 +318,10 @@ class SyntheticDriftPlaybackModule(Module):
                         )
                     except asyncio.TimeoutError:
                         raise RuntimeError(
-                            "PGO didn't start in time: no corrected_odometry "
+                            "PGOCpp didn't start in time: no corrected_odometry "
                             f"received within {self.config.pgo_first_response_timeout_sec:.1f}s "
                             "of the first scan. Bump PGO_FIRST_RESPONSE_TIMEOUT_SEC "
-                            "(top of test_pgo_synthetic_drift.py) if PGO needs longer to "
+                            "(top of test_pgo_synthetic_drift.py) if PGOCpp needs longer to "
                             "start on this host."
                         ) from None
                 if self.config.inter_frame_sleep_sec > 0:
@@ -373,14 +373,14 @@ def _run_pgo(
     use_scan_context: bool,
     trajectory: list[tuple[float, np.ndarray, float, np.ndarray, float]] | None = None,
 ) -> int:
-    """Build the blueprint, run the synthetic trajectory through PGO, return loop count."""
+    """Build the blueprint, run the synthetic trajectory through PGOCpp, return loop count."""
     if trajectory is None:
         trajectory = _trajectory_with_drift()
 
     playback_blueprint = SyntheticDriftPlaybackModule.blueprint(
         trajectory=_trajectory_payload(trajectory),
     )
-    pgo_blueprint = PGO.blueprint(
+    pgo_blueprint = PGOCpp.blueprint(
         debug=True,
         use_scan_context=use_scan_context,
         key_pose_delta_trans=0.4,

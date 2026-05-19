@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end check that PGO publishes valid loop_closure_event messages.
+"""End-to-end check that PGOCpp publishes valid loop_closure_event messages.
 
-Replays the ``og_nav_60s`` rosbag through PGO with aggressive
+Replays the ``og_nav_60s`` rosbag through PGOCpp with aggressive
 loop-closure thresholds and asserts each emitted ``loop_closure_event``
 (a ``GraphDelta3D``) has positive-shape per-node SE(3) deltas with
 unit-norm quaternions and finite translations. Wired with the DimOS
@@ -39,7 +39,7 @@ from dimos.core.core import rpc
 from dimos.core.module import Module
 from dimos.core.stream import In
 from dimos.msgs.nav_msgs.GraphDelta3D import GraphDelta3D
-from dimos.navigation.nav_stack.modules.pgo.pgo import PGO
+from dimos.navigation.nav_stack.modules.pgo_cpp.pgo_cpp import PGOCpp
 from dimos.navigation.nav_stack.tests.rosbag_fixtures import (
     RosbagScanOdomPlaybackModule,
 )
@@ -172,13 +172,13 @@ def _validate_loop_closure_event(event: dict[str, Any], event_index: int) -> tup
 
 
 class TestPGOLoopClosure:
-    """End-to-end: PGO publishes loop_closure_event with valid SE(3) deltas."""
+    """End-to-end: PGOCpp publishes loop_closure_event with valid SE(3) deltas."""
 
     def test_loop_closure_events_published(self) -> None:
         playback_blueprint = RosbagScanOdomPlaybackModule.blueprint()
         # Aggressive loop-closure thresholds — bag is 60s, so we need short
         # re-visit windows to actually fire events.
-        pgo_blueprint = PGO.blueprint(
+        pgo_blueprint = PGOCpp.blueprint(
             key_pose_delta_trans=0.5,
             loop_search_radius=2.0,
             loop_time_thresh=5.0,
@@ -208,7 +208,7 @@ class TestPGOLoopClosure:
 
         if not events:
             pytest.skip(
-                "rosbag trajectory didn't trigger any PGO loop closures "
+                "rosbag trajectory didn't trigger any PGOCpp loop closures "
                 "even with aggressive thresholds — this validates only the "
                 "publishing path's existence (verified via native log "
                 "lines), not the on-wire payload."

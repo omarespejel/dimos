@@ -13,8 +13,8 @@
 # limitations under the License.
 
 """
-Spins up a blueprint with PGO, the KITTI-360 playback module, and a
-TopicCounter module that subscribes to every PGO output. Reports per-topic
+Spins up a blueprint with PGOCpp, the KITTI-360 playback module, and a
+TopicCounter module that subscribes to every PGOCpp output. Reports per-topic
 message counts and a one-line verdict.
 """
 
@@ -39,11 +39,11 @@ from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.navigation.nav_stack.benchmarks.pose_graph_kitti360.playback import (
     Kitti360PlaybackModule,
 )
-from dimos.navigation.nav_stack.modules.pgo.pgo import PGO
+from dimos.navigation.nav_stack.modules.pgo_cpp.pgo_cpp import PGOCpp
 
 
 class TopicCounterModule(Module):
-    """Subscribes to every PGO output stream and counts arrivals per topic."""
+    """Subscribes to every PGOCpp output stream and counts arrivals per topic."""
 
     corrected_odometry: In[Odometry]
     global_map: In[PointCloud2]
@@ -78,7 +78,7 @@ class TopicCounterModule(Module):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PGO liveness probe via DimOS modules")
+    parser = argparse.ArgumentParser(description="PGOCpp liveness probe via DimOS modules")
     parser.add_argument("--kitti360-root", type=Path, required=True)
     parser.add_argument("--sequence", type=int, default=2)
     parser.add_argument("--num-scans", type=int, default=200)
@@ -99,7 +99,7 @@ def main() -> None:
         max_scans=args.num_scans,
         publish_interval_sec=args.publish_interval_sec,
     )
-    pgo_blueprint = PGO.blueprint(
+    pgo_blueprint = PGOCpp.blueprint(
         loop_search_radius=args.loop_search_radius_m,
     )
     counter_blueprint = TopicCounterModule.blueprint()
@@ -119,7 +119,7 @@ def main() -> None:
     finally:
         coordinator.stop()
 
-    print("\n=== PGO topic message counts ===")
+    print("\n=== PGOCpp topic message counts ===")
     for name in (
         "corrected_odometry",
         "global_map",
@@ -130,14 +130,14 @@ def main() -> None:
 
     print("\nverdict:")
     if counts.get("pose_graph", 0) == 0:
-        print("  ⚠ no pose graph — PGO never promoted a keyframe. Check --key_pose_delta_*.")
+        print("  ⚠ no pose graph — PGOCpp never promoted a keyframe. Check --key_pose_delta_*.")
     elif counts.get("loop_closure_event", 0) == 0:
         print(
             "  ⚠ graph builds, no loop closure events — try wider --loop-search-radius "
             "or lower --scan-context-match-threshold."
         )
     else:
-        print("  ✓ all topics firing — PGO is alive end-to-end.")
+        print("  ✓ all topics firing — PGOCpp is alive end-to-end.")
 
 
 if __name__ == "__main__":

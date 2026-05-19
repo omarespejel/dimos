@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Rosbag accuracy test: replays scan+odom at original timing, validates PGO outputs."""
+"""Rosbag accuracy test: replays scan+odom at original timing, validates PGOCpp outputs."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from dimos.core.module import Module
 from dimos.core.stream import In
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
-from dimos.navigation.nav_stack.modules.pgo.pgo import PGO
+from dimos.navigation.nav_stack.modules.pgo_cpp.pgo_cpp import PGOCpp
 from dimos.navigation.nav_stack.tests.rosbag_fixtures import (
     RosbagScanOdomPlaybackModule,
     load_rosbag_window,
@@ -82,13 +82,13 @@ class PgoOutputCollectorModule(Module):
 
 
 class TestPGORosbag:
-    """Validate PGO native module accuracy against OG nav stack recording."""
+    """Validate PGOCpp native module accuracy against OG nav stack recording."""
 
     def test_pgo_corrected_odometry(self) -> None:
-        """Feed scan + odom at original timing and validate PGO outputs.
+        """Feed scan + odom at original timing and validate PGOCpp outputs.
 
         Checks:
-        - PGO produces corrected odometry messages
+        - PGOCpp produces corrected odometry messages
         - Corrected odometry tracks the input trajectory (no wild divergence)
         - Global map is published with non-zero points
         """
@@ -98,7 +98,7 @@ class TestPGORosbag:
 
         playback_blueprint = RosbagScanOdomPlaybackModule.blueprint()
         # Config params matching pgo_unity_sim.yaml.
-        pgo_blueprint = PGO.blueprint(
+        pgo_blueprint = PGOCpp.blueprint(
             key_pose_delta_trans=0.5,
             loop_search_radius=1.0,
             loop_time_thresh=60.0,
@@ -129,14 +129,14 @@ class TestPGORosbag:
         global_map_count = len(global_map_point_counts)
 
         logger.info(f"\n{'=' * 60}")
-        logger.info("PGO NATIVE ROSBAG DEVIATION SCORE")
+        logger.info("PGOCpp NATIVE ROSBAG DEVIATION SCORE")
         logger.info(f"  Input scans:            {len(window.scans)}")
         logger.info(f"  Input odom messages:     {len(window.odom)}")
         logger.info(f"  Corrected odom outputs:  {corrected_count}")
         logger.info(f"  Global map outputs:      {global_map_count}")
 
-        assert corrected_count > 0, "PGO produced no corrected odometry"
-        assert global_map_count > 0, "PGO produced no global map messages"
+        assert corrected_count > 0, "PGOCpp produced no corrected odometry"
+        assert global_map_count > 0, "PGOCpp produced no global map messages"
 
         input_positions = window.odom[:, 1:4]
 
@@ -146,7 +146,7 @@ class TestPGORosbag:
         input_centroid = input_positions.mean(axis=0)
         centroid_error = float(np.linalg.norm(corrected_centroid - input_centroid))
 
-        # PGO shouldn't collapse the trajectory to a point or explode it.
+        # PGOCpp shouldn't collapse the trajectory to a point or explode it.
         corrected_extent = corrected_positions.max(axis=0) - corrected_positions.min(axis=0)
         input_extent = input_positions.max(axis=0) - input_positions.min(axis=0)
         extent_ratio_xy = float(

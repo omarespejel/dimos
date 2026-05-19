@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""evaluate PGO against KITTI-360
+"""evaluate PGOCpp against KITTI-360
 
 Usage:
     uv run python -m dimos.navigation.nav_stack.modules.pgo.run_kitti360 \\
@@ -28,12 +28,12 @@ from pathlib import Path
 from dimos.navigation.nav_stack.benchmarks.pose_graph_kitti360.runner import (
     run_benchmark,
 )
-from dimos.navigation.nav_stack.modules.pgo.pgo import PGO
+from dimos.navigation.nav_stack.modules.pgo_cpp.pgo_cpp import PGOCpp
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run the generic pose-graph KITTI-360 benchmark against PGO"
+        description="Run the generic pose-graph KITTI-360 benchmark against PGOCpp"
     )
     parser.add_argument("--kitti360-root", type=Path, required=True)
     parser.add_argument("--sequence", type=int, default=2)
@@ -47,7 +47,7 @@ def main() -> None:
     args = parser.parse_args()
 
     results = run_benchmark(
-        module_under_test=PGO,
+        module_under_test=PGOCpp,
         module_kwargs={
             "scan_context_match_threshold": args.scan_context_match_threshold,
             "loop_score_thresh": args.loop_score_thresh,

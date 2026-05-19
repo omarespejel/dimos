@@ -34,7 +34,7 @@ from dimos.utils.logging_config import setup_logger
 logger = setup_logger()
 
 
-class PGOConfig(NativeModuleConfig):
+class PGOCppConfig(NativeModuleConfig):
     cwd: str | None = str(Path(__file__).resolve().parent / "cpp")
     executable: str = "result/bin/pgo"
     build_command: str | None = "nix build .#default --no-write-lock-file"
@@ -85,10 +85,10 @@ class PGOConfig(NativeModuleConfig):
     debug: bool = False
 
 
-class PGO(NativeModule, LoopClosure):
+class PGOCpp(NativeModule, LoopClosure):
     """Pose graph optimization with loop closure using GTSAM iSAM2 + PCL ICP."""
 
-    config: PGOConfig
+    config: PGOCppConfig
 
     registered_scan: In[PointCloud2]
     odometry: In[Odometry]
