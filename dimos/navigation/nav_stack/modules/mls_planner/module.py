@@ -27,11 +27,21 @@ from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.nav_msgs.Path import Path
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
+from dimos.navigation.nav_stack.modules.mls_planner.planner import (
+    MLS,
+    points_to_mls,
+    robot_height_in_voxels,
+    surface_centers,
+)
+from dimos.utils.logging_config import setup_logger
+
+logger = setup_logger()
 
 
 class MlsPlannerConfig(ModuleConfig):
     world_frame: str = "world"
     voxel_size: float = 0.1
+    robot_height: float = 0.75  # m
 
 
 class MlsPlanner(Module):
@@ -47,12 +57,13 @@ class MlsPlanner(Module):
     odometry: In[Odometry]
     goal: In[PoseStamped]
     path: Out[Path]
+    surfaces: Out[PointCloud2]  # debug: extracted MLS surface centers
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._lock = threading.Lock()
         self._latest_odom: Odometry | None = None
-        self._latest_map: PointCloud2 | None = None
+        self._latest_mls: MLS | None = None
 
     @rpc
     def start(self) -> None:
@@ -70,8 +81,12 @@ class MlsPlanner(Module):
             self._latest_odom = msg
 
     def _on_map(self, msg: PointCloud2) -> None:
+        points = msg.points_f32()
+        rh_voxels = robot_height_in_voxels(self.config.robot_height, self.config.voxel_size)
+        mls = points_to_mls(points, self.config.voxel_size, rh_voxels)
         with self._lock:
-            self._latest_map = msg
+            self._latest_mls = mls
+        self._publish_surfaces(mls)
 
     def _on_goal(self, goal: PoseStamped) -> None:
         with self._lock:
@@ -80,6 +95,16 @@ class MlsPlanner(Module):
             return
         path = self._plan(odom, goal)
         self.path.publish(path)
+
+    def _publish_surfaces(self, mls: MLS) -> None:
+        centers = surface_centers(mls, self.config.voxel_size)
+        cloud = PointCloud2.from_numpy(
+            points=centers,
+            frame_id=self.config.world_frame,
+            timestamp=time.time(),
+        )
+        self.surfaces.publish(cloud)
+        logger.info("MlsPlanner extracted %d surfaces across %d columns", len(centers), len(mls))
 
     def _plan(self, odom: Odometry, goal: PoseStamped) -> Path:
         start_pose = PoseStamped(

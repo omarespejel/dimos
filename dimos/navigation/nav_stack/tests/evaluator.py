@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import threading
 import time
 from typing import Any
@@ -51,6 +52,18 @@ class Scene:
     name: str = "scene"
 
 
+def _cell_centers(low: float, high: float, voxel_size: float) -> np.ndarray:
+    """World-frame voxel-center positions for cells whose centers lie in [low, high].
+
+    Generated via integer cell indices to avoid floating-point drift in
+    ``np.arange(step=voxel_size)``, which would otherwise mis-bucket points
+    at certain x and y values and produce missing stripes downstream.
+    """
+    i_min = math.floor(low / voxel_size)
+    i_max = math.floor(high / voxel_size)
+    return (np.arange(i_min, i_max + 1) + 0.5) * voxel_size
+
+
 def _flat_floor(
     voxel_size: float,
     extent: tuple[float, float, float, float],
@@ -60,13 +73,14 @@ def _flat_floor(
     """Single-layer floor at height ``z`` over ``extent=(xmin, xmax, ymin, ymax)``,
     with rectangular ``holes`` cut out (e.g. footprints of objects sitting on it)."""
     xmin, xmax, ymin, ymax = extent
-    xs = np.arange(xmin, xmax + voxel_size, voxel_size)
-    ys = np.arange(ymin, ymax + voxel_size, voxel_size)
+    xs = _cell_centers(xmin, xmax, voxel_size)
+    ys = _cell_centers(ymin, ymax, voxel_size)
+    z_center = (math.floor(z / voxel_size) + 0.5) * voxel_size
     fx, fy = np.meshgrid(xs, ys, indexing="ij")
     mask = np.ones(fx.shape, dtype=bool)
     for hx_min, hx_max, hy_min, hy_max in holes or []:
         mask &= ~((fx >= hx_min) & (fx <= hx_max) & (fy >= hy_min) & (fy <= hy_max))
-    return np.stack([fx[mask], fy[mask], np.full(int(mask.sum()), z)], axis=1)
+    return np.stack([fx[mask], fy[mask], np.full(int(mask.sum()), z_center)], axis=1)
 
 
 def _box_shell(
@@ -80,23 +94,23 @@ def _box_shell(
     False since boxes sitting on a floor occlude their bottom face from lidar.
     """
     xmin, xmax, ymin, ymax, zmin, zmax = bounds
-    xs = np.arange(xmin, xmax + voxel_size, voxel_size)
-    ys = np.arange(ymin, ymax + voxel_size, voxel_size)
-    zs = np.arange(zmin, zmax + voxel_size, voxel_size)
+    xs = _cell_centers(xmin, xmax, voxel_size)
+    ys = _cell_centers(ymin, ymax, voxel_size)
+    zs = _cell_centers(zmin, zmax, voxel_size)
 
     def _grid(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
         ga, gb, gc = np.meshgrid(a, b, c, indexing="ij")
         return np.stack([ga.ravel(), gb.ravel(), gc.ravel()], axis=1)
 
     faces = [
-        _grid(xs, ys, np.array([zmax])),  # top
-        _grid(np.array([xmin]), ys, zs),  # -x wall
-        _grid(np.array([xmax]), ys, zs),  # +x wall
-        _grid(xs, np.array([ymin]), zs),  # -y wall
-        _grid(xs, np.array([ymax]), zs),  # +y wall
+        _grid(xs, ys, zs[-1:]),  # top
+        _grid(xs[:1], ys, zs),  # -x wall
+        _grid(xs[-1:], ys, zs),  # +x wall
+        _grid(xs, ys[:1], zs),  # -y wall
+        _grid(xs, ys[-1:], zs),  # +y wall
     ]
     if include_bottom:
-        faces.append(_grid(xs, ys, np.array([zmin])))
+        faces.append(_grid(xs, ys, zs[:1]))
     return np.concatenate(faces, axis=0)
 
 

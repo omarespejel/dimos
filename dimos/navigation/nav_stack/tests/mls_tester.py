@@ -20,18 +20,27 @@ Run with:
 
 from __future__ import annotations
 
+from typing import Any
+
 from dimos.core.coordination.blueprints import Blueprint, autoconnect
 from dimos.core.coordination.module_coordinator import ModuleCoordinator
+from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.navigation.nav_stack.modules.mls_planner.module import MlsPlanner
 from dimos.navigation.nav_stack.tests.evaluator import Evaluator, default_scene
 from dimos.visualization.rerun.bridge import RerunBridgeModule
+
+
+def _render_surfaces(msg: PointCloud2) -> Any:
+    return msg.to_rerun(voxel_size=0.075, mode="boxes")
 
 
 def build_blueprint() -> Blueprint:
     return autoconnect(
         Evaluator.blueprint(scene=default_scene()),
         MlsPlanner.blueprint(),
-        RerunBridgeModule.blueprint(),
+        RerunBridgeModule.blueprint(
+            visual_override={"world/surfaces": _render_surfaces},
+        ),
     )
 
 
