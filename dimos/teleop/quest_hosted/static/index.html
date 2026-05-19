@@ -520,6 +520,7 @@ angular.z = 0</pre>
         function startKeyboardLoop() {
             window.addEventListener('keydown', onKeyDown);
             window.addEventListener('keyup', onKeyUp);
+            let twistSeq = 0;
             kbInterval = setInterval(() => {
                 // Always update key visuals; only send/readout when channel is up.
                 updateKeyVisuals();
@@ -530,8 +531,9 @@ angular.z = 0</pre>
                     sec: Math.floor(nowMs / 1000),
                     nsec: (nowMs % 1000) * 1_000_000,
                 });
+                twistSeq = (twistSeq + 1) & 0x7fffffff;
                 const twist = new geometry_msgs.TwistStamped({
-                    header: new std_msgs.Header({ stamp: ts, frame_id: 'keyboard' }),
+                    header: new std_msgs.Header({ stamp: ts, frame_id: 'keyboard', seq: twistSeq }),
                     twist: new geometry_msgs.Twist({
                         linear: new geometry_msgs.Vector3({ x: t.linear_x, y: t.linear_y, z: t.linear_z }),
                         angular: new geometry_msgs.Vector3({ x: 0, y: 0, z: t.angular_z }),
