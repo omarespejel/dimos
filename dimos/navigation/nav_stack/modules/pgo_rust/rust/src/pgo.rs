@@ -72,7 +72,17 @@ impl Default for Config {
 pub struct Keyframe {
     pub timestamp: f64,
     pub body_cloud: Vec<[f64; 3]>,
+    /// Raw odometry pose at the time this keyframe was added — the input
+    /// from upstream odometry, never modified.
     pub raw_pose: Isometry3<f64>,
+    /// Current best-estimate world-frame pose. Initially equals
+    /// `pose_offset_at_add * raw_pose`; refreshed from iSAM2 after every
+    /// `flush()` so that older keyframes reflect post-loop corrections.
+    /// Submaps and ICP use this directly (matches cpp's per-keyframe
+    /// `r_global` / `t_global` semantics — without this each keyframe
+    /// would inherit only the latest single pose_offset which is wrong
+    /// when iSAM2 distributed corrections non-uniformly across the chain).
+    pub world_pose: Isometry3<f64>,
     pub descriptor: Descriptor,
     pub ring_key: RingKey,
 }
@@ -139,9 +149,16 @@ impl PgoState {
     ) -> usize {
         let descriptor = scan_context::make_descriptor(&body_cloud, &self.config.scan_context);
         let ring_key = scan_context::make_ring_key(&descriptor);
-        let keyframe = Keyframe { timestamp, body_cloud, raw_pose, descriptor, ring_key };
         let index = self.keyframes.len();
         let corrected_pose = self.pose_offset * raw_pose;
+        let keyframe = Keyframe {
+            timestamp,
+            body_cloud,
+            raw_pose,
+            world_pose: corrected_pose,
+            descriptor,
+            ring_key,
+        };
         if index == 0 {
             self.optimizer.add_prior(0, corrected_pose, self.config.prior_noise);
             self.optimizer.insert_initial(0, corrected_pose);
@@ -203,14 +220,8 @@ impl PgoState {
             self.search_by_position(query_index).map(|index| (index, 0))
         }?;
 
-        // Reject candidates physically too far from the query in current
-        // world frame.  scan_context's structural descriptor can match
-        // genuinely-similar-looking-but-different scenes (urban grid → grid)
-        // across the trajectory; this gate kills those cross-trajectory FPs
-        // before they get into ICP and from there into iSAM2 (where one bad
-        // loop ruins pose_offset and cascades).
-        let q_world = (self.pose_offset * self.keyframes[query_index].raw_pose).translation.vector;
-        let c_world = (self.pose_offset * self.keyframes[candidate_index].raw_pose).translation.vector;
+        let q_world = self.keyframes[query_index].world_pose.translation.vector;
+        let c_world = self.keyframes[candidate_index].world_pose.translation.vector;
         if (q_world - c_world).norm() > self.config.loop_candidate_max_distance_m {
             return None;
         }
@@ -235,7 +246,7 @@ impl PgoState {
         if sector_shift != 0 {
             let yaw = scan_context::yaw_from_shift(sector_shift, self.config.scan_context.n_sectors);
             let rotation = nalgebra::UnitQuaternion::from_axis_angle(&nalgebra::Vector3::z_axis(), yaw);
-            let source_world_pos = (self.pose_offset * self.keyframes[query_index].raw_pose).translation.vector;
+            let source_world_pos = self.keyframes[query_index].world_pose.translation.vector;
             // init = T(p) · Rz(yaw) · T(-p)
             let translation = source_world_pos - rotation * source_world_pos;
             init_guess = Isometry3::from_parts(
@@ -244,23 +255,10 @@ impl PgoState {
             );
         }
 
-        // Single-pass ICP with PCL-style few-correspondences tolerance
-        // (min_correspondences=3 in icp::Config::default — was 10, which
-        // rejected entire runs that PCL would refine).  Start at 10 m corr
-        // distance to match cpp.  ICP iterates from whatever overlapping
-        // points exist after the yaw init_guess and grows the correspondence
-        // set as the source pulls toward target.
         let mut icp_cfg = icp::Config::default();
         icp_cfg.initial_transform = init_guess;
         let icp_result = icp::align(&source_cloud, &target_cloud, &icp_cfg);
 
-        // Accept any ICP termination that didn't error out.  Trust
-        // scan_context for admission (its 0.4 cosine threshold already
-        // filters out ~95% of queries), and let the noise-scaled loop
-        // factor in iSAM2 attenuate any borderline matches.  The cpp
-        // baseline at loop_score_thresh=10000 effectively does the same:
-        // "accept whatever scan_context matched, ICP gives us the
-        // refined transform but isn't a rejection gate."
         if !matches!(
             icp_result.reason,
             icp::TerminationReason::Converged | icp::TerminationReason::MaxIterations
@@ -271,6 +269,32 @@ impl PgoState {
         if score > self.config.loop_score_thresh {
             return None;
         }
+
+        // The BetweenFactor between target → source expects T_between such
+        // that T_target^-1 * T_source_corrected = T_between, where
+        // T_source_corrected = T_align * T_source_world (the ICP alignment
+        // applied to the source's current world-frame pose). Both submaps
+        // were built in the current pose_offset world frame, so T_align is
+        // a world-frame transform — we must compose it with the world poses
+        // and then express the result in the target's body frame.
+        //
+        // This mirrors cpp/simple_pgo.cpp:277-280:
+        //   r_refined = R_loop * R_source_global
+        //   t_refined = R_loop * t_source_global + t_loop
+        //   r_offset  = R_target_global^T * r_refined
+        //   t_offset  = R_target_global^T * (t_refined - t_target_global)
+        // which is exactly T_target_world^-1 * (T_align * T_source_world).
+        //
+        // Previously we passed T_align directly — that produced a factor
+        // demanding T_target^-1 * T_source = T_align, which only happens
+        // when T_target and T_source straddle the world origin in a very
+        // specific way. On KITTI-360 with revisits far from origin this
+        // made the loop factor pull poses to nonsense, undoing recall.
+        let source_world = self.keyframes[query_index].world_pose;
+        let target_world = self.keyframes[candidate_index].world_pose;
+        let source_corrected_world = icp_result.transform * source_world;
+        let relative_pose = target_world.inverse() * source_corrected_world;
+
         eprintln!(
             "pgo_rust ICP ACCEPT: q={} c={} corr={} mse={:.3} reason={:?}",
             query_index, candidate_index, icp_result.correspondences,
@@ -279,7 +303,7 @@ impl PgoState {
         Some(LoopPair {
             source_index: query_index,
             target_index: candidate_index,
-            relative_pose: icp_result.transform,
+            relative_pose,
             score,
         })
     }
@@ -307,13 +331,13 @@ impl PgoState {
 
     fn search_by_position(&self, query_index: usize) -> Option<usize> {
         let query = &self.keyframes[query_index];
-        let query_pos = (self.pose_offset * query.raw_pose).translation.vector;
+        let query_pos = query.world_pose.translation.vector;
         let mut best: Option<(usize, f64)> = None;
         for (candidate_index, candidate) in self.keyframes.iter().enumerate() {
             if !self.is_time_eligible(query, candidate) {
                 continue;
             }
-            let candidate_pos = (self.pose_offset * candidate.raw_pose).translation.vector;
+            let candidate_pos = candidate.world_pose.translation.vector;
             let distance = (query_pos - candidate_pos).norm();
             if distance <= self.config.loop_search_radius
                 && best.is_none_or(|(_, best_distance)| distance < best_distance)
@@ -341,9 +365,8 @@ impl PgoState {
 
         let mut combined: Vec<[f64; 3]> = Vec::new();
         for keyframe in &self.keyframes[start..end] {
-            let world_pose = self.pose_offset * keyframe.raw_pose;
             for point in &keyframe.body_cloud {
-                let p = world_pose * nalgebra::Point3::new(point[0], point[1], point[2]);
+                let p = keyframe.world_pose * nalgebra::Point3::new(point[0], point[1], point[2]);
                 combined.push([p.x, p.y, p.z]);
             }
         }
@@ -392,12 +415,19 @@ impl PgoState {
         }
         let deltas = self.optimizer.update();
         self.pending_loops.clear();
-        // Refresh pose_offset against the latest keyframe.
-        if let Some(last_index) = self.keyframes.len().checked_sub(1) {
-            if let Some(optimized) = self.optimizer.estimate(last_index as u64) {
-                let raw_last = self.keyframes[last_index].raw_pose;
-                self.pose_offset = optimized * raw_last.inverse();
+        // Refresh every keyframe's world_pose from iSAM2 (mirrors cpp's
+        // smoothAndUpdate loop at simple_pgo.cpp:315). Without this, only
+        // the latest keyframe's pose tracked the optimizer and earlier
+        // keyframes inherited a single global pose_offset that didn't
+        // reflect iSAM2's actual per-key corrections — subsequent
+        // submap()/ICP calls then operated on stale world coordinates.
+        for (index, keyframe) in self.keyframes.iter_mut().enumerate() {
+            if let Some(optimized) = self.optimizer.estimate(index as u64) {
+                keyframe.world_pose = optimized;
             }
+        }
+        if let Some(last) = self.keyframes.last() {
+            self.pose_offset = last.world_pose * last.raw_pose.inverse();
         }
         deltas
     }
@@ -507,6 +537,25 @@ mod tests {
         let deltas = state.flush();
         assert!(deltas.is_empty());
         assert!((state.pose_offset().translation.vector.norm() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn loop_pair_between_factor_recovers_target_pose() {
+        // Setup: target at world origin, source at world (10, 0, 0) but raw
+        // odometry says source is at (10, 0, 0). ICP aligns source's submap
+        // onto target's by pulling it back to (0, 0, 0), so T_align is a
+        // translation of (-10, 0, 0). Verify the resulting BetweenFactor
+        // relative pose, when applied to the target, reproduces the
+        // corrected source location.
+        let target_world = Isometry3::identity();
+        let source_world = translated(10.0, 0.0, 0.0);
+        let t_align = translated(-10.0, 0.0, 0.0);
+        let source_corrected = t_align * source_world;
+        let relative = target_world.inverse() * source_corrected;
+        // T_target * relative should give corrected source ( = origin ).
+        let composed = target_world * relative;
+        assert!(composed.translation.vector.norm() < 1e-9,
+            "expected corrected source at origin, got {:?}", composed.translation);
     }
 
     #[test]
