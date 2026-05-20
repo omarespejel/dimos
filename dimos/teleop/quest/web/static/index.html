@@ -108,8 +108,6 @@
         <button id="disconnectBtn" class="disconnect hidden" onclick="disconnect()">Disconnect</button>
     </div>
     <canvas id="canvas"></canvas>
-    <!-- Hidden MJPEG sink — img element pulls multipart/x-mixed-replace stream,
-         we upload its current frame as a WebGL texture each XR frame. -->
     <img id="videoFeed" style="display:none" crossorigin="anonymous"/>
 
     <script type="module">
@@ -137,16 +135,12 @@
         let videoAttribs = null;
         let videoUniforms = null;
         let videoReady = false;  // true after first frame loads
+        const videoModelMatrix = new Float32Array(16);
 
-        // Panel placement (world space, metres, in xrRefSpace=local-floor).
-        // World-locked: panel stays where it was placed when the user turns
-        // their head. (0,0,0) is the user's standing spot; +Y is up; -Z is
-        // the direction the user was facing when the session started.
         const PANEL_POS_X = 0.0;
         const PANEL_POS_Y = 1.4;   // ~eye height
         const PANEL_POS_Z = -1.5;  // 1.5m in front of starting position
         const PANEL_HEIGHT = 1.2;
-
 
         // UI elements
         const statusEl = document.getElementById('status');
@@ -237,8 +231,8 @@
                 throw new Error('Program link failed: ' + gl.getProgramInfoLog(videoProgram));
             }
 
-            // Quad as TRIANGLE_STRIP: x, y, u, v (UV flipped on Y so the
-            // image isn't upside down — texImage2D uploads bottom-up).
+            // Quad as TRIANGLE_STRIP: x, y, u, v. v=0 at top of quad +
+            // UNPACK_FLIP_Y_WEBGL=false → image displays upright.
             const verts = new Float32Array([
                 -1, -1, 0, 1,
                  1, -1, 1, 1,
@@ -266,47 +260,35 @@
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
 
-            // Start the MJPEG pull. Browser keeps re-decoding into the same
-            // <img> element as new parts arrive on the multipart stream.
             videoEl.onload = () => { videoReady = true; };
-            videoEl.onerror = () => { console.warn('Video feed failed to load'); };
+            videoEl.onerror = () => { setStatus('Video feed failed to load'); };
             videoEl.src = '/video';
         }
 
-        // Upload the latest MJPEG frame to the GL texture. Cheap if the img
-        // hasn't decoded a new frame since last call (browser caches), but
-        // we don't bother gating it — Quest can do this at 90Hz easily.
         function uploadVideoTexture() {
-            if (!videoReady || !videoEl.naturalWidth) return false;
             gl.bindTexture(gl.TEXTURE_2D, videoTex);
-            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
             gl.texImage2D(
                 gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, videoEl
             );
-            return true;
         }
 
-        // Build the panel's world-space model matrix — translate to the fixed
-        // anchor and scale the unit quad to (halfW × halfH). Column-major.
-        function makeModelMatrix() {
+        function updateModelMatrix() {
             const aspect = videoEl.naturalWidth / videoEl.naturalHeight || 1.0;
             const halfH = PANEL_HEIGHT * 0.5;
             const halfW = halfH * aspect;
-            return new Float32Array([
-                halfW, 0,     0, 0,
-                0,     halfH, 0, 0,
-                0,     0,     1, 0,
-                PANEL_POS_X, PANEL_POS_Y, PANEL_POS_Z, 1,
-            ]);
+            videoModelMatrix.fill(0);
+            videoModelMatrix[0] = halfW;
+            videoModelMatrix[5] = halfH;
+            videoModelMatrix[10] = 1;
+            videoModelMatrix[12] = PANEL_POS_X;
+            videoModelMatrix[13] = PANEL_POS_Y;
+            videoModelMatrix[14] = PANEL_POS_Z;
+            videoModelMatrix[15] = 1;
         }
 
-        // Render the textured panel for one XR view. The panel sits in
-        // *world space* (anchored in xrRefSpace=local-floor), so it stays
-        // put when the user turns their head.
         function renderVideoPanel(view, viewport) {
-            if (!videoReady) return;
-
             gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
             gl.useProgram(videoProgram);
 
@@ -318,7 +300,7 @@
 
             gl.uniformMatrix4fv(videoUniforms.proj,  false, view.projectionMatrix);
             gl.uniformMatrix4fv(videoUniforms.view,  false, view.transform.inverse.matrix);
-            gl.uniformMatrix4fv(videoUniforms.model, false, makeModelMatrix());
+            gl.uniformMatrix4fv(videoUniforms.model, false, videoModelMatrix);
 
             gl.activeTexture(gl.TEXTURE0);
             gl.bindTexture(gl.TEXTURE_2D, videoTex);
@@ -425,7 +407,9 @@
             gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
             gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
+            if (!videoReady || !videoEl.naturalWidth) return;
             uploadVideoTexture();
+            updateModelMatrix();
             const pose = frame.getViewerPose(xrRefSpace);
             if (pose) {
                 for (const view of pose.views) {
