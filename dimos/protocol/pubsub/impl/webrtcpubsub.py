@@ -133,16 +133,11 @@ except ImportError:
     BrokerProvider = None  # type: ignore[assignment,misc]
 
 
-# Convenience alias matching old API
-CloudflareSession = CloudflareProvider
-
-
 __all__ = [
     "BROKER_AVAILABLE",
     "WEBRTC_AVAILABLE",
     "BrokerProvider",
     "CloudflareProvider",
-    "CloudflareSession",
     "DataChannelProvider",
     "WebRTCPubSub",
 ]
