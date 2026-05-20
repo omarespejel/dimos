@@ -34,15 +34,17 @@ from dimos.navigation.nav_stack.modules.pgo_rust.pgo_rust import PGORust
 
 def _resolve_git_sha() -> str:
     """Read the head commit SHA, suffixed with '_dirty' if the worktree
-    has uncommitted changes. Used to stamp every result JSON so the
-    benchmark output is traceable back to source. Empty string if not
-    in a git repo (shouldn't happen in normal usage)."""
+    has uncommitted changes to tracked files. Untracked files are
+    ignored — they're typically local-only artifacts (HEARTBEAT.md,
+    memory/, etc) that shouldn't taint a benchmark's provenance string.
+    """
     try:
         sha = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, text=True
         ).strip()
         status = subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=Path(__file__).parent, text=True
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=Path(__file__).parent, text=True,
         ).strip()
         return f"{sha}_dirty" if status else sha
     except (subprocess.CalledProcessError, FileNotFoundError):
