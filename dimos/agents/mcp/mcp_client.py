@@ -89,7 +89,7 @@ def _reorder_tool_responses(
     """Standard add_messages merge, then fix any parallel-tool batches."""
     # add_messages is typed against langgraph's permissive Messages union;
     # list[BaseMessage] is invariant so we cast at the boundary.
-    merged = cast(list[BaseMessage], add_messages(cast(Any, left), cast(Any, right)))
+    merged = cast("list[BaseMessage]", add_messages(cast("Any", left), cast("Any", right)))
     return _fix_parallel_tool_batches(merged)
 
 
@@ -298,7 +298,7 @@ class McpClient(Module):
                 model=model,
                 tools=tools,
                 system_prompt=self.config.system_prompt,
-                state_schema=cast(type[AgentState[Any]], _OrderedAgentState),
+                state_schema=cast("type[AgentState[Any]]", _OrderedAgentState),
             )
             if not self._thread.is_alive():
                 self._thread.start()
