@@ -369,7 +369,7 @@ class WebRTCTransport(PubSubTransport[T]):
         self._msg_type = msg_type
         self._fingerprint: bytes | None = None
         if msg_type is not None and hasattr(msg_type, "_get_packed_fingerprint"):
-            self._fingerprint = msg_type._get_packed_fingerprint()
+            self._fingerprint = msg_type._get_packed_fingerprint()  # type: ignore[attr-defined]
 
         if provider is not None:
             self.webrtc = WebRTCPubSub(provider=provider)
@@ -385,7 +385,7 @@ class WebRTCTransport(PubSubTransport[T]):
         # typed fingerprint filtering survives multiprocessing.
         return (WebRTCTransport, (self.topic,), {"msg_type": self._msg_type})
 
-    def __setstate__(self, state: dict) -> None:  # type: ignore[no-untyped-def]
+    def __setstate__(self, state: dict[str, Any]) -> None:
         msg_type = state.get("msg_type")
         self.__init__(self.topic, msg_type=msg_type)  # type: ignore[misc]
 
@@ -411,7 +411,7 @@ class WebRTCTransport(PubSubTransport[T]):
 
             def _typed_cb(data: bytes, _topic: str) -> None:
                 if len(data) >= 8 and data[:8] == fp:
-                    callback(msg_type.lcm_decode(data))  # type: ignore[union-attr]
+                    callback(msg_type.lcm_decode(data))  # type: ignore[attr-defined]
 
             return self.webrtc.subscribe(self.topic, _typed_cb)
         else:

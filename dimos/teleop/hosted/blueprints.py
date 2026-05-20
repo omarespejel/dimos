@@ -126,8 +126,6 @@ def make_teleop_hosted_go2(
 
     return unitree_go2_basic.transports(
         {
-            # TwistStamped is a subclass of Twist (DimOS stamped type hierarchy),
-            # so delivering TwistStamped to Go2Connection.cmd_vel: In[Twist] is safe.
             ("cmd_vel", Twist): WebRTCTransport(
                 "cmd_unreliable",
                 msg_type=TwistStamped,

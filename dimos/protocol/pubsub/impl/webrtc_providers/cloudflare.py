@@ -238,7 +238,7 @@ class CloudflareProvider(DataChannelProvider):
             ev = asyncio.Event()
 
             @pc.on("icegatheringstatechange")
-            def _():
+            def _on_gathering() -> None:
                 if pc.iceGatheringState == "complete":
                     ev.set()
 
@@ -307,7 +307,7 @@ class CloudflareProvider(DataChannelProvider):
         ev = asyncio.Event()
 
         @pc.on("connectionstatechange")
-        def _():
+        def _on_state() -> None:
             if pc.connectionState in ("connected", "failed", "closed"):
                 ev.set()
 
@@ -321,7 +321,7 @@ class CloudflareProvider(DataChannelProvider):
         ev = asyncio.Event()
 
         @ch.on("open")
-        def _():
+        def _on_open() -> None:
             ev.set()
 
         await asyncio.wait_for(ev.wait(), timeout)

@@ -354,7 +354,7 @@ if WEBRTC_AVAILABLE:
 
     testcases.append(
         Case(
-            pubsub_context=webrtc_loopback_pubsub_channel,
+            pubsub_context=webrtc_loopback_pubsub_channel,  # type: ignore[arg-type]
             msg_gen=webrtc_loopback_msggen,
         )
     )
@@ -384,7 +384,7 @@ if (
 
     testcases.append(
         Case(
-            pubsub_context=webrtc_pubsub_channel,
+            pubsub_context=webrtc_pubsub_channel,  # type: ignore[arg-type]
             msg_gen=webrtc_msggen,
         )
     )
