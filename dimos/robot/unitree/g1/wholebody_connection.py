@@ -219,11 +219,6 @@ class G1WholeBodyConnection(Module):
         logger.info("G1WholeBodyConnection disconnected")
         super().stop()
 
-    # Identity quaternion + zeros while LowState hasn't arrived (start() blocks
-    # for it, but the publish loop may also see _low_state cleared during stop()).
-    _ZERO_QUAT = (1.0, 0.0, 0.0, 0.0)
-    _ZERO_VEC3 = (0.0, 0.0, 0.0)
-
     def _drain_low_state(self) -> None:
         """Pull the freshest LowState frame off the subscriber and stash it."""
         sub = self._subscriber
@@ -255,26 +250,22 @@ class G1WholeBodyConnection(Module):
 
     def _snapshot_motor_imu(
         self,
-    ) -> tuple[
-        list[float], list[float], list[float],
-        tuple[float, float, float, float],
-        tuple[float, float, float],
-        tuple[float, float, float],
-    ]:
-        """Return (positions, velocities, efforts, quat, gyro, accel) for
-        the latest cached LowState, or zero-defaults when none has been
-        received yet."""
+    ) -> (
+        tuple[
+            list[float],
+            list[float],
+            list[float],
+            tuple[float, float, float, float],
+            tuple[float, float, float],
+            tuple[float, float, float],
+        ]
+        | None
+    ):
+        """Return the latest real motor/IMU sample, or None before first LowState."""
         with self._lock:
             ls = self._low_state
             if ls is None:
-                return (
-                    [0.0] * _NUM_MOTORS,
-                    [0.0] * _NUM_MOTORS,
-                    [0.0] * _NUM_MOTORS,
-                    self._ZERO_QUAT,
-                    self._ZERO_VEC3,
-                    self._ZERO_VEC3,
-                )
+                return None
             return (
                 [ls.motor_state[i].q for i in range(_NUM_MOTORS)],
                 [ls.motor_state[i].dq for i in range(_NUM_MOTORS)],
@@ -323,17 +314,19 @@ class G1WholeBodyConnection(Module):
 
         while not self._stop_event.is_set():
             self._drain_low_state()
-            positions, velocities, efforts, quat, gyro, accel = self._snapshot_motor_imu()
-            self._publish_motor_state_and_imu(
-                now=time.time(),
-                frame_id=frame_id,
-                positions=positions,
-                velocities=velocities,
-                efforts=efforts,
-                quat=quat,
-                gyro=gyro,
-                accel=accel,
-            )
+            sample = self._snapshot_motor_imu()
+            if sample is not None:
+                positions, velocities, efforts, quat, gyro, accel = sample
+                self._publish_motor_state_and_imu(
+                    now=time.time(),
+                    frame_id=frame_id,
+                    positions=positions,
+                    velocities=velocities,
+                    efforts=efforts,
+                    quat=quat,
+                    gyro=gyro,
+                    accel=accel,
+                )
 
             next_tick += period
             sleep_for = next_tick - time.perf_counter()

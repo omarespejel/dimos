@@ -262,6 +262,7 @@ class MujocoSimModule(
         self._stop_event = threading.Event()
         self._publish_thread: threading.Thread | None = None
         self._camera_info_base: CameraInfo | None = None
+        self._shm_ready_signaled = False
 
         # IMU sensor slices into MjData.sensordata, resolved once at start.
         # None if the MJCF has no recognized IMU sensors (e.g. arm-only sims).
@@ -315,6 +316,7 @@ class MujocoSimModule(
         # SHM key — adapter derives the same key from the same MJCF path.
         shm_key = shm_key_from_path(self.config.address)
         self._shm = ManipShmWriter(shm_key)
+        self._shm_ready_signaled = False
 
         # Build engine with SHM hooks installed.
         engine_assets: dict[str, bytes] | None = None
@@ -404,8 +406,6 @@ class MujocoSimModule(
         if not self._engine.connect():
             raise RuntimeError("MujocoSimModule: engine.connect() failed")
 
-        self._shm.signal_ready(num_joints=len(joint_names))
-
         # Camera intrinsics.
         self._build_camera_info()
 
@@ -486,6 +486,9 @@ class MujocoSimModule(
         shm = self._shm
         if shm is None:
             return
+        if not self._shm_ready_signaled:
+            shm.signal_ready(num_joints=len(engine.joint_names))
+            self._shm_ready_signaled = True
 
         # Odom — when the MJCF has a free-joint root, publish base pose
         # from qpos[0:7] every step.  Without this, downstream consumers
