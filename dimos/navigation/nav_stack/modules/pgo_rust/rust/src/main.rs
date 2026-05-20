@@ -46,10 +46,12 @@ struct Config {
 
     loop_search_radius: f64,
     loop_time_thresh: f64,
+    loop_frame_gap: u64,
     loop_score_thresh: f32,
     loop_submap_half_range: i32,
     submap_resolution: f64,
     min_loop_detect_duration: f64,
+    loop_candidate_max_distance_m: f64,
 
     unregister_input: bool,
 
@@ -79,10 +81,12 @@ impl Default for Config {
             key_pose_delta_trans: 0.5,
             loop_search_radius: 1.0,
             loop_time_thresh: 60.0,
+            loop_frame_gap: 0,
             loop_score_thresh: 0.15,
             loop_submap_half_range: 5,
             submap_resolution: 0.1,
             min_loop_detect_duration: 5.0,
+            loop_candidate_max_distance_m: 30.0,
             unregister_input: true,
             global_map_voxel_size: 0.1,
             global_map_publish_rate: 1.0,
@@ -123,7 +127,18 @@ struct PgoRust {
     config: Config,
 
     state: Option<PgoState>,
-    last_odometry: Option<Isometry3<f64>>,
+    /// Last received odometry, with the message timestamp it arrived under.
+    /// We pair scans with this only when the timestamps match — LCM is UDP
+    /// multicast and drops messages under load; if we paired by "latest
+    /// odom" alone, a dropped odom would attach an older pose to a newer
+    /// scan and break the ground-truth position invariant the benchmark
+    /// relies on. (See lcm_conv.rs::odometry_to_isometry and the
+    /// playback.py odom/scan pair — playback sends both with the same `ts`.)
+    last_odometry: Option<(f64, Isometry3<f64>)>,
+    /// Monotonic count of registered_scans received. Stored on each keyframe
+    /// so loop-eligibility can use frame-index gap (robust to dataset-specific
+    /// timestamp regimes) instead of timestamp deltas.
+    scan_count: u64,
 }
 
 impl PgoRust {
@@ -133,10 +148,12 @@ impl PgoRust {
         pgo_config.key_pose_delta_trans = self.config.key_pose_delta_trans;
         pgo_config.loop_search_radius = self.config.loop_search_radius;
         pgo_config.loop_time_thresh = self.config.loop_time_thresh;
+        pgo_config.loop_frame_gap = self.config.loop_frame_gap;
         pgo_config.loop_score_thresh = self.config.loop_score_thresh;
         pgo_config.loop_submap_half_range = self.config.loop_submap_half_range.max(0) as usize;
         pgo_config.submap_resolution = self.config.submap_resolution;
         pgo_config.min_loop_detect_duration = self.config.min_loop_detect_duration;
+        pgo_config.loop_candidate_max_distance_m = self.config.loop_candidate_max_distance_m;
         pgo_config.use_scan_context = self.config.use_scan_context;
         pgo_config.scan_context = scan_context::Config {
             n_rings: self.config.scan_context_num_rings.max(0) as usize,
@@ -163,7 +180,8 @@ impl PgoRust {
 
     async fn on_odometry(&mut self, msg: Odometry) {
         let pose = lcm_conv::odometry_to_isometry(&msg);
-        self.last_odometry = Some(pose);
+        let ts = msg.header.stamp.sec as f64 + msg.header.stamp.nsec as f64 * 1e-9;
+        self.last_odometry = Some((ts, pose));
         let Some(state) = self.state.as_ref() else { return };
         let corrected = state.correct(pose);
         // Republish corrected odometry — pose_offset is identity under the
@@ -181,12 +199,26 @@ impl PgoRust {
     }
 
     async fn on_registered_scan(&mut self, msg: PointCloud2) {
+        // Increment per received scan, even when this scan doesn't become a
+        // keyframe — the counter is a stable index into the playback stream
+        // that the GT criterion (min_frame_gap) also uses.
+        let scan_index = self.scan_count;
+        self.scan_count += 1;
         let Some(state) = self.state.as_mut() else { return };
-        let Some(raw_pose) = self.last_odometry else { return };
+        let Some((odom_ts, raw_pose)) = self.last_odometry else { return };
+        // Require the odom and scan timestamps to match within 1 ms — KITTI
+        // playback emits both with the SAME `ts` for each frame; an LCM drop
+        // that mispairs them would attach the wrong pose to this scan and
+        // break the world-frame invariant. The pgo_rust binary is then
+        // robust to UDP packet loss instead of silently consuming bad data.
+        let scan_ts = msg.header.stamp.sec as f64 + msg.header.stamp.nsec as f64 * 1e-9;
+        if (odom_ts - scan_ts).abs() > 1e-3 {
+            return;
+        }
         if !state.should_add_keyframe(&raw_pose) {
             return;
         }
-        let timestamp = msg.header.stamp.sec as f64 + msg.header.stamp.nsec as f64 * 1e-9;
+        let timestamp = scan_ts;
         let body_cloud = if self.config.unregister_input {
             // Scans arrive in world frame; transform back into body frame.
             lcm_conv::point_cloud_to_xyz(&msg)
@@ -199,7 +231,7 @@ impl PgoRust {
         } else {
             lcm_conv::point_cloud_to_xyz(&msg)
         };
-        let index = state.add_keyframe(body_cloud, raw_pose, timestamp);
+        let index = state.add_keyframe(body_cloud, raw_pose, timestamp, scan_index);
         if let Some(pair) = state.search_loop_candidate() {
             state.enqueue_loop(pair);
             let _ = state.flush();

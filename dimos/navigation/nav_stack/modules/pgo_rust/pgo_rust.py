@@ -56,6 +56,7 @@ class PGORustConfig(NativeModuleConfig):
 
     loop_search_radius: float = 1.0
     loop_time_thresh: float = 60.0
+    loop_frame_gap: int = 0
     loop_score_thresh: float = 0.15
     loop_submap_half_range: int = 5
     submap_resolution: float = 0.1

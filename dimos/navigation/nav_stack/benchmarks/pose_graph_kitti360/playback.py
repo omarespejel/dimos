@@ -159,12 +159,20 @@ def compute_send_timestamps(
 
     PGO's Odometry constructor treats ``ts==0`` as "now", so clamp the first
     ts away from zero; subsequent values inherit at least a 1 ms floor.
+
+    When raw timestamps are missing (seq08 has no timestamps.txt), fall back
+    to a 10 Hz synthetic schedule (0.1 s/index). KITTI lidar is captured at
+    10 Hz, and downstream consumers use timestamps as a stable frame
+    identifier; a 1 s/index fallback (which we used previously) would make
+    time-based eligibility checks mean different things across sequences,
+    breaking F1 comparability.
     """
     if not frame_ids_in_order:
         return []
+    fallback_period_sec = 0.1
     first_timestamp = max(raw_timestamps.get(frame_ids_in_order[0], 1.0), 1.0)
     send_timestamps: list[float] = []
     for index, frame_id in enumerate(frame_ids_in_order):
-        raw_timestamp = raw_timestamps.get(frame_id, float(index))
+        raw_timestamp = raw_timestamps.get(frame_id, index * fallback_period_sec)
         send_timestamps.append(max(raw_timestamp, first_timestamp + index * 0.001))
     return send_timestamps

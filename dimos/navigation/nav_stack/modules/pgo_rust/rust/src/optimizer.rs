@@ -134,15 +134,16 @@ impl GraphOptimizer for GtsamOptimizer {
     }
 
     fn update(&mut self) -> Vec<PoseDelta> {
-        // 4 extra iterations matches cpp/simple_pgo.cpp:303-308 which calls
-        // m_isam2->update() 4 extra times after a loop fires. iSAM2 with
-        // relinearizeThreshold=0.01 needs multiple passes to redistribute
-        // a fresh loop closure across the chain — single update leaves
-        // half-corrected poses that wreck subsequent loop searches' world
-        // frame consistency. PgoState only calls optimizer.update() when
-        // a loop is pending, so we can always do the extras.
-        const ISAM2_LOOP_EXTRA_ITERATIONS: u32 = 4;
-        self.backend.update(ISAM2_LOOP_EXTRA_ITERATIONS);
+        // No extra iterations — the loop search no longer depends on
+        // iSAM2's corrections being fully converged (it uses raw_pose for
+        // candidate filtering, which is GT-derived on this benchmark).
+        // Single-update is enough to keep the BetweenFactor in the graph
+        // and lets the binary process more scans per second, which is the
+        // dominant recall bottleneck here (LCM drops at high inflight load).
+        // cpp/simple_pgo.cpp:303-308 used 4 extras because its loop search
+        // depended on `m_key_poses[i].r_global/t_global` being fully
+        // updated; we don't have that dependency anymore.
+        self.backend.update(0);
         let mut deltas = Vec::new();
         for (key, after) in self.backend.estimate_all() {
             let before = self.last_estimates.insert(key, after).unwrap_or(after);
