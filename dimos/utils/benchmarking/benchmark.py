@@ -20,13 +20,18 @@ limit; ``--ff`` / ``--profile`` are opt-in comparison arms) across a
 speed ladder on a fixed real-space-constrained path set, scores each
 (path, speed), and writes back the operating-point map +
 tolerance->max-safe-speed inversion (artifact section 5). Robot-agnostic:
-everything robot-specific comes from the ``RobotProfile`` (``--robot``).
+everything robot-specific comes from the ``RobotPlantProfile`` (``--robot``).
+
+Architecturally sim and hw are identical here. The benchmark always
+runs the baseline INSIDE a real ``ControlCoordinator`` tick loop driving
+the ``transport_lcm`` twist-base adapter. The only thing that changes
+between modes is which connection module is on the robot side of the
+LCM topics — sim: ``coordinator-sim-fopdt`` (FopdtPlantConnection), hw:
+``unitree-go2-webrtc-keyboard-teleop`` (GO2Connection). The operator
+brings that up in another terminal; the prereq banner reminds them.
 
     uv run python -m dimos.utils.benchmarking.benchmark \\
         --robot go2 --config reports/go2_config_hw_<...>.json --mode hw
-
-The sim harness (the baseline driven through a real ``ControlCoordinator``
-+ the FOPDT sim adapter) is inlined below — small, baseline-only.
 """
 
 from __future__ import annotations
@@ -39,7 +44,6 @@ from pathlib import Path
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Protocol
 
 import matplotlib
 
@@ -47,13 +51,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from dimos.control.components import HardwareComponent, HardwareType, make_twist_base_joints
-from dimos.control.coordinator import ControlCoordinator, TaskConfig
-from dimos.control.task import (
-    ControlMode,
-    CoordinatorState,
-    JointCommandOutput,
-    JointStateSnapshot,
-)
+from dimos.control.coordinator import ControlCoordinator
 from dimos.control.tasks.baseline_path_follower_task import (
     BaselinePathFollowerTask,
     BaselinePathFollowerTaskConfig,
@@ -65,8 +63,9 @@ from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.nav_msgs.Path import Path as NavPath
+from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.utils.benchmarking.paths import circle, single_corner, square, straight_line
-from dimos.utils.benchmarking.plant import ROBOT_PROFILES, RobotProfile
+from dimos.utils.benchmarking.plant import ROBOT_PLANT_PROFILES, RobotPlantProfile
 from dimos.utils.benchmarking.scoring import ExecutedTrajectory, TrajectoryTick, score_run
 from dimos.utils.benchmarking.tuning import (
     OperatingPoint,
@@ -74,252 +73,28 @@ from dimos.utils.benchmarking.tuning import (
     TuningConfig,
     invert_tolerance,
 )
-from dimos.utils.benchmarking.velocity_profile import PathSpeedCap, VelocityProfileConfig
+from dimos.utils.benchmarking.velocity_profile import VelocityProfileConfig
 
-if TYPE_CHECKING:
-    from dimos.hardware.drive_trains.fopdt_sim_base.adapter import FopdtTwistBaseAdapter
-
-_base_joints = make_twist_base_joints("base")
 _ARRIVED_STATES = frozenset({"arrived", "completed"})
 _FAILED_STATES = frozenset({"aborted"})
 
 REPORTS_DIR = Path(__file__).parent / "reports"
 
 
-def _resolve_profile(name: str) -> RobotProfile:
+def _resolve_profile(name: str) -> RobotPlantProfile:
     try:
-        return ROBOT_PROFILES[name]
+        return ROBOT_PLANT_PROFILES[name]
     except KeyError:
-        raise SystemExit(f"unknown --robot {name!r}; known: {sorted(ROBOT_PROFILES)}") from None
-
-
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
-def _twist_clamped(vx: float, wz: float, vx_max: float, wz_max: float) -> Twist:
-    return Twist(
-        linear=Vector3(_clamp(vx, -vx_max, vx_max), 0.0, 0.0),
-        angular=Vector3(0.0, 0.0, _clamp(wz, -wz_max, wz_max)),
-    )
-
-
-# --- inlined baseline sim harness (was runner.py + sim_blueprint.py) -----
-
-
-class _PathFollowerLike(Protocol):
-    def start_path(self, path: NavPath, current_odom: PoseStamped) -> bool: ...
-    def update_odom(self, odom: PoseStamped) -> None: ...
-    def compute(self, state) -> object: ...
-    def get_state(self) -> str: ...
-
-
-class _VelocityProfileProxyTask:
-    """Curvature velocity-profile cap (the DERIVE consumer seam). Caps
-    commanded ``|vx|`` to the profile at the robot's path index, scaling
-    ``wz`` to preserve geometry; pure pass-through otherwise. No
-    control-law change."""
-
-    def __init__(self, inner: _PathFollowerLike, cap: PathSpeedCap) -> None:
-        self._inner = inner
-        self._cap = cap
-        self._xy = (0.0, 0.0)
-
-    @property
-    def name(self) -> str:
-        return self._inner.name
-
-    def claim(self):
-        return self._inner.claim()
-
-    def is_active(self) -> bool:
-        return self._inner.is_active()
-
-    def on_preempted(self, by_task: str, joints: frozenset[str]) -> None:
-        self._inner.on_preempted(by_task, joints)
-
-    def on_buttons(self, *a, **k):
-        return self._inner.on_buttons(*a, **k)
-
-    def on_cartesian_command(self, *a, **k):
-        return self._inner.on_cartesian_command(*a, **k)
-
-    def set_target_by_name(self, *a, **k):
-        return self._inner.set_target_by_name(*a, **k)
-
-    def set_velocities_by_name(self, *a, **k):
-        return self._inner.set_velocities_by_name(*a, **k)
-
-    def get_state(self) -> str:
-        return self._inner.get_state()
-
-    def update_odom(self, odom: PoseStamped) -> None:
-        self._xy = (float(odom.position.x), float(odom.position.y))
-        self._inner.update_odom(odom)
-
-    def start_path(self, path: NavPath, current_odom: PoseStamped) -> bool:
-        self._cap.for_path(path)
-        self._xy = (float(current_odom.position.x), float(current_odom.position.y))
-        return self._inner.start_path(path, current_odom)
-
-    def compute(self, state):
-        out = self._inner.compute(state)
-        if out is None or out.mode != ControlMode.VELOCITY or out.velocities is None:
-            return out
-        vx, vy, wz = ([*out.velocities, 0.0, 0.0, 0.0])[:3]
-        cx, cy, cz = self._cap.cap(self._xy[0], self._xy[1], vx, vy, wz)
-        return JointCommandOutput(
-            joint_names=out.joint_names,
-            velocities=[cx, cy, cz],
-            mode=ControlMode.VELOCITY,
-        )
-
-
-def _sim_base(profile: RobotProfile) -> HardwareComponent:
-    return HardwareComponent(
-        hardware_id="base",
-        hardware_type=HardwareType.BASE,
-        joints=make_twist_base_joints("base"),
-        adapter_type=profile.sim_adapter_key,
-        adapter_kwargs={"params": profile.sim_plant},
-    )
-
-
-def _odom_to_pose(odom: list[float]) -> PoseStamped:
-    return PoseStamped(
-        position=Vector3(odom[0], odom[1], 0.0),
-        orientation=Quaternion.from_euler(Vector3(0.0, 0.0, odom[2])),
-    )
-
-
-def _vels_to_twist(v: list[float]) -> Twist:
-    return Twist(linear=Vector3(v[0], v[1], 0.0), angular=Vector3(0.0, 0.0, v[2]))
-
-
-def _run_baseline_sim(
-    profile: RobotProfile,
-    path: NavPath,
-    speed: float,
-    k_angular: float,
-    ff_config: FeedforwardGainConfig | None,
-    profile_config: VelocityProfileConfig | None,
-    timeout_s: float,
-) -> tuple[ExecutedTrajectory, NavPath]:
-    """Stock baseline P-controller in sim against the profile's FOPDT
-    sim adapter. ``ff_config``/``profile_config`` are OPTIONAL comparison
-    arms (``None`` = bare controller — the physical-limit measurement).
-    Returns the trajectory and the reference path in the executed frame
-    (sim runs in the path's own frame, so it is ``path`` unchanged)."""
-    coord = ControlCoordinator(
-        tick_rate=profile.tick_rate_hz,
-        hardware=[_sim_base(profile)],
-        tasks=[
-            TaskConfig(name="vel_base", type="velocity", joint_names=_base_joints, priority=10),
-        ],
-    )
-
-    def _make() -> _PathFollowerLike:
-        base = BaselinePathFollowerTask(
-            name="baseline_follower",
-            config=BaselinePathFollowerTaskConfig(
-                speed=speed, k_angular=k_angular, ff_config=ff_config
-            ),
-            global_config=global_config,
-        )
-        if profile_config is None:
-            return base
-        return _VelocityProfileProxyTask(base, PathSpeedCap(profile_config))
-
-    coord.start()
-    try:
-        adapter: FopdtTwistBaseAdapter = coord._hardware["base"].adapter
-        start = path.poses[0]
-        adapter.set_initial_pose(start.position.x, start.position.y, start.orientation.euler[2])
-        adapter.connect()
-
-        task = _make()
-        coord.add_task(task)
-        task.start_path(path, _odom_to_pose(adapter.read_odometry()))
-
-        ticks: list[TrajectoryTick] = []
-        period = 1.0 / profile.tick_rate_hz
-        t0 = time.perf_counter()
-        next_sample = t0
-        arrived = False
-        while True:
-            now = time.perf_counter()
-            t_rel = now - t0
-            if t_rel > timeout_s:
-                break
-            pose = _odom_to_pose(adapter.read_odometry())
-            task.update_odom(pose)
-            ticks.append(
-                TrajectoryTick(
-                    t=t_rel,
-                    pose=pose,
-                    cmd_twist=_vels_to_twist(adapter._cmd),
-                    actual_twist=_vels_to_twist(adapter.read_velocities()),
-                )
-            )
-            s = task.get_state()
-            if s in _ARRIVED_STATES:
-                arrived = True
-                break
-            if s in _FAILED_STATES:
-                break
-            next_sample += period
-            sleep_for = next_sample - time.perf_counter()
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-        return ExecutedTrajectory(ticks=ticks, arrived=arrived), path
-    finally:
-        coord.stop()
-
-
-# --- hw harness (real robot over LCM; closed-loop baseline) -------------
-#
-# Ported from the R&D `_run_path_follower_hw`. Talks LCM to a separately
-# running `dimos run <profile.blueprint>` (publishes the odom topic,
-# consumes the cmd topic; if that blueprint includes a keyboard teleop it
-# must be publish-only-when-active so it does not fight the run). No new
-# module — the small estimator/anchor are duplicated with
-# characterization by choice (no shared-module addition).
-
-
-class _PoseVelocityEstimator:
-    """Consecutive ``PoseStamped`` -> EMA body-frame (vx,vy,wz)."""
-
-    def __init__(self, alpha: float = 0.5) -> None:
-        self._pp = None
-        self._pt: float | None = None
-        self._vx = self._vy = self._wz = 0.0
-        self._a = alpha
-
-    def update(self, pose, t: float) -> tuple[float, float, float]:
-        if self._pp is None or self._pt is None:
-            self._pp, self._pt = pose, t
-            return 0.0, 0.0, 0.0
-        dt = t - self._pt
-        if dt <= 0:
-            return self._vx, self._vy, self._wz
-        dx = pose.position.x - self._pp.position.x
-        dy = pose.position.y - self._pp.position.y
-        y0, y1 = self._pp.orientation.euler[2], pose.orientation.euler[2]
-        dyaw = (y1 - y0 + math.pi) % (2 * math.pi) - math.pi
-        c, s = math.cos(y1), math.sin(y1)
-        bx = (dx / dt) * c + (dy / dt) * s
-        by = -(dx / dt) * s + (dy / dt) * c
-        self._vx = self._a * bx + (1 - self._a) * self._vx
-        self._vy = self._a * by + (1 - self._a) * self._vy
-        self._wz = self._a * (dyaw / dt) + (1 - self._a) * self._wz
-        self._pp, self._pt = pose, t
-        return self._vx, self._vy, self._wz
+        raise SystemExit(
+            f"unknown --robot {name!r}; known: {sorted(ROBOT_PLANT_PROFILES)}"
+        ) from None
 
 
 def _shift_path_to_start_at_pose(path: NavPath, start_pose: PoseStamped) -> NavPath:
     """Rigid-transform a robot-centric reference path into the odom frame
     anchored at the robot's current pose (so it need not be positioned
-    precisely — only roughly aimed)."""
+    precisely — only roughly aimed). Used in BOTH sim and hw so scoring
+    is in the executed frame regardless of where the plant starts."""
     px0, py0 = path.poses[0].position.x, path.poses[0].position.y
     pyaw0 = path.poses[0].orientation.euler[2]
     sx, sy = start_pose.position.x, start_pose.position.y
@@ -337,9 +112,158 @@ def _shift_path_to_start_at_pose(path: NavPath, start_pose: PoseStamped) -> NavP
     return NavPath(poses=new)
 
 
-def _run_baseline_hw(
-    profile: RobotProfile,
-    link: dict,
+class _JointStateRecorder:
+    """Subscribes to a coordinator's ``joint_state`` Out and turns each
+    tick into a ``TrajectoryTick``. Recovers body-frame velocity by
+    pose differentiation (``read_velocities`` returns last-commanded for
+    ``transport_lcm``, not measured — same for hw GO2Connection and the
+    sim FopdtPlantConnection). EMA-smoothed (alpha=0.5)."""
+
+    def __init__(self, joint_names: list[str], alpha: float = 0.5) -> None:
+        self._jx, self._jy, self._jyaw = joint_names
+        self._alpha = alpha
+        self._lock = threading.Lock()
+        self._ticks: list[TrajectoryTick] = []
+        self._first_pose: PoseStamped | None = None
+        self._t0: float | None = None
+        # diff state
+        self._prev_pose: PoseStamped | None = None
+        self._prev_t: float | None = None
+        self._vx = self._vy = self._wz = 0.0
+        # commanded telemetry: most recent JointState.velocity (the adapter's
+        # last write) for this hardware's joints
+        self._cmd_vx = self._cmd_vy = self._cmd_wz = 0.0
+
+    def on_joint_state(self, msg: JointState) -> None:
+        # ConnectedTwistBase publishes positions = odometry [x, y, yaw]
+        # and velocities = last commanded (transport_lcm convention).
+        # Caller waits a grace period after coord.start before sampling
+        # the latest pose so the first /odom has time to propagate
+        # through the adapter and one tick — that avoids latching onto
+        # the [0,0,0] placeholder ConnectedTwistBase emits before the
+        # adapter has seen any odom.
+        if not msg.name:
+            return
+        idx = {n: i for i, n in enumerate(msg.name)}
+        try:
+            x = float(msg.position[idx[self._jx]])
+            y = float(msg.position[idx[self._jy]])
+            yaw = float(msg.position[idx[self._jyaw]])
+        except (KeyError, IndexError):
+            return
+
+        now = time.perf_counter()
+        pose = PoseStamped(
+            ts=now,
+            position=Vector3(x, y, 0.0),
+            orientation=Quaternion.from_euler(Vector3(0.0, 0.0, yaw)),
+        )
+
+        # commanded telemetry (optional — used only to colour the recorded
+        # cmd_twist column; behaviour is identical with or without it)
+        if msg.velocity:
+            try:
+                self._cmd_vx = float(msg.velocity[idx[self._jx]])
+                self._cmd_vy = float(msg.velocity[idx[self._jy]])
+                self._cmd_wz = float(msg.velocity[idx[self._jyaw]])
+            except (KeyError, IndexError):
+                pass
+
+        with self._lock:
+            if self._first_pose is None:
+                self._first_pose = pose
+            if self._t0 is None:
+                self._t0 = now
+            t_rel = now - self._t0
+
+            if self._prev_pose is None or self._prev_t is None:
+                self._prev_pose, self._prev_t = pose, now
+                self._ticks.append(
+                    TrajectoryTick(
+                        t=t_rel,
+                        pose=pose,
+                        cmd_twist=Twist(
+                            linear=Vector3(self._cmd_vx, self._cmd_vy, 0.0),
+                            angular=Vector3(0.0, 0.0, self._cmd_wz),
+                        ),
+                        actual_twist=Twist(
+                            linear=Vector3(0.0, 0.0, 0.0),
+                            angular=Vector3(0.0, 0.0, 0.0),
+                        ),
+                    )
+                )
+                return
+
+            dt = now - self._prev_t
+            if dt > 0:
+                dx = pose.position.x - self._prev_pose.position.x
+                dy = pose.position.y - self._prev_pose.position.y
+                y0 = self._prev_pose.orientation.euler[2]
+                y1 = pose.orientation.euler[2]
+                dyaw = (y1 - y0 + math.pi) % (2 * math.pi) - math.pi
+                c, s = math.cos(y1), math.sin(y1)
+                bx = (dx / dt) * c + (dy / dt) * s
+                by = -(dx / dt) * s + (dy / dt) * c
+                a = self._alpha
+                self._vx = a * bx + (1 - a) * self._vx
+                self._vy = a * by + (1 - a) * self._vy
+                self._wz = a * (dyaw / dt) + (1 - a) * self._wz
+                self._prev_pose, self._prev_t = pose, now
+
+            self._ticks.append(
+                TrajectoryTick(
+                    t=t_rel,
+                    pose=pose,
+                    cmd_twist=Twist(
+                        linear=Vector3(self._cmd_vx, self._cmd_vy, 0.0),
+                        angular=Vector3(0.0, 0.0, self._cmd_wz),
+                    ),
+                    actual_twist=Twist(
+                        linear=Vector3(self._vx, self._vy, 0.0),
+                        angular=Vector3(0.0, 0.0, self._wz),
+                    ),
+                )
+            )
+
+    def first_pose(self, timeout_s: float, grace_s: float = 0.5) -> PoseStamped:
+        # Wait at minimum until coord+adapter have had time to receive a
+        # first /odom and propagate it through one tick (otherwise we
+        # latch onto the ConnectedTwistBase [0,0,0] placeholder). After
+        # the grace period the latest pose is the real current one.
+        time.sleep(grace_s)
+        deadline = time.perf_counter() + timeout_s
+        while time.perf_counter() < deadline:
+            with self._lock:
+                if self._prev_pose is not None:
+                    return self._prev_pose
+            time.sleep(0.02)
+        raise RuntimeError(f"no odom within {timeout_s:.1f}s")
+
+    def snapshot(self) -> list[TrajectoryTick]:
+        with self._lock:
+            return list(self._ticks)
+
+
+def _make_base_component(profile: RobotPlantProfile) -> HardwareComponent:
+    """In-process transport_lcm base — pubs Twist on /{robot_id}/cmd_vel,
+    subs PoseStamped on /{robot_id}/odom. Identical in sim and hw; the
+    only thing that differs is which connection module is the other end
+    of those topics (the operator's running blueprint)."""
+    return HardwareComponent(
+        hardware_id=profile.robot_id,
+        hardware_type=HardwareType.BASE,
+        joints=make_twist_base_joints(profile.robot_id),
+        adapter_type="transport_lcm",
+        # READ-ONLY: we observe /{robot_id}/odom via this adapter, but the
+        # tool publishes its own Twist on /cmd_vel into the operator's
+        # coord. If we let this adapter write, it would also publish on
+        # /{robot_id}/cmd_vel and race the operator's coord.
+        auto_enable=False,
+    )
+
+
+def _run_baseline(
+    profile: RobotPlantProfile,
     path: NavPath,
     speed: float,
     k_angular: float,
@@ -348,94 +272,71 @@ def _run_baseline_hw(
     timeout_s: float,
     label: str,
 ) -> tuple[ExecutedTrajectory, NavPath]:
-    """Closed-loop stock baseline on the real robot: anchor the path to
-    the robot's current pose, then track at the profile tick rate off
-    real odom. ``ff_config``/``profile_config`` are OPTIONAL arms
-    (``None`` = bare = the physical-limit measurement). Safe: velocity
-    clamp, stale-odom abort, timeout, zero-Twist on exit. Returns the
-    trajectory and the anchored reference path (odom frame) — score/plot
-    must use this, not the robot-centric input path."""
-    cmd_pub, get_odom = link["pub"], link["get"]
+    """Stock baseline P-controller inside a real ControlCoordinator,
+    talking ``transport_lcm`` to whichever connection module the operator
+    brought up. ``ff_config``/``profile_config`` are OPTIONAL arms
+    (``None`` = bare = the physical-limit measurement).
 
-    def stop_twist() -> Twist:
-        return _twist_clamped(0.0, 0.0, profile.vx_max, profile.wz_max)
-
-    base = BaselinePathFollowerTask(
+    Path is anchored to the robot's first observed pose so the operator
+    doesn't have to position the robot precisely — only roughly aim it.
+    Returns the executed trajectory and the anchored reference path
+    (scoring + plotting must use this, not the robot-centric input)."""
+    joints = make_twist_base_joints(profile.robot_id)
+    coord = ControlCoordinator(
+        tick_rate=profile.tick_rate_hz,
+        hardware=[_make_base_component(profile)],
+    )
+    task = BaselinePathFollowerTask(
         name=f"baseline_{label}",
         config=BaselinePathFollowerTaskConfig(
-            speed=speed, k_angular=k_angular, ff_config=ff_config
+            joint_names=joints,
+            speed=speed,
+            k_angular=k_angular,
+            control_frequency=profile.tick_rate_hz,
+            ff_config=ff_config,
+            velocity_profile_config=profile_config,
         ),
         global_config=global_config,
     )
-    task = (
-        base
-        if profile_config is None
-        else _VelocityProfileProxyTask(base, PathSpeedCap(profile_config))
-    )
+    recorder = _JointStateRecorder(joint_names=joints)
+    unsub = coord.joint_state.subscribe(recorder.on_joint_state)
 
-    pose0, _ = get_odom()
-    path_w = _shift_path_to_start_at_pose(path, pose0)
-    task.start_path(path_w, pose0)
-
-    ticks: list[TrajectoryTick] = []
-    est = _PoseVelocityEstimator()
-    period = 1.0 / profile.tick_rate_hz
-    t0 = time.perf_counter()
+    coord.start()
     arrived = False
+    path_w = path
     try:
-        while True:
-            now = time.perf_counter()
-            t_rel = now - t0
-            if t_rel > timeout_s:
-                print(f"  [{label}] timeout {timeout_s:.0f}s")
-                break
-            pose, age = get_odom()
-            if pose is None or age > profile.odom_stale_s:
-                print(f"  [{label}] ABORT stale odom ({age:.2f}s)")
-                break
-            task.update_odom(pose)
-            ev = est.update(pose, now)
-            state = CoordinatorState(
-                joints=JointStateSnapshot(
-                    joint_velocities={"base/vx": ev[0], "base/vy": ev[1], "base/wz": ev[2]},
-                    timestamp=now,
-                ),
-                t_now=now,
-                dt=period,
-            )
-            out = task.compute(state)
-            vx, wz = (
-                (out.velocities[0], out.velocities[2])
-                if (out is not None and out.velocities is not None)
-                else (0.0, 0.0)
-            )
-            tw = _twist_clamped(vx, wz, profile.vx_max, profile.wz_max)
-            cmd_pub.broadcast(None, tw)
-            ticks.append(
-                TrajectoryTick(
-                    t=t_rel,
-                    pose=pose,
-                    cmd_twist=tw,
-                    actual_twist=Twist(
-                        linear=Vector3(ev[0], ev[1], 0.0),
-                        angular=Vector3(0.0, 0.0, ev[2]),
-                    ),
-                )
-            )
+        pose0 = recorder.first_pose(timeout_s=profile.odom_warmup_s)
+        path_w = _shift_path_to_start_at_pose(path, pose0)
+        coord.add_task(task)
+        if not task.start_path(path_w, pose0):
+            print(f"  [{label}] start_path rejected; aborting run")
+            return ExecutedTrajectory(ticks=recorder.snapshot(), arrived=False), path_w
+
+        t_start = time.perf_counter()
+        deadline = t_start + timeout_s
+        terminated = False
+        while time.perf_counter() < deadline:
             st = task.get_state()
             if st in _ARRIVED_STATES:
                 arrived = True
-                print(f"  [{label}] arrived in {t_rel:.1f}s")
+                terminated = True
+                print(f"  [{label}] arrived in {time.perf_counter() - t_start:.1f}s")
                 break
             if st in _FAILED_STATES:
-                print(f"  [{label}] task aborted")
+                terminated = True
+                print(f"  [{label}] task aborted (state={st})")
                 break
-            time.sleep(max(0.0, t0 + len(ticks) * period - time.perf_counter()))
-    finally:
-        for _ in range(3):
-            cmd_pub.broadcast(None, stop_twist())
             time.sleep(0.05)
-    return ExecutedTrajectory(ticks=ticks, arrived=arrived), path_w
+        if not terminated:
+            print(f"  [{label}] timeout {timeout_s:.0f}s")
+    finally:
+        try:
+            task.cancel()
+        except Exception:
+            pass
+        unsub()
+        coord.stop()
+    return ExecutedTrajectory(ticks=recorder.snapshot(), arrived=arrived), path_w
 
 
 # --- benchmark ----------------------------------------------------------
@@ -451,42 +352,12 @@ def _path_set() -> dict:
     }
 
 
-def _open_hw_link(profile: RobotProfile, warmup_s: float) -> dict:
-    """LCM to a running `dimos run <profile.blueprint>`."""
-    from dimos.core.transport import LCMTransport
-
-    cmd_pub = LCMTransport(profile.cmd_topic, Twist)
-    odom_sub = LCMTransport(profile.odom_topic, PoseStamped)
-    lock = threading.Lock()
-    box: dict = {"pose": None, "t": 0.0}
-
-    def _on(msg) -> None:
-        with lock:
-            box["pose"] = msg
-            box["t"] = time.perf_counter()
-
-    odom_sub.subscribe(_on)
-
-    def get_odom():
-        with lock:
-            return box["pose"], time.perf_counter() - box["t"]
-
-    print(f"[hw] waiting up to {warmup_s:.0f}s for {profile.odom_topic} ...")
-    deadline = time.perf_counter() + warmup_s
-    while time.perf_counter() < deadline and get_odom()[0] is None:
-        time.sleep(0.05)
-    if get_odom()[0] is None:
-        raise RuntimeError(f"No {profile.odom_topic} — is `dimos run {profile.blueprint}` up?")
-    return {"pub": cmd_pub, "get": get_odom}
-
-
 def _run_ladder(
     cfg: TuningConfig,
-    profile: RobotProfile,
+    profile: RobotPlantProfile,
     speeds: list[float],
     timeout_s: float,
     mode: str,
-    warmup_s: float,
     use_ff: bool,
     use_profile: bool,
 ) -> tuple[list[OperatingPoint], list[dict]]:
@@ -494,82 +365,62 @@ def _run_ladder(
     # measurement. FF / velocity profile are opt-in comparison arms.
     ff = cfg.feedforward.to_runtime() if use_ff else None
     k_angular = float(cfg.recommended_controller.params.get("k_angular", 0.5))
-    link = _open_hw_link(profile, warmup_s) if mode == "hw" else None
     points: list[OperatingPoint] = []
     runs: list[dict] = []  # for the XY trajectory overlay
-    try:
-        for name, path in _path_set().items():
-            for speed in speeds:
-                prof_cfg = (
-                    cfg.velocity_profile.to_runtime(max_linear_speed=speed) if use_profile else None
-                )
-                if mode == "hw":
-                    for _ in range(3):
-                        link["pub"].broadcast(
-                            None, _twist_clamped(0.0, 0.0, profile.vx_max, profile.wz_max)
-                        )
-                        time.sleep(0.05)
-                    resp = (
-                        input(
-                            f"\n[{name} v={speed:.2f}] reposition+aim robot, "
-                            f"ENTER=run  s=skip  q=quit: "
-                        )
-                        .strip()
-                        .lower()
+    for name, path in _path_set().items():
+        for speed in speeds:
+            prof_cfg = (
+                cfg.velocity_profile.to_runtime(max_linear_speed=speed) if use_profile else None
+            )
+            if mode == "hw":
+                resp = (
+                    input(
+                        f"\n[{name} v={speed:.2f}] reposition+aim robot, "
+                        f"ENTER=run  s=skip  q=quit: "
                     )
-                    if resp == "q":
-                        raise KeyboardInterrupt
-                    if resp == "s":
-                        print("  skipped")
-                        continue
-                    traj, ref = _run_baseline_hw(
-                        profile,
-                        link,
-                        path,
-                        speed,
-                        k_angular,
-                        ff,
-                        prof_cfg,
-                        timeout_s,
-                        f"{name}@{speed:.2f}",
-                    )
-                else:
-                    traj, ref = _run_baseline_sim(
-                        profile, path, speed, k_angular, ff, prof_cfg, timeout_s
-                    )
-                # Score/plot against the executed-frame reference: in hw
-                # that's the pose-anchored path, not the robot-centric input.
-                s = score_run(ref, traj)
-                points.append(
-                    OperatingPoint(
-                        path=name,
-                        speed=speed,
-                        cte_max=s.cte_max,
-                        cte_rms=s.cte_rms,
-                        arrived=s.arrived,
-                    )
+                    .strip()
+                    .lower()
                 )
-                runs.append(
-                    {
-                        "path": name,
-                        "speed": speed,
-                        "cte_max": s.cte_max,
-                        "arrived": s.arrived,
-                        "ref": [(p.position.x, p.position.y) for p in ref.poses],
-                        "exec": [(tk.pose.position.x, tk.pose.position.y) for tk in traj.ticks],
-                    }
+                if resp == "q":
+                    raise KeyboardInterrupt
+                if resp == "s":
+                    print("  skipped")
+                    continue
+            traj, ref = _run_baseline(
+                profile,
+                path,
+                speed,
+                k_angular,
+                ff,
+                prof_cfg,
+                timeout_s,
+                f"{name}@{speed:.2f}",
+            )
+            # Score/plot against the executed-frame reference (the anchored path).
+            s = score_run(ref, traj)
+            points.append(
+                OperatingPoint(
+                    path=name,
+                    speed=speed,
+                    cte_max=s.cte_max,
+                    cte_rms=s.cte_rms,
+                    arrived=s.arrived,
                 )
-                print(
-                    f"  {name:14} v={speed:.2f}  cte_max={s.cte_max * 100:6.1f}cm  "
-                    f"cte_rms={s.cte_rms * 100:6.1f}cm  arrived={s.arrived}"
-                )
-    finally:
-        if link is not None:
-            for _ in range(3):
-                link["pub"].broadcast(
-                    None, _twist_clamped(0.0, 0.0, profile.vx_max, profile.wz_max)
-                )
-                time.sleep(0.05)
+            )
+            runs.append(
+                {
+                    "path": name,
+                    "speed": speed,
+                    "cte_max": s.cte_max,
+                    "arrived": s.arrived,
+                    "ref": [(p.position.x, p.position.y) for p in ref.poses],
+                    "exec": [(tk.pose.position.x, tk.pose.position.y) for tk in traj.ticks],
+                }
+            )
+            print(
+                f"  {name:14} v={speed:.2f}  cte_max={s.cte_max * 100:6.1f}cm  "
+                f"cte_rms={s.cte_rms * 100:6.1f}cm  arrived={s.arrived}"
+            )
     return points, runs
 
 
@@ -595,8 +446,8 @@ def _canonicalize(ref: list, exec_: list) -> tuple[list, list]:
     start -> (0,0), initial heading -> +x. The same transform is applied
     to the executed trajectory. Makes every run of a path overlay on one
     identical reference sharing the origin — so speeds are comparable
-    regardless of where the robot physically started (hw anchors each run
-    to its current odom pose; sim already starts at the path origin)."""
+    regardless of where the robot physically started (paths are anchored
+    to the robot's first odom pose, which differs between runs)."""
     if len(ref) < 2:
         return ref, exec_
     ox, oy = ref[0]
@@ -671,20 +522,32 @@ def _plot_xy(runs: list[dict], out: Path, robot_name: str, arm: str) -> None:
     plt.close(fig)
 
 
+def _prereq_banner(profile: RobotPlantProfile, mode: str) -> None:
+    if mode == "hw":
+        bp = profile.blueprint
+        kind = "HARDWARE"
+    else:
+        bp = profile.sim_blueprint
+        kind = "SIM"
+    print(
+        f"\n=== {kind} MODE ({profile.name}) ===\n"
+        f"Prereqs:\n"
+        f"  1. Another terminal: `dimos run {bp}`\n"
+        f"     (publishes {profile.odom_topic}, consumes {profile.cmd_topic}).\n"
+        f"  2. This process: strip /nix/store from LD_LIBRARY_PATH (README).\n"
+        f"Each (path,speed): reposition+aim, then ENTER. Velocity-commanded\n"
+        f"baseline runs inside our ControlCoordinator; ticks at {profile.tick_rate_hz:g}Hz.\n"
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Twist-base operating-point benchmark")
-    ap.add_argument("--robot", default="go2", help=f"one of {sorted(ROBOT_PROFILES)}")
+    ap.add_argument("--robot", default="go2", help=f"one of {sorted(ROBOT_PLANT_PROFILES)}")
     ap.add_argument("--config", required=True, help="config artifact from characterization")
     ap.add_argument("--mode", choices=["hw", "sim"], default="hw")
     ap.add_argument("--speeds", default="0.3,0.5,0.7,0.9,1.0")
     ap.add_argument("--tolerances", default="5,10,15", help="cm")
     ap.add_argument("--timeout", type=float, default=60.0, help="per (path,speed) run timeout (s)")
-    ap.add_argument(
-        "--odom-warmup",
-        type=float,
-        default=None,
-        help="how long to wait for first odom (s); default from profile",
-    )
     ap.add_argument(
         "--ff",
         action="store_true",
@@ -700,7 +563,6 @@ def main() -> None:
     args = ap.parse_args()
 
     profile = _resolve_profile(args.robot)
-    warmup_s = args.odom_warmup if args.odom_warmup is not None else profile.odom_warmup_s
     config_path = Path(args.config).expanduser()
     cfg = TuningConfig.from_json(config_path)  # asserts schema_version
     speeds = [float(s) for s in args.speeds.split(",")]
@@ -723,6 +585,8 @@ def main() -> None:
             "plant only; the operating-point map is NOT a real-robot result."
         )
 
+    _prereq_banner(profile, args.mode)
+
     arm_desc = (
         "BARE stock baseline (no FF, no profile) — the plant's physical tracking limit"
         if arm == "bare"
@@ -740,7 +604,6 @@ def main() -> None:
             speeds,
             args.timeout,
             args.mode,
-            warmup_s,
             use_ff=args.ff,
             use_profile=args.profile,
         )

@@ -17,7 +17,7 @@
 **This is a hardware tool.** It measures a real velocity-commanded
 base's per-axis response (vx, vy, wz), fits FOPDT per channel, runs the
 DERIVE step, and emits the versioned config artifact. Robot-agnostic:
-everything robot-specific comes from the selected ``RobotProfile``
+everything robot-specific comes from the selected ``RobotPlantProfile``
 (``--robot``, default ``go2``).
 
     # terminal 1 (the robot's bring-up blueprint, see the profile):
@@ -26,11 +26,14 @@ everything robot-specific comes from the selected ``RobotProfile``
     uv run python -m dimos.utils.benchmarking.characterization \\
         --robot go2 --mode hw --surface concrete
 
-`--mode hw` (default) drives the real robot over LCM (profile cmd topic
-out, odom topic in). It is **operator-gated**: before every step it
-stops the robot and waits for you to reposition it and press ENTER.
-Safe (velocity clamp, zero-Twist on exit/SIGINT, stale-odom abort,
-distance + time caps).
+`--mode hw` (default) drives the real robot via the same path the
+benchmark does: an in-process ``ControlCoordinator`` with the
+``transport_lcm`` twist-base adapter spins up to give us a ``joint_state``
+Out stream sourced from the adapter's odometry. Signal-injection itself
+stays a standalone Twist publisher (SI is open-loop by nature). Each
+step is **operator-gated**: before every step the robot is stopped and
+we wait for ENTER. Safe (velocity clamp, zero-Twist on exit/SIGINT,
+stale-odom abort, distance + time caps).
 
 `--mode self-test` is a **plumbing check, NOT a tuning artifact**: it
 steps the profile's in-process FOPDT sim plant and recovers it. It only
@@ -53,10 +56,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from dimos.control.components import HardwareComponent, HardwareType, make_twist_base_joints
+from dimos.control.coordinator import ControlCoordinator
+from dimos.core.transport import LCMTransport
+from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+from dimos.msgs.geometry_msgs.Twist import Twist
+from dimos.msgs.geometry_msgs.Vector3 import Vector3
+from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.utils.benchmarking.plant import (
-    ROBOT_PROFILES,
+    ROBOT_PLANT_PROFILES,
     FopdtChannelParams,
-    RobotProfile,
+    RobotPlantProfile,
     TwistBasePlantParams,
     TwistBasePlantSim,
 )
@@ -76,17 +86,19 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
-def _resolve_profile(name: str) -> RobotProfile:
+def _resolve_profile(name: str) -> RobotPlantProfile:
     try:
-        return ROBOT_PROFILES[name]
+        return ROBOT_PLANT_PROFILES[name]
     except KeyError:
-        raise SystemExit(f"unknown --robot {name!r}; known: {sorted(ROBOT_PROFILES)}") from None
+        raise SystemExit(
+            f"unknown --robot {name!r}; known: {sorted(ROBOT_PLANT_PROFILES)}"
+        ) from None
 
 
 # --- self-test (in-process FOPDT plant; NOT robot-valid) -----------------
 
 
-def _fit_selftest(profile: RobotProfile) -> tuple[TwistBasePlantParams, dict, list[dict]]:
+def _fit_selftest(profile: RobotPlantProfile) -> tuple[TwistBasePlantParams, dict, list[dict]]:
     """Step the profile's FOPDT sim plant and recover it. Plumbing check
     only — proves the measure->fit->derive code path runs."""
     truth = profile.sim_plant
@@ -153,7 +165,7 @@ def _fit_selftest(profile: RobotProfile) -> tuple[TwistBasePlantParams, dict, li
 
 
 def _plot_fits(
-    traces: list[dict], provenance: Provenance, profile: RobotProfile, out: Path
+    traces: list[dict], provenance: Provenance, profile: RobotPlantProfile, out: Path
 ) -> None:
     """One column per channel; each step's measured velocity overlaid
     with its fitted FOPDT step response. This is the artifact a human
@@ -198,40 +210,78 @@ def _plot_fits(
 # --- hardware SI (real robot over LCM, operator-gated, safe) -------------
 
 
-class _PoseVelocityEstimator:
-    """Differentiate consecutive ``PoseStamped`` to body-frame (vx,vy,wz);
-    EMA-smoothed (pose-only odom). Ported from the R&D hw loop."""
+class _JointStatePoseStream:
+    """Pose + body-velocity stream sourced from a coordinator's
+    ``joint_state`` Out. Reuses the benchmark observer's math: positions
+    are [x, y, yaw] (twist-base adapter convention); body-frame velocity
+    is recovered by EMA-smoothed pose differentiation. Drop-in
+    replacement for the old standalone /odom LCM subscriber +
+    in-house ``_PoseVelocityEstimator``."""
 
-    def __init__(self, alpha: float = 0.5) -> None:
-        self._pp = None
-        self._pt: float | None = None
+    def __init__(self, joint_names: list[str], alpha: float = 0.5) -> None:
+        self._jx, self._jy, self._jyaw = joint_names
+        self._alpha = alpha
+        self._lock = threading.Lock()
+        self._pose: PoseStamped | None = None
+        self._pose_t: float = 0.0
+        self._prev_pose: PoseStamped | None = None
+        self._prev_t: float | None = None
         self._vx = self._vy = self._wz = 0.0
-        self._a = alpha
 
-    def update(self, pose, t: float) -> tuple[float, float, float]:
-        if self._pp is None or self._pt is None:
-            self._pp, self._pt = pose, t
-            return 0.0, 0.0, 0.0
-        dt = t - self._pt
-        if dt <= 0:
-            return self._vx, self._vy, self._wz
-        dx = pose.position.x - self._pp.position.x
-        dy = pose.position.y - self._pp.position.y
-        y0, y1 = self._pp.orientation.euler[2], pose.orientation.euler[2]
-        dyaw = (y1 - y0 + math.pi) % (2 * math.pi) - math.pi
-        yaw = y1
-        c, s = math.cos(yaw), math.sin(yaw)
-        bx = (dx / dt) * c + (dy / dt) * s
-        by = -(dx / dt) * s + (dy / dt) * c
-        bw = dyaw / dt
-        self._vx = self._a * bx + (1 - self._a) * self._vx
-        self._vy = self._a * by + (1 - self._a) * self._vy
-        self._wz = self._a * bw + (1 - self._a) * self._wz
-        self._pp, self._pt = pose, t
-        return self._vx, self._vy, self._wz
+    def on_joint_state(self, msg: JointState) -> None:
+        if not msg.name:
+            return
+        idx = {n: i for i, n in enumerate(msg.name)}
+        try:
+            x = float(msg.position[idx[self._jx]])
+            y = float(msg.position[idx[self._jy]])
+            yaw = float(msg.position[idx[self._jyaw]])
+        except (KeyError, IndexError):
+            return
+        # The caller waits a grace period after coord.start before
+        # sampling, so the (0,0,0) placeholder from ConnectedTwistBase
+        # (emitted before the adapter receives its first /odom) does
+        # not get latched as the start pose.
+        now = time.perf_counter()
+        from dimos.msgs.geometry_msgs.Quaternion import Quaternion
+
+        pose = PoseStamped(
+            ts=now,
+            position=Vector3(x, y, 0.0),
+            orientation=Quaternion.from_euler(Vector3(0.0, 0.0, yaw)),
+        )
+        with self._lock:
+            if self._prev_pose is not None and self._prev_t is not None:
+                dt = now - self._prev_t
+                if dt > 0:
+                    dx = pose.position.x - self._prev_pose.position.x
+                    dy = pose.position.y - self._prev_pose.position.y
+                    y0 = self._prev_pose.orientation.euler[2]
+                    y1 = pose.orientation.euler[2]
+                    dyaw = (y1 - y0 + math.pi) % (2 * math.pi) - math.pi
+                    c, s = math.cos(y1), math.sin(y1)
+                    bx = (dx / dt) * c + (dy / dt) * s
+                    by = -(dx / dt) * s + (dy / dt) * c
+                    a = self._alpha
+                    self._vx = a * bx + (1 - a) * self._vx
+                    self._vy = a * by + (1 - a) * self._vy
+                    self._wz = a * (dyaw / dt) + (1 - a) * self._wz
+            self._prev_pose, self._prev_t = pose, now
+            self._pose, self._pose_t = pose, now
+
+    def latest(self) -> tuple[PoseStamped | None, float, tuple[float, float, float]]:
+        with self._lock:
+            return self._pose, self._pose_t, (self._vx, self._vy, self._wz)
+
+    def reset_velocity(self) -> None:
+        """Drop EMA state — called at pre-roll so each step starts clean."""
+        with self._lock:
+            self._vx = self._vy = self._wz = 0.0
+            self._prev_pose = None
+            self._prev_t = None
 
 
-def _prereq_banner(profile: RobotProfile) -> None:
+def _prereq_banner(profile: RobotPlantProfile) -> None:
     print(
         f"\n=== HARDWARE MODE ({profile.name}) ===\n"
         "Prereqs:\n"
@@ -249,30 +299,19 @@ def _prereq_banner(profile: RobotProfile) -> None:
 
 
 def _fit_hw(
-    profile: RobotProfile,
+    profile: RobotPlantProfile,
     step_s: float,
     pre_roll_s: float,
     warmup_s: float,
     max_dist: float,
 ) -> tuple[TwistBasePlantParams, dict, list[dict]]:
-    from dimos.core.transport import LCMTransport
-    from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
-    from dimos.msgs.geometry_msgs.Twist import Twist
-    from dimos.msgs.geometry_msgs.Vector3 import Vector3
-
     _prereq_banner(profile)
     hw_dt = 1.0 / profile.tick_rate_hz
+
+    # Signal-injection is open-loop and naturally external — we publish
+    # Twist directly onto the LCM cmd topic without going through the
+    # coordinator's task graph (the SI is not a task).
     cmd_pub = LCMTransport(profile.cmd_topic, Twist)
-    odom_sub = LCMTransport(profile.odom_topic, PoseStamped)
-    lock = threading.Lock()
-    box: dict = {"pose": None, "t": 0.0}
-
-    def _on_odom(msg) -> None:
-        with lock:
-            box["pose"] = msg
-            box["t"] = time.perf_counter()
-
-    odom_sub.subscribe(_on_odom)
 
     def publish(vx: float, vy: float, wz: float) -> None:
         cmd_pub.broadcast(
@@ -288,21 +327,48 @@ def _fit_hw(
             publish(0.0, 0.0, 0.0)
             time.sleep(0.05)
 
-    # No custom SIGINT handler: Ctrl-C must raise KeyboardInterrupt so it
-    # also breaks out of the blocking input() prompt. The try/finally
-    # below guarantees a zero-Twist stop on any exit (Ctrl-C, q, error).
+    # Observation goes through an in-process ControlCoordinator with the
+    # transport_lcm adapter — same path the benchmark uses. JointState
+    # positions = [x, y, yaw]; body velocity is recovered by pose-diff
+    # in the observer (transport_lcm.read_velocities returns last-cmd,
+    # not measured, so we always differentiate pose).
+    joints = make_twist_base_joints(profile.robot_id)
+    coord = ControlCoordinator(
+        tick_rate=profile.tick_rate_hz,
+        hardware=[
+            HardwareComponent(
+                hardware_id=profile.robot_id,
+                hardware_type=HardwareType.BASE,
+                joints=joints,
+                adapter_type="transport_lcm",
+                # READ-ONLY: we observe /{robot_id}/odom via this adapter,
+                # but the SI loop publishes its own Twist on /cmd_vel into
+                # the operator's coord. If we let this adapter write, it
+                # would also publish on /{robot_id}/cmd_vel and race the
+                # operator's coord.
+                auto_enable=False,
+            )
+        ],
+    )
+    stream = _JointStatePoseStream(joint_names=joints)
+    unsub = coord.joint_state.subscribe(stream.on_joint_state)
+    coord.start()
 
-    print(f"[hw] waiting up to {warmup_s:.0f}s for {profile.odom_topic} ...")
+    print(
+        f"[hw] waiting up to {warmup_s:.0f}s for {profile.odom_topic} (via coord.joint_state) ..."
+    )
+    time.sleep(0.5)  # grace: let adapter receive first /odom + one tick
     deadline = time.perf_counter() + warmup_s
     while time.perf_counter() < deadline:
-        with lock:
-            if box["pose"] is not None:
-                break
+        p, _, _ = stream.latest()
+        if p is not None:
+            break
         time.sleep(0.05)
-    with lock:
-        if box["pose"] is None:
-            safe_stop()
-            raise SystemExit(f"No {profile.odom_topic} — is `dimos run {profile.blueprint}` up?")
+    if stream.latest()[0] is None:
+        safe_stop()
+        unsub()
+        coord.stop()
+        raise SystemExit(f"No {profile.odom_topic} — is `dimos run {profile.blueprint}` up?")
 
     pooled: dict[str, FopdtChannelParams] = {}
     per_amplitude: dict[str, list[dict]] = {}
@@ -327,14 +393,11 @@ def _fit_hw(
                     print("  skipped")
                     continue
 
-                est = _PoseVelocityEstimator()
                 # pre-roll zeros (settle + prime estimator)
+                stream.reset_velocity()
                 t_end = time.perf_counter() + pre_roll_s
                 while time.perf_counter() < t_end:
                     publish(0.0, 0.0, 0.0)
-                    with lock:
-                        p = box["pose"]
-                    est.update(p, time.perf_counter())
                     time.sleep(hw_dt)
 
                 # step. Ends on whichever comes first: travelled distance
@@ -346,8 +409,10 @@ def _fit_hw(
                 cmd[channel] = amp
                 ts: list[float] = []
                 ys: list[float] = []
-                with lock:
-                    sp = box["pose"]
+                sp, _, _ = stream.latest()
+                if sp is None:
+                    print("  [abort] lost odom before step")
+                    continue
                 x0, y0 = sp.position.x, sp.position.y
                 t0 = time.perf_counter()
                 end_reason = "time"
@@ -357,8 +422,7 @@ def _fit_hw(
                     if t_rel > step_s:
                         break
                     publish(cmd["vx"], cmd["vy"], cmd["wz"])
-                    with lock:
-                        p, pt = box["pose"], box["t"]
+                    p, pt, v = stream.latest()
                     if p is None or now - pt > profile.odom_stale_s:
                         print(f"  [abort] stale odom ({now - pt:.2f}s)")
                         end_reason = "stale"
@@ -367,7 +431,6 @@ def _fit_hw(
                     if dist >= max_dist:
                         end_reason = "dist"
                         break
-                    v = est.update(p, now)
                     ts.append(t_rel)
                     ys.append(v[_CHANNELS.index(channel)])
                     time.sleep(hw_dt)
@@ -408,12 +471,14 @@ def _fit_hw(
                 L=float(np.mean([f.L for f in fits])),
             )
     except KeyboardInterrupt:
-        safe_stop()
+        # finally below does safe_stop + unsub + coord.stop — don't duplicate
         raise SystemExit(
             "\n[hw] aborted by operator — robot stopped, no artifact written."
         ) from None
     finally:
         safe_stop()
+        unsub()
+        coord.stop()
 
     # Channels not excited (e.g. vy on a non-strafing robot) are
     # placeholdered = vx so FF / profile stay sane; flagged in caveats.
@@ -431,7 +496,7 @@ def _fit_hw(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Twist-base characterization -> tuning artifact")
-    ap.add_argument("--robot", default="go2", help=f"one of {sorted(ROBOT_PROFILES)}")
+    ap.add_argument("--robot", default="go2", help=f"one of {sorted(ROBOT_PLANT_PROFILES)}")
     ap.add_argument("--mode", choices=["hw", "self-test"], default="hw")
     ap.add_argument("--out", default=str(REPORTS_DIR))
     ap.add_argument("--robot-id", default=None, help="provenance id (default: profile.robot_id)")

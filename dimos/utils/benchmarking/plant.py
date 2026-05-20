@@ -18,10 +18,10 @@ Per-channel FOPDT velocity tracking + unicycle kinematics (robot-agnostic;
 the ``(vx, vy, wz)`` twist-base contract). Tick-based: each call to
 :meth:`TwistBasePlantSim.step` advances one control period.
 
-The bottom of this module holds the per-robot config (``RobotProfile`` +
-``ROBOT_PROFILES``). The vendored Go2 fit (``GO2_PLANT_FITTED``) is the
-Go2 profile's ground truth — it keeps its ``GO2_`` name because it is
-genuinely Go2-measured data, not generic.
+The bottom of this module holds the per-robot plant + control config
+(``RobotPlantProfile`` + ``ROBOT_PLANT_PROFILES``). The vendored Go2 fit
+(``GO2_PLANT_FITTED``) is the Go2 profile's ground truth — it keeps its
+``GO2_`` name because it is genuinely Go2-measured data, not generic.
 """
 
 from __future__ import annotations
@@ -148,19 +148,25 @@ GO2_PLANT_FITTED = TwistBasePlantParams(
 
 
 @dataclass(frozen=True)
-class RobotProfile:
+class RobotPlantProfile:
     """Everything the characterization + benchmark tools need to know
-    about a specific velocity-commanded twist base. Add a robot by
-    appending one instance to ``ROBOT_PROFILES``."""
+    about a specific velocity-commanded twist base: the FOPDT plant and
+    the control-loop knobs that surround it. Add a robot by appending
+    one instance to ``ROBOT_PLANT_PROFILES``.
+
+    ``robot_id`` doubles as the ``hardware_id`` on the ``transport_lcm``
+    adapter that the tools use to drive the robot (so the LCM topic
+    prefix is ``/{robot_id}/{cmd_vel|odom}``). The adapter is always
+    ``transport_lcm`` — sim/hw differ only in which connection module
+    the operator brings up on the robot side (the ``blueprint``).
+    """
 
     # identity / cosmetic
     name: str
     robot_id: str
     # transport / bring-up
-    cmd_topic: str
-    odom_topic: str
-    blueprint: str  # the `dimos run <blueprint>` the operator starts
-    sim_adapter_key: str
+    blueprint: str  # the `dimos run <blueprint>` the operator starts (hw)
+    sim_blueprint: str  # the `dimos run <blueprint>` for sim (FOPDT plant)
     # physical envelope
     vx_max: float
     wz_max: float
@@ -173,17 +179,26 @@ class RobotProfile:
     step_s: float
     pre_roll_s: float
     max_dist_m: float
-    # sim ground truth: self-test + sim adapter + DERIVE ceiling fallback
+    # Sim ground truth: drives FopdtPlantConnection (sim blueprint) +
+    # self-test path + DERIVE ceiling fallback.
     sim_plant: TwistBasePlantParams
 
+    @property
+    def cmd_topic(self) -> str:
+        """LCM topic the transport_lcm adapter publishes Twist on."""
+        return f"/{self.robot_id}/cmd_vel"
 
-GO2_PROFILE = RobotProfile(
+    @property
+    def odom_topic(self) -> str:
+        """LCM topic the transport_lcm adapter subscribes PoseStamped on."""
+        return f"/{self.robot_id}/odom"
+
+
+GO2_PLANT_PROFILE = RobotPlantProfile(
     name="Go2",
     robot_id="go2",
-    cmd_topic="/cmd_vel",
-    odom_topic="/go2/odom",
     blueprint="unitree-go2-webrtc-keyboard-teleop",
-    sim_adapter_key="fopdt_sim_twist_base",
+    sim_blueprint="coordinator-sim-fopdt",
     vx_max=1.0,
     wz_max=1.5,
     tick_rate_hz=10.0,
@@ -197,18 +212,18 @@ GO2_PROFILE = RobotProfile(
     sim_plant=GO2_PLANT_FITTED,
 )
 
-ROBOT_PROFILES: dict[str, RobotProfile] = {"go2": GO2_PROFILE}
+ROBOT_PLANT_PROFILES: dict[str, RobotPlantProfile] = {"go2": GO2_PLANT_PROFILE}
 
 
 __all__ = [
     "GO2_PLANT_FITTED",
-    "GO2_PROFILE",
+    "GO2_PLANT_PROFILE",
     "GO2_VX_RISE",
     "GO2_WZ_RISE",
-    "ROBOT_PROFILES",
+    "ROBOT_PLANT_PROFILES",
     "FOPDTChannel",
     "FopdtChannelParams",
-    "RobotProfile",
+    "RobotPlantProfile",
     "TwistBasePlantParams",
     "TwistBasePlantSim",
 ]
