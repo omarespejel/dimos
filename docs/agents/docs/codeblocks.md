@@ -30,6 +30,8 @@ Add flags after the language identifier:
 | `skip` | Don't execute this block |
 | `expected-error` | Block is expected to fail |
 
+Use `skip` when a block would pull in **CUDA / GPU-only** stacks (for example perception models, `VoxelGridMapper` defaults, or imports that load torch with GPU expectations), or when it is **flaky in CI** (multi-module coordinators, timing-sensitive workers, pytest-style snippets that are not meant to run as a single script). Prefer `expected-error` only when the block is supposed to fail and you want to assert that failure.
+
 ## Examples
 
 # md-babel-py
@@ -52,9 +54,8 @@ Execute code blocks in markdown files and insert the results.
 echo "cwd: $(pwd)"
 ```
 
-<!--Result:-->
-```
-cwd: /work
+```results
+cwd: /home/lesh/coding/dimos
 ```
 
 ### Python
@@ -64,8 +65,7 @@ a = "hello world"
 print(a)
 ```
 
-<!--Result:-->
-```
+```results
 hello world
 ```
 
@@ -75,8 +75,7 @@ Sessions preserve state between code blocks:
 print(a, "again")
 ```
 
-<!--Result:-->
-```
+```results
 hello world again
 ```
 
@@ -87,15 +86,16 @@ console.log("Hello from Node.js");
 console.log(`Node version: ${process.version}`);
 ```
 
-<!--Result:-->
-```
+```results
 Hello from Node.js
-Node version: v22.21.1
+Node version: v24.11.1
 ```
 
 ### Matplotlib
 
 ```python output=assets/matplotlib-demo.svg
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 plt.style.use('dark_background')
@@ -110,7 +110,6 @@ plt.grid(alpha=0.3)
 plt.savefig('{output}', transparent=True)
 ```
 
-<!--Result:-->
 ![output](assets/matplotlib-demo.svg)
 
 ### Pikchr
@@ -153,7 +152,6 @@ arrow from X to Out.w
 
 </details>
 
-<!--Result:-->
 ![output](assets/pikchr-demo.svg)
 
 ### Asymptote
@@ -181,7 +179,6 @@ xaxis("$x$",BottomTop,LeftTicks,p=white);
 yaxis("$dP/dx$",LeftRight,RightTicks(trailingzero),p=white);
 ```
 
-<!--Result:-->
 ![output](assets/histogram.svg)
 
 ### Graphviz
@@ -191,18 +188,7 @@ A -> B -> C
 A -> C
 ```
 
-<!--Result:-->
 ![output](assets/graph.svg)
-
-### OpenSCAD
-
-```openscad output=assets/cube-sphere.png
-cube([10, 10, 10]);
-sphere(r=7);
-```
-
-<!--Result:-->
-![output](assets/cube-sphere.png)
 
 ### Diagon
 
@@ -212,8 +198,7 @@ ASCII art diagrams:
 1 + 1/2 + sum(i,0,10)
 ```
 
-<!--Result:-->
-```
+```results
         10
         ___
     1   ╲
@@ -227,8 +212,7 @@ A -> B -> C
 A -> C
 ```
 
-<!--Result:-->
-```
+```results
 ┌───┐
 │A  │
 └┬─┬┘
@@ -311,4 +295,7 @@ md-babel-py run document.md --lang python,sh
 
 # Dry run - show what would execute
 md-babel-py run document.md --dry-run
+
+# Longer subprocess limit (default 60s); see upstream README for MD_BABEL_EXECUTION_TIMEOUT
+md-babel-py run document.md --execution-timeout 120
 ```

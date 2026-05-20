@@ -13,8 +13,7 @@ print(f"Path: {data_path}")
 print(f"Exists: {data_path.exists()}")
 ```
 
-<!--Result:-->
-```
+```results
 Path: /home/lesh/coding/dimos/data/cafe.jpg
 Exists: True
 ```
@@ -46,7 +45,6 @@ F: box "Return path" rad 5px fit wid 170% ht 170%
 
 </details>
 
-<!--Result:-->
 ![output](assets/get_data_flow.svg)
 
 1. Checks if `data/{name}` already exists locally
@@ -60,20 +58,19 @@ F: box "Return path" rad 5px fit wid 170% ht 170%
 
 ```python
 from dimos.utils.data import get_data
-from dimos.msgs.sensor_msgs import Image
+from dimos.msgs.sensor_msgs.Image import Image
 
 image = Image.from_file(get_data("cafe.jpg"))
 print(f"Image shape: {image.data.shape}")
 ```
 
-<!--Result:-->
-```
+```results
 Image shape: (771, 1024, 3)
 ```
 
 ### Loading Model Checkpoints
 
-```python
+```python skip
 from dimos.utils.data import get_data
 
 model_dir = get_data("models_yolo")
@@ -88,7 +85,7 @@ Checkpoint: yolo11n.pt (5482KB)
 
 ### Loading Recorded Data for Replay
 
-```python
+```python skip
 from dimos.utils.data import get_data
 from dimos.utils.testing.replay import TimedSensorReplay
 
@@ -112,7 +109,7 @@ Replay <dimos.utils.testing.replay.TimedSensorReplay object at 0x7fdc24c708f0> l
 
 ### Loading Point Clouds
 
-```python
+```python skip
 from dimos.utils.data import get_data
 from dimos.mapping.pointclouds.util import read_pointcloud
 
@@ -143,8 +140,7 @@ data/
 
 </details>
 
-<!--Result:-->
-```
+```results
 data/
  ├──cafe.jpg
  ├──apartment/
