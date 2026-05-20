@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from enum import Enum
+from importlib import resources
 import sys
 from threading import Thread
 import time
@@ -83,22 +84,14 @@ class Go2ConnectionProtocol(Protocol):
     def publish_request(self, topic: str, data: dict) -> dict: ...  # type: ignore[type-arg]
 
 
-def _camera_info_static() -> CameraInfo:
-    fx, fy, cx, cy = (819.553492, 820.646595, 625.284099, 336.808987)
-    width, height = (1280, 720)
+_FRONT_CAMERA_720_YAML = resources.files("dimos.robot.unitree.go2").joinpath(
+    "front_camera_720.yaml"
+)
 
-    return CameraInfo(
-        frame_id="camera_optical",
-        height=height,
-        width=width,
-        distortion_model="plumb_bob",
-        D=[0.0, 0.0, 0.0, 0.0, 0.0],
-        K=[fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0],
-        R=[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        P=[fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0],
-        binning_x=0,
-        binning_y=0,
-    )
+
+def _camera_info_static() -> CameraInfo:
+    with resources.as_file(_FRONT_CAMERA_720_YAML) as yaml_path:
+        return CameraInfo.from_yaml(str(yaml_path))
 
 
 # Static camera mount chain: base_link -> camera_link -> camera_optical.
@@ -126,9 +119,15 @@ def make_connection(ip: str | None, cfg: GlobalConfig) -> Go2ConnectionProtocol:
         from dimos.robot.unitree.mujoco_connection import MujocoConnection
 
         return MujocoConnection(cfg)
-    else:
+    elif connection_type == "dimsim":
+        from dimos.robot.unitree.dimsim_connection import DimSimConnection
+
+        return DimSimConnection(cfg)
+    elif connection_type == "webrtc":
         assert ip is not None, "IP address must be provided"
         return UnitreeWebRTCConnection(ip)
+    else:
+        raise ValueError(f"Unknown simulator {cfg.simulation!r}. Choose from: mujoco, dimsim")
 
 
 class ReplayConnection(UnitreeWebRTCConnection):
@@ -193,6 +192,8 @@ _Config = TypeVar("_Config", bound=ConnectionConfig, default=ConnectionConfig)
 
 
 class GO2Connection(Module, Camera, Pointcloud):
+    dedicated_worker = True
+
     config: ConnectionConfig
     cmd_vel: In[Twist]
     pointcloud: Out[PointCloud2]
