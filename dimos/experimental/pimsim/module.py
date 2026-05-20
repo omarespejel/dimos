@@ -18,6 +18,7 @@ import asyncio
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+import struct
 import threading
 import time
 from typing import Any
@@ -65,15 +66,20 @@ from dimos.utils.logging_config import setup_logger
 logger = setup_logger()
 
 _DEFAULT_BROADCAST_HZ = 30.0
+_DEFAULT_METADATA_HZ = 10.0
 _DEFAULT_PORT = 8091
 _DEFAULT_POINTCLOUD_HZ = 2.0
 _DEFAULT_POINTCLOUD_MAX_POINTS = 70000
 _DEFAULT_CAMERA_HZ = 15.0
 _DEFAULT_CAMERA_JPEG_QUALITY = 75
+_POSE_POSITION_EPSILON = 1e-5
+_POSE_QUATERNION_EPSILON = 1e-5
 # Binary websocket message tags.
 _WS_MSG_CAMERA = 0x01
 _WS_MSG_POINTCLOUD = 0x02
+_WS_MSG_ROBOT_POSE = 0x03
 _WS_POINTCLOUD_HEADER_BYTES = 8
+_WS_ROBOT_POSE_HEADER_BYTES = 16
 _NO_CACHE_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
     "Pragma": "no-cache",
@@ -130,6 +136,7 @@ class BabylonSceneViewerModule(Module):
         scene_rotation_zyx_deg: tuple[float, float, float] = (0.0, 0.0, 0.0),
         scene_y_up: bool = True,
         broadcast_hz: float = _DEFAULT_BROADCAST_HZ,
+        metadata_hz: float = _DEFAULT_METADATA_HZ,
         pointcloud_hz: float = _DEFAULT_POINTCLOUD_HZ,
         pointcloud_max_points: int = _DEFAULT_POINTCLOUD_MAX_POINTS,
         camera_hz: float = _DEFAULT_CAMERA_HZ,
@@ -151,6 +158,7 @@ class BabylonSceneViewerModule(Module):
         self._scene_rotation_zyx_deg = scene_rotation_zyx_deg
         self._scene_y_up = scene_y_up
         self._broadcast_dt = 1.0 / float(broadcast_hz)
+        self._metadata_dt = 1.0 / float(metadata_hz)
         self._pointcloud_min_dt = 1.0 / float(pointcloud_hz)
         self._pointcloud_max_points = pointcloud_max_points
         self._camera_min_dt = 1.0 / float(camera_hz)
@@ -165,6 +173,10 @@ class BabylonSceneViewerModule(Module):
         self._latest_base_wxyz: np.ndarray | None = None
         self._latest_path: list[list[float]] = []
         self._latest_path_version = 0
+        self._last_metadata_broadcast = 0.0
+        self._last_metadata_path_version = -1
+        self._robot_pose_lock = threading.Lock()
+        self._last_robot_pose_values: np.ndarray | None = None
         self._pointcloud_lock = threading.Lock()
         self._latest_pointcloud_payload: bytes | None = None
         self._pointcloud_pending_lock = threading.Lock()
@@ -387,6 +399,9 @@ class BabylonSceneViewerModule(Module):
         self._clients.add(websocket)
         logger.info("BabylonViewer: websocket connected", clients=len(self._clients))
         try:
+            robot_pose_payload = self._make_robot_pose_payload(force=True)
+            if robot_pose_payload is not None:
+                await websocket.send_bytes(robot_pose_payload)
             await websocket.send_json(self._make_state_payload())
             with self._pointcloud_lock:
                 pointcloud_payload = self._latest_pointcloud_payload
@@ -511,63 +526,52 @@ class BabylonSceneViewerModule(Module):
         while not self._stop_event.is_set():
             loop = self._server_loop
             if loop is not None and self._clients:
-                payload = self._make_state_payload()
-                asyncio.run_coroutine_threadsafe(self._broadcast(payload), loop)
+                robot_pose_payload = self._make_robot_pose_payload()
+                state_payload = self._make_metadata_payload_if_due()
+                if robot_pose_payload is not None or state_payload is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        self._broadcast_state(state_payload, robot_pose_payload),
+                        loop,
+                    )
             time.sleep(self._broadcast_dt)
 
-    async def _broadcast(self, payload: dict[str, Any]) -> None:
+    async def _broadcast_state(
+        self,
+        state_payload: dict[str, Any] | None,
+        robot_pose_payload: bytes | None,
+    ) -> None:
         dead: list[WebSocket] = []
         for websocket in tuple(self._clients):
             try:
-                await websocket.send_json(payload)
+                if robot_pose_payload is not None:
+                    await websocket.send_bytes(robot_pose_payload)
+                if state_payload is not None:
+                    await websocket.send_json(state_payload)
             except Exception:
                 dead.append(websocket)
         for websocket in dead:
             self._clients.discard(websocket)
 
-    def _broadcast_from_thread(self, payload: dict[str, Any]) -> None:
-        loop = self._server_loop
-        if loop is None or not self._clients:
-            return
-        asyncio.run_coroutine_threadsafe(self._broadcast(payload), loop)
-
-    def _make_state_payload(self) -> dict[str, Any]:
-        robot = self._robot
-        if robot is None:
-            with self._state_lock:
-                path_version = self._latest_path_version
-            return {
-                "type": "state",
-                "time": time.time(),
-                "bodies": [],
-                "path": [],
-                "path_version": path_version,
-                "joints": {},
-            }
-
+    def _make_metadata_payload_if_due(self) -> dict[str, Any] | None:
+        now = time.monotonic()
         with self._state_lock:
-            joints = dict(self._latest_joints)
-            base_pos = None if self._latest_base_pos is None else self._latest_base_pos.copy()
-            base_wxyz = None if self._latest_base_wxyz is None else self._latest_base_wxyz.copy()
-            path_points = [point[:] for point in self._latest_path]
             path_version = self._latest_path_version
 
-        apply_state(
-            robot,
-            base_pos=base_pos,
-            base_wxyz=base_wxyz,
-            joint_positions=joints,
-        )
+        if (
+            now - self._last_metadata_broadcast < self._metadata_dt
+            and path_version == self._last_metadata_path_version
+        ):
+            return None
 
-        bodies = []
-        for body_id, body_name in enumerate(robot.body_names):
-            bodies.append(
-                {
-                    "name": body_name,
-                    "position": robot.data.xpos[body_id].astype(np.float32).tolist(),
-                    "wxyz": robot.data.xquat[body_id].astype(np.float32).tolist(),
-                }
-            )
+        self._last_metadata_broadcast = now
+        self._last_metadata_path_version = path_version
+        return self._make_state_payload()
+
+    def _make_state_payload(self) -> dict[str, Any]:
+        with self._state_lock:
+            joints = dict(self._latest_joints)
+            path_points = [point[:] for point in self._latest_path]
+            path_version = self._latest_path_version
 
         # Normalise joint names to the short form the slider HUD uses:
         #   * strip a leading "<hwid>/" prefix (e.g. "g1/left_shoulder_pitch"
@@ -585,11 +589,54 @@ class BabylonSceneViewerModule(Module):
         return {
             "type": "state",
             "time": time.time(),
-            "bodies": bodies,
             "path": path_points,
             "path_version": path_version,
             "joints": joint_positions,
         }
+
+    def _make_robot_pose_payload(self, *, force: bool = False) -> bytes | None:
+        robot = self._robot
+        if robot is None:
+            return None
+
+        with self._state_lock:
+            joints = dict(self._latest_joints)
+            base_pos = None if self._latest_base_pos is None else self._latest_base_pos.copy()
+            base_wxyz = None if self._latest_base_wxyz is None else self._latest_base_wxyz.copy()
+
+        with self._robot_pose_lock:
+            apply_state(
+                robot,
+                base_pos=base_pos,
+                base_wxyz=base_wxyz,
+                joint_positions=joints,
+            )
+
+            body_count = len(robot.body_names)
+            poses = np.empty((body_count, 7), dtype=np.float32)
+            poses[:, 0:3] = robot.data.xpos[:body_count].astype(np.float32, copy=False)
+            poses[:, 3:7] = robot.data.xquat[:body_count].astype(np.float32, copy=False)
+
+            previous = self._last_robot_pose_values
+            if not force and previous is not None and previous.shape == poses.shape:
+                position_delta = np.max(np.abs(poses[:, 0:3] - previous[:, 0:3]))
+                quaternion_delta = np.max(np.abs(poses[:, 3:7] - previous[:, 3:7]))
+                if (
+                    position_delta <= _POSE_POSITION_EPSILON
+                    and quaternion_delta <= _POSE_QUATERNION_EPSILON
+                ):
+                    return None
+
+            self._last_robot_pose_values = poses.copy()
+
+        header = struct.pack(
+            ">B3xId",
+            _WS_MSG_ROBOT_POSE,
+            body_count,
+            time.time(),
+        )
+        assert len(header) == _WS_ROBOT_POSE_HEADER_BYTES
+        return header + np.ascontiguousarray(poses).tobytes()
 
     def _on_joint_state(self, msg: JointState) -> None:
         with self._state_lock:

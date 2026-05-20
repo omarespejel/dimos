@@ -55,6 +55,8 @@ try {
 }
 
 const bodyNodes = new Map();
+const bodyNodeList = [];
+const bodyNameList = [];
 const sceneMeshes = [];
 const collisionMeshes = [];
 const robotMeshes = [];
@@ -62,11 +64,13 @@ const maxAutoSceneBytes = 2 * 1024 * 1024 * 1024;
 const params = new URLSearchParams(window.location.search);
 const useRobotMesh = params.get("robot") !== "proxy";
 const sceneMode = params.get("scene") || "auto";
+const showPerfHud = params.get("perf") === "1";
 let sceneConfig = null;
 let sceneLoadStarted = false;
 let pathMesh = null;
 let lidarMesh = null;
 let lidarMaterial = null;
+let lidarPointCount = 0;
 let lidarVisible = true;
 const lidarPointSizePx = 5.0;
 let clickMode = null;
@@ -88,19 +92,35 @@ const driveSendPeriod = 0.08;
 const driveLinearSpeed = 0.35;
 const driveStrafeSpeed = 0.25;
 const driveAngularSpeed = 0.8;
+const pointcloudHeaderBytes = 8;
+const robotPoseHeaderBytes = 16;
 const stateQueueMaxLength = 8;
 const stateImmediateDeltaMs = 100;
 const stateMaxLagMs = 100;
 const stateEarlyThresholdMs = 3;
 const statePacingDamping = 0.95;
 const robotRootBodyNames = new Set(["pelvis", "torso_link", "body_1"]);
+const posePositionEpsilon = 1e-5;
+const poseQuaternionEpsilon = 1e-5;
 const queuedStateFrames = [];
+const lastAppliedRobotPoses = [];
 const stateTiming = {
   previousSourceMs: null,
   lastIdealJsMs: null,
   jsMinusSourceMs: Number.POSITIVE_INFINITY,
 };
+const streamRef = { worker: null, ready: false };
 let lastPathVersion = null;
+const perfCounters = {
+  lastReportMs: performance.now(),
+  frames: 0,
+  poseFrames: 0,
+  poseBodiesUpdated: 0,
+  poseBodiesSkipped: 0,
+  pointcloudFrames: 0,
+  pointcloudBufferUpdates: 0,
+  pointcloudRecreates: 0,
+};
 
 const vec3 = (values) => new BABYLON.Vector3(values[0], values[1], values[2]);
 const quatWxyz = (values) =>
@@ -108,6 +128,34 @@ const quatWxyz = (values) =>
 
 function setStatus(message) {
   statusEl.textContent = message;
+}
+
+function updatePerfCounters() {
+  perfCounters.frames += 1;
+  const now = performance.now();
+  const elapsedMs = now - perfCounters.lastReportMs;
+  if (elapsedMs < 1000) return;
+
+  const elapsedSeconds = elapsedMs / 1000;
+  const summary = [
+    `fps=${(perfCounters.frames / elapsedSeconds).toFixed(1)}`,
+    `pose=${perfCounters.poseFrames}/s`,
+    `bodies=${perfCounters.poseBodiesUpdated}/${perfCounters.poseBodiesSkipped}`,
+    `pc=${perfCounters.pointcloudFrames}/s`,
+    `pcbuf=${perfCounters.pointcloudBufferUpdates}/${perfCounters.pointcloudRecreates}`,
+    `q=${queuedStateFrames.length}`,
+  ].join(" ");
+  statusEl.title = summary;
+  if (showPerfHud) statusEl.textContent = summary;
+
+  perfCounters.lastReportMs = now;
+  perfCounters.frames = 0;
+  perfCounters.poseFrames = 0;
+  perfCounters.poseBodiesUpdated = 0;
+  perfCounters.poseBodiesSkipped = 0;
+  perfCounters.pointcloudFrames = 0;
+  perfCounters.pointcloudBufferUpdates = 0;
+  perfCounters.pointcloudRecreates = 0;
 }
 
 function setButtonActive(id, active) {
@@ -265,9 +313,8 @@ function updateKeyboardCamera() {
 }
 
 function sendSocketPayload(payload) {
-  const socket = socketRef.current;
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-  socket.send(JSON.stringify(payload));
+  if (!streamRef.worker || !streamRef.ready) return false;
+  streamRef.worker.postMessage({ type: "send_json", payload });
   return true;
 }
 
@@ -515,11 +562,15 @@ async function loadRobot() {
   setStatus("loading robot");
   const response = await fetch("/robot.json", { cache: "no-store" });
   const payload = await response.json();
+  bodyNodeList.length = 0;
+  bodyNameList.length = 0;
+  lastAppliedRobotPoses.length = 0;
   for (const bodyName of payload.bodyNames) {
-    const node = new BABYLON.TransformNode(`body:${bodyName}`, scene);
-    node.rotationQuaternion = BABYLON.Quaternion.Identity();
-    bodyNodes.set(bodyName, node);
+    bodyNameList.push(bodyName);
+    bodyNodeList.push(ensureBodyNode(bodyName));
   }
+  if (!useRobotMesh) return;
+
   for (const geom of payload.geoms) {
     const mesh = new BABYLON.Mesh(`robot:${geom.id}`, scene);
     const normals = [];
@@ -582,15 +633,45 @@ function ensureBodyNode(bodyName) {
   return node;
 }
 
-function copyVec3ToNode(node, values) {
-  node.position.copyFromFloats(values[0], values[1], values[2]);
+function poseChanged(poses, offset, previous) {
+  if (!previous) return true;
+  return (
+    Math.abs(poses[offset] - previous[0]) > posePositionEpsilon ||
+    Math.abs(poses[offset + 1] - previous[1]) > posePositionEpsilon ||
+    Math.abs(poses[offset + 2] - previous[2]) > posePositionEpsilon ||
+    Math.abs(poses[offset + 3] - previous[3]) > poseQuaternionEpsilon ||
+    Math.abs(poses[offset + 4] - previous[4]) > poseQuaternionEpsilon ||
+    Math.abs(poses[offset + 5] - previous[5]) > poseQuaternionEpsilon ||
+    Math.abs(poses[offset + 6] - previous[6]) > poseQuaternionEpsilon
+  );
 }
 
-function copyQuatWxyzToNode(node, values) {
+function rememberAppliedPose(bodyIndex, poses, offset) {
+  let previous = lastAppliedRobotPoses[bodyIndex];
+  if (!previous) {
+    previous = new Float32Array(7);
+    lastAppliedRobotPoses[bodyIndex] = previous;
+  }
+  previous[0] = poses[offset];
+  previous[1] = poses[offset + 1];
+  previous[2] = poses[offset + 2];
+  previous[3] = poses[offset + 3];
+  previous[4] = poses[offset + 4];
+  previous[5] = poses[offset + 5];
+  previous[6] = poses[offset + 6];
+}
+
+function copyPackedPoseToNode(node, poses, offset) {
+  node.position.copyFromFloats(poses[offset], poses[offset + 1], poses[offset + 2]);
   if (!node.rotationQuaternion) {
     node.rotationQuaternion = BABYLON.Quaternion.Identity();
   }
-  node.rotationQuaternion.copyFromFloats(values[1], values[2], values[3], values[0]);
+  node.rotationQuaternion.copyFromFloats(
+    poses[offset + 4],
+    poses[offset + 5],
+    poses[offset + 6],
+    poses[offset + 3],
+  );
 }
 
 function updateLatestRootPosition(position) {
@@ -618,25 +699,40 @@ function updatePath(path, pathVersion) {
   pathMesh.isPickable = false;
 }
 
-function applyState(payload) {
-  for (const body of payload.bodies) {
-    const node = ensureBodyNode(body.name);
-    copyVec3ToNode(node, body.position);
-    copyQuatWxyzToNode(node, body.wxyz);
-    if (robotRootBodyNames.has(body.name)) {
+function applyRobotPose(payload) {
+  const count = Math.min(payload.count, bodyNodeList.length);
+  let updated = 0;
+  let skipped = 0;
+  for (let bodyIndex = 0; bodyIndex < count; bodyIndex += 1) {
+    const node = bodyNodeList[bodyIndex];
+    const bodyName = bodyNameList[bodyIndex];
+    const offset = bodyIndex * 7;
+    if (poseChanged(payload.poses, offset, lastAppliedRobotPoses[bodyIndex])) {
+      copyPackedPoseToNode(node, payload.poses, offset);
+      rememberAppliedPose(bodyIndex, payload.poses, offset);
+      updated += 1;
+    } else {
+      skipped += 1;
+    }
+    if (robotRootBodyNames.has(bodyName)) {
       updateLatestRootPosition(node.position);
     }
   }
 
-  if (!latestRootPosition && payload.bodies.length > 1) {
-    latestRootPosition = vec3(payload.bodies[1].position);
+  if (!latestRootPosition && count > 1) {
+    updateLatestRootPosition(bodyNodeList[1].position);
   }
+  perfCounters.poseFrames += 1;
+  perfCounters.poseBodiesUpdated += updated;
+  perfCounters.poseBodiesSkipped += skipped;
+}
 
+function applyStateMetadata(payload) {
   updatePath(payload.path, payload.path_version);
   _updateSlidersFromState(payload.joints);
 }
 
-function queueState(payload) {
+function queueRobotPose(payload) {
   const nowMs = performance.now();
   const sourceMs = Number.isFinite(payload.time) ? payload.time * 1000 : nowMs;
   stateTiming.jsMinusSourceMs = Math.min(
@@ -680,7 +776,7 @@ function applyQueuedState() {
   while (queuedStateFrames.length > 0 && queuedStateFrames[0].targetMs <= nowMs) {
     frame = queuedStateFrames.shift();
   }
-  if (frame) applyState(frame.payload);
+  if (frame) applyRobotPose(frame.payload);
 }
 
 function createLidarMaterial() {
@@ -732,6 +828,7 @@ function createLidarMaterial() {
 function updatePointCloud(payload) {
   const count = payload.count || 0;
   if (count === 0 || !payload.positions || !payload.colors) return;
+  perfCounters.pointcloudFrames += 1;
 
   const positions = payload.positions instanceof Float32Array
     ? payload.positions
@@ -743,6 +840,30 @@ function updatePointCloud(payload) {
     colors[i * 4 + 1] = packedColors[i * 3 + 1] / 255;
     colors[i * 4 + 2] = packedColors[i * 3 + 2] / 255;
     colors[i * 4 + 3] = 0.94;
+  }
+
+  if (lidarMesh && lidarPointCount === count) {
+    lidarMesh.updateVerticesData(
+      BABYLON.VertexBuffer.PositionKind,
+      positions,
+      true,
+      false,
+    );
+    lidarMesh.updateVerticesData(
+      BABYLON.VertexBuffer.ColorKind,
+      colors,
+      true,
+      false,
+    );
+    lidarMesh.setEnabled(lidarVisible);
+    perfCounters.pointcloudBufferUpdates += 1;
+    return;
+  }
+
+  if (lidarMesh) {
+    lidarMesh.dispose();
+    lidarMesh = null;
+    lidarPointCount = 0;
   }
 
   const nextMesh = new BABYLON.Mesh("lidarCloud", scene);
@@ -757,45 +878,74 @@ function updatePointCloud(payload) {
   nextMesh.material = createLidarMaterial();
   nextMesh.setEnabled(lidarVisible);
 
-  if (lidarMesh) lidarMesh.dispose();
   lidarMesh = nextMesh;
+  lidarPointCount = count;
+  perfCounters.pointcloudRecreates += 1;
 }
 
-function connectWebSocket(socketRef) {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
-  socket.binaryType = "arraybuffer";
-  socketRef.current = socket;
-  socket.onopen = () => setStatus("live");
-  socket.onclose = () => {
-    setStatus("reconnecting");
-    setTimeout(() => connectWebSocket(socketRef), 1000);
-  };
-  socket.onerror = () => setStatus("socket error");
-  socket.onmessage = (event) => {
-    if (typeof event.data === "string") {
-      const payload = JSON.parse(event.data);
-      if (payload.type === "state") {
-        queueState(payload);
+function connectStreamWorker() {
+  const worker = new Worker("/static/stream_worker.js");
+  streamRef.worker = worker;
+  streamRef.ready = false;
+  worker.onmessage = (event) => {
+    const message = event.data || {};
+    switch (message.type) {
+      case "status":
+        streamRef.ready = Boolean(message.ready);
+        setStatus(message.status);
+        break;
+      case "state":
+        if (message.payload.type === "state") {
+          applyStateMetadata(message.payload);
+        }
+        if (message.payload.type === "pointcloud") {
+          updatePointCloud(message.payload);
+        }
+        break;
+      case "robot_pose":
+        queueRobotPose({
+          count: message.count,
+          time: message.time,
+          poses: new Float32Array(
+            message.buffer,
+            robotPoseHeaderBytes,
+            message.count * 7,
+          ),
+        });
+        break;
+      case "pointcloud": {
+        const positionLength = message.count * 3;
+        const colorOffset = pointcloudHeaderBytes + positionLength * 4;
+        updatePointCloud({
+          count: message.count,
+          positions: new Float32Array(
+            message.buffer,
+            pointcloudHeaderBytes,
+            positionLength,
+          ),
+          colors: new Uint8Array(message.buffer, colorOffset, positionLength),
+        });
+        break;
       }
-      if (payload.type === "pointcloud") updatePointCloud(payload);
-    } else {
-      handleBinaryMessage(event.data);
+      case "camera":
+        updateCameraFrame(message.cameraName, message.buffer, message.jpegOffset);
+        break;
+      case "error":
+        console.warn(message.message);
+        break;
+      default:
+        break;
     }
   };
-  return socket;
+  worker.onerror = (event) => {
+    console.error(event);
+    streamRef.ready = false;
+    setStatus("stream worker error");
+  };
+  worker.postMessage({ type: "connect" });
+  return worker;
 }
 
-// Binary camera frame:
-//   byte 0:      message type (0x01)
-//   bytes 1-2:   name length (big-endian uint16)
-//   bytes 3..n:  utf-8 camera name
-//   bytes n..:   JPEG payload
-// Binary pointcloud frame:
-//   byte 0:      message type (0x02)
-//   bytes 1-3:   reserved padding
-//   bytes 4-7:   point count (big-endian uint32)
-//   bytes 8..:   float32 xyz positions, then uint8 rgb colors
 // Per-camera state. Each entry tracks its <img> element, label, and
 // the last object URL so we can revoke it after the next swap.
 const _cameraTargets = {
@@ -817,27 +967,8 @@ const _cameraTargets = {
   },
 };
 
-function handleBinaryMessage(buffer) {
-  const view = new DataView(buffer);
-  const msgType = view.getUint8(0);
-  if (msgType === 0x02) {
-    const count = view.getUint32(4, false);
-    const positionOffset = 8;
-    const positionLength = count * 3;
-    const colorOffset = positionOffset + positionLength * 4;
-    if (buffer.byteLength < colorOffset + positionLength) return;
-    updatePointCloud({
-      count,
-      positions: new Float32Array(buffer, positionOffset, positionLength),
-      colors: new Uint8Array(buffer, colorOffset, positionLength),
-    });
-    return;
-  }
-  if (msgType !== 0x01) return;
-  const nameLen = view.getUint16(1, false);
-  const nameBytes = new Uint8Array(buffer, 3, nameLen);
-  const cameraName = new TextDecoder().decode(nameBytes);
-  const jpegBytes = new Uint8Array(buffer, 3 + nameLen);
+function updateCameraFrame(cameraName, buffer, jpegOffset) {
+  const jpegBytes = new Uint8Array(buffer, jpegOffset);
   const blob = new Blob([jpegBytes], { type: "image/jpeg" });
   const url = URL.createObjectURL(blob);
 
@@ -856,7 +987,7 @@ function handleBinaryMessage(buffer) {
   if (panel) panel.dataset.hasFrame = "true";
 }
 
-function installClickPublisher(socketRef) {
+function installClickPublisher() {
   scene.onPointerObservable.add((pointerInfo) => {
     if (pointerInfo.type !== BABYLON.PointerEventTypes.POINTERPICK) return;
     const event = pointerInfo.event;
@@ -867,8 +998,7 @@ function installClickPublisher(socketRef) {
     const publishSpawn = clickMode === "spawn";
     if (!publishNav && !publishPoint && !publishSpawn) return;
 
-    const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (!streamRef.ready) return;
 
     if (publishNav || publishSpawn) {
       const point = pickScenePoint();
@@ -881,12 +1011,10 @@ function installClickPublisher(socketRef) {
           spawnMarkerMaterial,
           0.28,
         );
-        socket.send(
-          JSON.stringify({
-            type: "respawn_at",
-            point: [point.x, point.y, point.z],
-          }),
-        );
+        sendSocketPayload({
+          type: "respawn_at",
+          point: [point.x, point.y, point.z],
+        });
         setClickMode(null);
         setStatus("spawn requested");
         return;
@@ -898,12 +1026,10 @@ function installClickPublisher(socketRef) {
         navMarkerMaterial,
         0.22,
       );
-      socket.send(
-          JSON.stringify({
-            type: "clicked_point",
-            point: [point.x, point.y, point.z],
-          }),
-        );
+      sendSocketPayload({
+        type: "clicked_point",
+        point: [point.x, point.y, point.z],
+      });
       setClickMode(null);
       setStatus("nav target sent");
       return;
@@ -932,12 +1058,10 @@ function installClickPublisher(socketRef) {
       pointMarkerMaterial,
       0.16,
     );
-    socket.send(
-      JSON.stringify({
-        type: "point_goal",
-        point: [point.x, point.y, point.z],
-      }),
-    );
+    sendSocketPayload({
+      type: "point_goal",
+      point: [point.x, point.y, point.z],
+    });
     setClickMode(null);
     setStatus("point target sent");
   });
@@ -1134,14 +1258,13 @@ function _updateSlidersFromState(joints) {
   }
 })();
 
-const socketRef = { current: null };
 (async () => {
   try {
     const config = await loadConfig();
     sceneConfig = config;
-    if (useRobotMesh) await loadRobot();
-    connectWebSocket(socketRef);
-    installClickPublisher(socketRef);
+    await loadRobot();
+    connectStreamWorker();
+    installClickPublisher();
     setStatus("live");
     if (sceneMode !== "0" && sceneMode !== "manual") {
       window.setTimeout(async () => {
@@ -1195,6 +1318,7 @@ function renderFrame() {
   updateKeyboardCamera();
   sendDriveCommand(false);
   scene.render();
+  updatePerfCounters();
 }
 
 engine.runRenderLoop(renderFrame);

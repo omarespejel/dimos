@@ -55,7 +55,6 @@ from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.Imu import Imu
-from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.simulation.engines.mujoco_engine import (
     CameraConfig,
@@ -170,7 +169,6 @@ class MujocoSimModule(
     camera_info: Out[CameraInfo]
     depth_camera_info: Out[CameraInfo]
     imu: Out[Imu]
-    joint_state: Out[JointState]
     odom: Out[PoseStamped]
     cmd_vel: In[Twist]
 
@@ -596,15 +594,6 @@ class MujocoSimModule(
         if self._sim_hooks is not None:
             self._sim_hooks.post_step(engine)
 
-        self.joint_state.publish(
-            JointState(
-                frame_id="mujoco",
-                name=engine.joint_names,
-                position=engine.joint_positions,
-                velocity=engine.joint_velocities,
-                effort=engine.joint_efforts,
-            )
-        )
         root_pose = engine.get_root_pose()
         if root_pose is not None:
             position, quat_xyzw = root_pose

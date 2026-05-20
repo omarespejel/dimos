@@ -79,7 +79,6 @@ _REAL_TICK_RATE_HZ = 500.0
 _REAL_ARM_RAMP_SECONDS = 10.0
 _SIM_POLICY_DECIMATION = 1
 _DEFAULT_COMMAND_CENTER_PORT = 7779
-_DEFAULT_VISER_PORT = 8082
 _DEFAULT_BABYLON_PORT = 8091
 _DEFAULT_POINTCLOUD_FPS = 2.0
 _DEFAULT_LIDAR_VOXEL_SIZE_M = 0.05
@@ -281,7 +280,7 @@ def _websocket_blueprint(cmd_vel_topic: str) -> Blueprint:
     )
 
 
-def _sim_support_blueprints(mujoco_mjcf_path: str | Path) -> tuple[Blueprint, ...]:
+def _sim_support_blueprints() -> tuple[Blueprint, ...]:
     if not global_config.simulation:
         return ()
 
@@ -345,59 +344,9 @@ def _sim_support_blueprints(mujoco_mjcf_path: str | Path) -> tuple[Blueprint, ..
             CostMapper.blueprint(),
         )
 
-    viser_stack: tuple[Blueprint, ...] = ()
-    if _env_bool("DIMOS_ENABLE_VISER", False):
-        try:
-            from dimos.visualization.viser import ViserRenderModule
-
-            scene_mesh_path = str(scene_package.source_path) if scene_package is not None else None
-            viser_stack = (
-                ViserRenderModule.blueprint(
-                    splat_path=None,
-                    mjcf_path=mujoco_mjcf_path,
-                    port=_env_int(
-                        "DIMOS_VISER_PORT", global_config.viser_port or _DEFAULT_VISER_PORT
-                    ),
-                    scene_mesh_path=scene_mesh_path,
-                    scene_mesh_scale=(
-                        scene_package.alignment.scale if scene_package is not None else 1.0
-                    ),
-                    scene_mesh_translation=(
-                        scene_package.alignment.translation
-                        if scene_package is not None
-                        else (0.0, 0.0, 0.0)
-                    ),
-                    scene_mesh_rotation_zyx_deg=(
-                        scene_package.alignment.rotation_zyx_deg
-                        if scene_package is not None
-                        else (0.0, 0.0, 0.0)
-                    ),
-                    scene_mesh_y_up=(
-                        scene_package.alignment.y_up if scene_package is not None else False
-                    ),
-                ).transports(
-                    {
-                        ("joint_state", JointState): LCMTransport(
-                            "/coordinator/joint_state", JointState
-                        ),
-                        ("odom", PoseStamped): LCMTransport("/odom", PoseStamped),
-                        ("path", PathMsg): LCMTransport("/nav_path", PathMsg),
-                        ("clicked_point", PointStamped): LCMTransport(
-                            "/clicked_point", PointStamped
-                        ),
-                        ("pointcloud_overlay", PointCloud2): LCMTransport(
-                            "/global_map", PointCloud2
-                        ),
-                    }
-                ),
-            )
-        except ModuleNotFoundError as exc:
-            logger.warning("Viser disabled because optional dependency is missing: %s", exc.name)
-
     return (
         *mapping_stack,
         ReplanningAStarPlanner.blueprint(),
-        *viser_stack,
     )
 
 
@@ -567,7 +516,7 @@ g1_groot_wbc = autoconnect(
     _backend_selection.blueprint,
     _coordinator,
     _websocket_blueprint(_cmd_vel_topic),
-    *_sim_support_blueprints(_backend_selection.viewer_mjcf_path),
+    *_sim_support_blueprints(),
     *_optional,
 ).transports(
     {

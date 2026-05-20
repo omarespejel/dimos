@@ -42,6 +42,8 @@ if TYPE_CHECKING:
 def dimos_joint_to_mjcf(name: str) -> str:
     parts = name.split("/", 1)
     suffix = parts[1] if len(parts) > 1 else parts[0]
+    if suffix.endswith("_joint"):
+        return suffix
     return f"{suffix}_joint"
 
 
