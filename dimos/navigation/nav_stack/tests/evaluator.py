@@ -83,66 +83,6 @@ def _flat_floor(
     return np.stack([fx[mask], fy[mask], np.full(int(mask.sum()), z_center)], axis=1)
 
 
-def _staircase(
-    voxel_size: float,
-    x_extent: tuple[float, float],
-    y_start: float,
-    n_steps: int,
-    step_height: float,
-    step_depth: float,
-    base_z_voxel: int = 0,
-) -> np.ndarray:
-    """Staircase of ``n_steps`` ascending in +y starting at ``y_start``.
-
-    Step ``k`` (1-indexed) has its tread top voxel at z-index
-    ``base_z_voxel + k * step_height_voxels``, occupying a y-range of
-    ``step_depth`` starting at ``y_start + (k-1) * step_depth``. For
-    single-voxel-tall steps the tread corner doubles as the riser face;
-    multi-voxel-tall steps also emit explicit riser voxels.
-    """
-    xmin, xmax = x_extent
-    step_height_v = max(1, round(step_height / voxel_size))
-    step_depth_v = max(1, round(step_depth / voxel_size))
-    y_start_v = math.floor(y_start / voxel_size)
-    x_min_v = math.floor(xmin / voxel_size)
-    x_max_v = math.floor(xmax / voxel_size)
-    half = 0.5 * voxel_size
-
-    parts: list[np.ndarray] = []
-    for k in range(1, n_steps + 1):
-        z_top_v = base_z_voxel + k * step_height_v
-        y_front_v = y_start_v + (k - 1) * step_depth_v
-        y_back_v = y_start_v + k * step_depth_v - 1
-
-        ix = np.arange(x_min_v, x_max_v + 1)
-        iy = np.arange(y_front_v, y_back_v + 1)
-        gx, gy = np.meshgrid(ix, iy, indexing="ij")
-        tread = np.stack(
-            [
-                gx.ravel() * voxel_size + half,
-                gy.ravel() * voxel_size + half,
-                np.full(gx.size, z_top_v * voxel_size + half),
-            ],
-            axis=1,
-        )
-        parts.append(tread)
-
-        if step_height_v > 1:
-            iz = np.arange(z_top_v - step_height_v + 1, z_top_v)
-            gx2, gz = np.meshgrid(ix, iz, indexing="ij")
-            riser = np.stack(
-                [
-                    gx2.ravel() * voxel_size + half,
-                    np.full(gx2.size, y_front_v * voxel_size + half),
-                    gz.ravel() * voxel_size + half,
-                ],
-                axis=1,
-            )
-            parts.append(riser)
-
-    return np.concatenate(parts, axis=0)
-
-
 def _box_shell(
     voxel_size: float,
     bounds: tuple[float, float, float, float, float, float],
@@ -175,39 +115,76 @@ def _box_shell(
 
 
 def default_scene(voxel_size: float = 0.1) -> Scene:
-    """Lidar-realistic shell scene: floor + box obstacle + staircase.
+    """Lidar-realistic shell scene: floor + tall central box + ramp + bridge.
 
-    Robot starts at (-3, 0) on the floor and the goal is at (3, 0). A 1m square,
-    0.3m-tall box sits at the origin. A staircase climbs from z=0 to z=2m in
-    20 steps (each 0.1m tall, 0.2m deep) starting at the floor's -y edge and
-    spanning over the floor in +y. This exercises the column walker's
-    robot-height clearance check: columns under low steps see only the step
-    (gap to floor too small); columns under high steps see both floor and step.
-    Voxels are lidar-shells: only observable surfaces, no interiors or bottoms.
+    Robot starts at (-3, 0) and the goal is at (3, 0). A 2m square, 1m-tall
+    box sits at the origin — too tall to climb. To its -y side, a 5-step ramp
+    stretches from the floor's -y edge to the box; each step is 1 voxel
+    (0.1m) tall, traversable. To its +y side, a 2m-wide bridge spans from
+    the box to the floor's +y edge; its underside is at z=0.8m, leaving only
+    0.7m of clearance under it — less than the robot's 0.75m height, so the
+    walker should filter out the floor underneath the bridge as unreachable.
+
+    Expected path from (-3,0) to (3,0): around the central box, using step 1
+    of the ramp at the -y end as a low bridge to cross the obstacle strip
+    (step 1 is the only step with a 1-voxel delta to the floor).
     """
-    box = (-0.5, 0.5, -0.5, 0.5, 0.0, 0.3)
+    # Central tall box. zmax=0.95 → top voxel at z_voxel=9 (cleanly aligned).
+    big_box = (-1.0, 1.0, -1.0, 1.0, 0.0, 0.95)
+
+    # Five 1-voxel-tall steps along the -y side of the box, each 0.8m deep in y.
+    # zmax = (k + 0.5) * voxel_size keeps floor-of-zmax/voxel_size = k.
+    # Step 5 is split: left half (x in [-1, 0]) stays flat at z_voxel=5, and
+    # the right half (x in [0, 1]) is sliced into 5 sub-steps climbing from
+    # z_voxel=5 to z_voxel=9 (= box top), so the robot can reach the box top.
+    step_x = (-1.0, 1.0)
+    step_5_y = (-1.8, -1.0)
+    steps = [
+        (*step_x, -5.0, -4.2, 0.0, 0.15),  # step 1: top voxel z_voxel=1
+        (*step_x, -4.2, -3.4, 0.0, 0.25),  # step 2: z_voxel=2
+        (*step_x, -3.4, -2.6, 0.0, 0.35),  # step 3
+        (*step_x, -2.6, -1.8, 0.0, 0.45),  # step 4
+        # Step 5 left half (flat at z_voxel=5).
+        (-1.0, 0.0, *step_5_y, 0.0, 0.55),
+        # Step 5 right half: 5 sub-steps climbing in -x from z=5 to z=9.
+        (0.8, 1.0, *step_5_y, 0.0, 0.55),  # sub A: z=5 (entry at +x edge)
+        (0.6, 0.8, *step_5_y, 0.0, 0.65),  # sub B: z=6
+        (0.4, 0.6, *step_5_y, 0.0, 0.75),  # sub C: z=7
+        (0.2, 0.4, *step_5_y, 0.0, 0.85),  # sub D: z=8
+        (0.0, 0.2, *step_5_y, 0.0, 0.95),  # sub E: z=9 (= box top)
+    ]
+
+    # Bridge on +y side of box. Top voxel at z_voxel=9 (matches box top); 2
+    # voxels thick (underside at z_voxel=8, z=0.8m).
+    bridge = (-1.0, 1.0, 1.0, 5.0, 0.85, 0.95)
+
+    # Floor holes: the strip from ramp through central box (no floor visible).
+    # No hole under the bridge — lidar sees the floor through the gap on its
+    # sides, and the column walker will filter it as unreachable.
     floor = _flat_floor(
         voxel_size,
         extent=(-5.0, 5.0, -5.0, 5.0),
-        holes=[(box[0], box[1], box[2], box[3])],
+        holes=[(-1.0, 1.0, -5.0, 1.0)],
     )
-    box_voxels = _box_shell(voxel_size, box)
-    stairs = _staircase(
-        voxel_size,
-        x_extent=(-2.0, 2.0),
-        y_start=-5.0,
-        n_steps=20,
-        step_height=0.1,
-        step_depth=0.2,
+    box_voxels = _box_shell(voxel_size, big_box)
+    step_voxels = [_box_shell(voxel_size, s) for s in steps]
+    # include_bottom=True: lidar would see the bridge's underside from below,
+    # so emit voxels there. Without this, interior columns under the bridge
+    # only have the top voxel and the column walker computes too generous a
+    # gap (8 voxels) to the floor and emits a phantom-reachable floor surface.
+    bridge_voxels = _box_shell(voxel_size, bridge, include_bottom=True)
+    voxels = np.concatenate([floor, box_voxels, *step_voxels, bridge_voxels], axis=0).astype(
+        np.float32
     )
-    voxels = np.concatenate([floor, box_voxels, stairs], axis=0).astype(np.float32)
 
     return Scene(
         voxels=voxels,
         voxel_size=voxel_size,
         start_position=(-3.0, 0.0, 0.5),
-        goal_position=(3.0, 0.0, 0.5),
-        name="default_floor_box_staircase",
+        # Goal at the +y end of the bridge: forces the planner to climb the
+        # ramp + sub-staircase, traverse the box top, and walk the bridge.
+        goal_position=(0.0, 4.5, 1.4),
+        name="default_floor_box_ramp_bridge",
     )
 
 
