@@ -53,9 +53,6 @@ skip_unless_cf = pytest.mark.skipif(
 )
 
 
-# ---------- unit tests (no network) -----------------------------------
-
-
 def test_import() -> None:
     """Module should be importable even without aiortc installed."""
     from dimos.protocol.pubsub.impl import webrtcpubsub  # noqa: F401
@@ -68,9 +65,6 @@ def test_sanitize_dc_name() -> None:
     assert _sanitize_dc_name("a" * 100) == "a" * 64
     # Empty / fully-stripped names get a fallback so we never produce ""
     assert _sanitize_dc_name("///") == "___"
-
-
-# ---------- live integration tests (require CF) -----------------------
 
 
 @pytest.fixture

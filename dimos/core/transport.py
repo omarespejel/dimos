@@ -380,7 +380,14 @@ class WebRTCTransport(PubSubTransport[T]):
             self.webrtc = WebRTCPubSub(provider=CloudflareProvider(**provider_kwargs))
 
     def __reduce__(self):  # type: ignore[no-untyped-def]
-        return (WebRTCTransport, (self.topic,))
+        # Provider cannot be pickled (holds sockets/threads); on unpickle
+        # a new provider is created from env vars. Preserve msg_type so
+        # typed fingerprint filtering survives multiprocessing.
+        return (WebRTCTransport, (self.topic,), {"msg_type": self._msg_type})
+
+    def __setstate__(self, state: dict) -> None:  # type: ignore[no-untyped-def]
+        msg_type = state.get("msg_type")
+        self.__init__(self.topic, msg_type=msg_type)  # type: ignore[misc]
 
     def broadcast(self, _, msg) -> None:  # type: ignore[no-untyped-def]
         if not self._started:

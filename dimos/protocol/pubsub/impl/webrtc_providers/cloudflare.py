@@ -391,15 +391,18 @@ class CloudflareProvider(DataChannelProvider):
         ch = self._pub_channels.get(topic)
         if ch is None:
             ch = self._run_sync(self._ensure_pub(topic))
-        assert self._loop
-        self._loop.call_soon_threadsafe(ch.send, data)
+        loop = self._loop
+        if loop is None:
+            return
+        loop.call_soon_threadsafe(ch.send, data)
 
     def subscribe(self, topic: str, callback: Callable[[bytes, str], None]) -> Callable[[], None]:
         if not self._started:
             self.start()
         with self._lock:
             self._callbacks[topic].append(callback)
-        if topic not in self._sub_channels:
+            needs_sub = topic not in self._sub_channels
+        if needs_sub:
             self._run_sync(self._ensure_sub(topic))
 
         def _unsub() -> None:
