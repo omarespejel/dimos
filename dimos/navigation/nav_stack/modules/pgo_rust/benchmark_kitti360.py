@@ -33,18 +33,29 @@ from dimos.navigation.nav_stack.modules.pgo_rust.pgo_rust import PGORust
 
 
 def _resolve_git_sha() -> str:
-    """Read the head commit SHA, suffixed with '_dirty' if the worktree
-    has uncommitted changes to tracked files. Untracked files are
-    ignored — they're typically local-only artifacts (HEARTBEAT.md,
-    memory/, etc) that shouldn't taint a benchmark's provenance string.
+    """Read the head commit SHA, suffixed with '_dirty' if any *source*
+    file is modified relative to HEAD. Ignores untracked files (local
+    dev artifacts like HEARTBEAT.md) and ignores files inside
+    benchmarks/results/ (they're stamped by this exact code path —
+    flagging them as dirty would be self-referential and prevent every
+    benchmark run from producing a clean SHA).
     """
     try:
+        repo_root = Path(__file__).parent
         sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, text=True
+            ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
         ).strip()
+        # `git status --porcelain --untracked-files=no PATHSPEC` filters to
+        # tracked-file modifications outside the results directory. The
+        # `:!` pathspec is git's "exclude" magic — the trailing path is
+        # relative to the repo root, not cwd.
         status = subprocess.check_output(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            cwd=Path(__file__).parent, text=True,
+            [
+                "git", "status", "--porcelain", "--untracked-files=no",
+                "--", ".",
+                ":(exclude)dimos/navigation/nav_stack/modules/pgo_rust/benchmarks/results",
+            ],
+            cwd=repo_root, text=True,
         ).strip()
         return f"{sha}_dirty" if status else sha
     except (subprocess.CalledProcessError, FileNotFoundError):
