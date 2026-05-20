@@ -113,11 +113,13 @@ def get_data_dir(extra_path: str | None = None) -> Path:
 
 def resolve_named_path(name: str | Path, suffix: str = "") -> Path:
     s = str(name)
-    if suffix and not s.endswith(suffix):
-        s = s + suffix
     p = Path(s)
     if p.is_absolute() or p.exists():
         return p
+    if suffix and not s.endswith(suffix):
+        p = Path(s + suffix)
+        if p.is_absolute() or p.exists():
+            return p
     return get_data(p.name)
 
 
