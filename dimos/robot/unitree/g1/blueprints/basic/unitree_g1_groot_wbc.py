@@ -33,7 +33,7 @@ Sim (``--simulation``):
 
 Usage:
     dimos run unitree-g1-groot-wbc                 # real hardware
-    dimos --simulation run unitree-g1-groot-wbc    # sim
+    dimos --simulation mujoco run unitree-g1-groot-wbc    # sim
 
 Overrides (replace the old env-var dance):
     dimos run unitree-g1-groot-wbc \\
@@ -43,6 +43,7 @@ Overrides (replace the old env-var dance):
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from dimos.control.components import HardwareComponent, HardwareType
 from dimos.control.coordinator import ControlCoordinator, TaskConfig
@@ -125,6 +126,62 @@ else:
     )
 
 
+def _g1_groot_rerun_blueprint() -> Any:
+    import rerun as rr
+    import rerun.blueprint as rrb
+
+    return rrb.Blueprint(
+        rrb.Spatial3DView(
+            origin="world",
+            name="G1 GR00T WBC",
+            background=rrb.Background(kind="SolidColor", color=[0, 0, 0]),
+            line_grid=rrb.LineGrid3D(
+                plane=rr.components.Plane3D.XY.with_distance(0.0),
+            ),
+        ),
+        rrb.TimePanel(state="collapsed"),
+    )
+
+
+def _static_g1_body(rr: Any) -> Any:
+    return rr.Boxes3D(
+        half_sizes=[0.25, 0.20, 0.6],
+        centers=[[0.0, 0.0, 0.6]],
+        colors=[(0, 255, 127)],
+        fill_mode="MajorWireframe",
+    )
+
+
+_rerun_config = {
+    "blueprint": _g1_groot_rerun_blueprint,
+    "static": {
+        # MujocoSimModule logs odom as a Transform3D at world/odom.
+        # This body marker inherits that transform, giving dimos-viewer
+        # a visible robot anchor until a richer joint/URDF view exists.
+        "world/odom/g1": _static_g1_body,
+    },
+}
+
+
+def _viewer() -> Any:
+    if global_config.viewer == "none":
+        return autoconnect()
+    if global_config.viewer != "rerun":
+        raise ValueError(f"Unsupported viewer backend for G1 GR00T WBC: {global_config.viewer}")
+
+    from dimos.visualization.rerun.bridge import RerunBridgeModule
+    from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
+
+    return autoconnect(
+        RerunBridgeModule.blueprint(
+            **_rerun_config,
+            rerun_open=global_config.rerun_open,
+            rerun_web=global_config.rerun_web,
+        ),
+        RerunWebSocketServer.blueprint(),
+    )
+
+
 _coordinator = ControlCoordinator.blueprint(
     tick_rate=_tick_rate,
     publish_joint_state=True,
@@ -161,6 +218,7 @@ _coordinator = ControlCoordinator.blueprint(
         ("joint_state", JointState): LCMTransport("/coordinator/joint_state", JointState),
         ("joint_command", JointState): LCMTransport("/g1/joint_command", JointState),
         ("twist_command", Twist): LCMTransport("/g1/cmd_vel", Twist),
+        ("tele_cmd_vel", Twist): LCMTransport("/g1/cmd_vel", Twist),
         # Real-hw only: the transport_lcm adapter speaks to
         # G1WholeBodyConnection over these topics. autoconnect already
         # matches by (name, type) so sim doesn't need them -- they're
@@ -171,6 +229,8 @@ _coordinator = ControlCoordinator.blueprint(
     }
 )
 
-unitree_g1_groot_wbc = autoconnect(_backend, _coordinator)
+unitree_g1_groot_wbc = autoconnect(_backend, _coordinator, _viewer()).global_config(
+    robot_model="unitree_g1"
+)
 
 __all__ = ["unitree_g1_groot_wbc"]
