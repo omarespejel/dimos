@@ -54,8 +54,8 @@ from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 
 class RayTracingVoxelMapConfig(NativeModuleConfig):
     cwd: str | None = "rust"
-    executable: str = "target/release/voxel_ray_tracing"
-    build_command: str | None = "cargo build --release"
+    executable: str = "result/bin/voxel_ray_tracing"
+    build_command: str | None = "nix build .#default --no-write-lock-file"
     stdin_config: bool = True
 
     voxel_size: float = 0.1
