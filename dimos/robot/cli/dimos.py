@@ -51,6 +51,7 @@ from dimos.core.instance_registry import (
 )
 from dimos.protocol.pubsub.impl.lcmpubsub import LCM
 from dimos.protocol.service.lcmservice import autoconf
+from dimos.robot.unitree.go2.cli.go2tool import app as go2tool_app
 from dimos.utils.logging_config import setup_logger
 from dimos.visualization.rerun.constants import RerunOpenOption
 
@@ -131,6 +132,7 @@ def create_dynamic_callback():  # type: ignore[no-untyped-def]
 
 
 main.callback()(create_dynamic_callback())  # type: ignore[no-untyped-call]
+main.add_typer(go2tool_app, name="go2tool")
 
 
 def _resolve_name(name: str | None) -> InstanceInfo:
