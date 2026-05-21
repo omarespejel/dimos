@@ -82,6 +82,9 @@ In the ssh terminal `ssh -L 9877:localhost:9877 -L 9876:localhost:9876 -L 3030:l
 ```sh skip
 # confirm nix is installed
 which nix || sh <(curl --proto '=https' --tlsv1.2 -L https://nixos.org/nix/install)
+# confirm rust is installed
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
 source .venv/bin/activate
 uv run dimos --rerun-host 0.0.0.0 run unitree-g1-nav-onboard
 # should print out something like:
