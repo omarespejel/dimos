@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dimos.core._tls_preload import preload_tls_libs
+
+preload_tls_libs()
+
 
 def __getattr__(name: str) -> object:
     if name == "Dimos":

@@ -18,6 +18,9 @@
 
 def apply_library_config() -> None:
     """Apply process-wide library defaults. Call once per process."""
+    from dimos.core._tls_preload import preload_tls_libs
+
+    preload_tls_libs()
     # Limit OpenCV internal threads to avoid idle thread contention.
     try:
         import cv2
