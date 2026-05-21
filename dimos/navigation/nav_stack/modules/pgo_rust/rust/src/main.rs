@@ -18,8 +18,11 @@ mod voxel_grid;
 
 use dimos_lcm::LcmOptions;
 use dimos_module::{run, Input, LcmTransport, Module, Output};
+use lcm_msgs::geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3};
 use lcm_msgs::nav_msgs::Odometry;
 use lcm_msgs::sensor_msgs::PointCloud2;
+use lcm_msgs::std_msgs::{Header, Time};
+use lcm_msgs::tf2_msgs::TFMessage;
 use local_msgs::{Graph3D, GraphDelta3D};
 use nalgebra::Isometry3;
 use optimizer::GtsamOptimizer;
@@ -73,10 +76,15 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            frame_id: "map".to_string(),
-            child_frame_id: "start_point".to_string(),
+            // Frame chain: parent_frame → frame_id → child_frame_id → body_frame
+            // Identity:           world  →  map     →   odom            (corrected_odometry's child_frame_id is body_frame)
+            // pgo publishes parent→world (identity anchor) + world→odom
+            // (SLAM correction). Upstream odometry publishes odom→body.
+            // Matches cpp/pgo_cpp main's parent/world/local/body model.
             parent_frame: "world".to_string(),
-            body_frame: "current_point".to_string(),
+            frame_id: "map".to_string(),
+            child_frame_id: "odom".to_string(),
+            body_frame: "base_link".to_string(),
             tf_channel: "/tf#tf2_msgs.TFMessage".to_string(),
             key_pose_delta_deg: 10.0,
             key_pose_delta_trans: 0.5,
@@ -103,6 +111,64 @@ impl Default for Config {
     }
 }
 
+fn ts_to_time(ts: f64) -> Time {
+    let sec = ts.trunc();
+    Time {
+        sec: sec as i32,
+        nsec: ((ts - sec) * 1e9).round() as i32,
+    }
+}
+
+fn build_tf(
+    iso: &Isometry3<f64>,
+    ts: f64,
+    frame_id: &str,
+    child_frame_id: &str,
+) -> TransformStamped {
+    let t = iso.translation.vector;
+    let q = iso.rotation.into_inner();
+    TransformStamped {
+        header: Header {
+            seq: 0,
+            stamp: ts_to_time(ts),
+            frame_id: frame_id.to_string(),
+        },
+        child_frame_id: child_frame_id.to_string(),
+        transform: Transform {
+            translation: Vector3 {
+                x: t.x,
+                y: t.y,
+                z: t.z,
+            },
+            rotation: Quaternion {
+                x: q.i,
+                y: q.j,
+                z: q.k,
+                w: q.w,
+            },
+        },
+    }
+}
+
+/// Mirrors pgo_cpp/cpp/main.cpp::build_tf_message — emits two
+/// transforms: identity `parent_frame → frame_id` and the SLAM
+/// correction `frame_id → child_frame_id`. Downstream odometry is
+/// responsible for `child_frame_id → body_frame`.
+fn build_tf_message(
+    correction: &Isometry3<f64>,
+    ts: f64,
+    parent_frame: &str,
+    world_frame: &str,
+    local_frame: &str,
+) -> TFMessage {
+    TFMessage {
+        transforms: vec![
+            build_tf(&Isometry3::identity(), ts, parent_frame, world_frame),
+            build_tf(correction, ts, world_frame, local_frame),
+        ],
+    }
+}
+
 #[derive(Module)]
 #[module(setup = setup)]
 struct PgoRust {
@@ -123,6 +189,9 @@ struct PgoRust {
 
     #[output(encode = GraphDelta3D::encode)]
     loop_closure_event: Output<GraphDelta3D>,
+
+    #[output(encode = TFMessage::encode)]
+    tf: Output<TFMessage>,
 
     #[config]
     config: Config,
@@ -172,6 +241,31 @@ impl PgoRust {
         if self.config.debug {
             eprintln!("pgo_rust: initialized with GtsamOptimizer (iSAM2 via cxx FFI)");
         }
+        // Override the auto-derived `Output::topic` so TF publishes go to
+        // the configured channel (default `/tf#tf2_msgs.TFMessage`). The
+        // Python side intentionally doesn't declare `tf: Out[TFMessage]`
+        // because that would shadow `Module.tf`, so the macro's
+        // default-topic-from-port-name path doesn't reach the right
+        // channel. pgo_cpp publishes the same channel via raw
+        // `lcm.publish(tf_channel, ...)`.
+        self.tf.topic = self.config.tf_channel.clone();
+
+        // Seed an identity `world → odom` so consumers querying
+        // `world → body` get an immediate result before the first loop
+        // closure fires. Matches pgo_cpp main.cpp behavior.
+        let seed_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let seed = build_tf_message(
+            &Isometry3::identity(),
+            seed_ts,
+            &self.config.parent_frame,
+            &self.config.frame_id,
+            &self.config.child_frame_id,
+        );
+        let _ = self.tf.publish(&seed).await;
+
         // Marker the Python NativeModule.start() waits for before declaring
         // the subprocess ready (see ready_timeout_sec). Without this the
         // host races the binary's LCM subscribes, and the first publisher's
@@ -183,12 +277,15 @@ impl PgoRust {
         let pose = lcm_conv::odometry_to_isometry(&msg);
         let ts = msg.header.stamp.sec as f64 + msg.header.stamp.nsec as f64 * 1e-9;
         self.last_odometry = Some((ts, pose));
-        let Some(state) = self.state.as_ref() else {
-            return;
+        let (corrected, pose_offset) = {
+            let Some(state) = self.state.as_ref() else {
+                return;
+            };
+            (state.correct(pose), state.pose_offset())
         };
-        let corrected = state.correct(pose);
-        // Republish corrected odometry — pose_offset is identity under the
-        // stub optimizer, so this is a pass-through until Phase 3 lands.
+
+        // Republish corrected odometry — pose_offset is identity until
+        // the first loop fires.
         let mut out = msg.clone();
         out.pose.pose.position.x = corrected.translation.vector.x;
         out.pose.pose.position.y = corrected.translation.vector.y;
@@ -199,6 +296,19 @@ impl PgoRust {
         out.pose.pose.orientation.z = rotation.k;
         out.pose.pose.orientation.w = rotation.w;
         let _ = self.corrected_odometry.publish(&out).await;
+
+        // Publish the SLAM correction TF (parent→world identity + world→odom
+        // correction) alongside corrected_odometry. Downstream consumers that
+        // query `world → body` via the TF graph rely on this; pgo_cpp does
+        // the same on every scan callback.
+        let tf_msg = build_tf_message(
+            &pose_offset,
+            ts,
+            &self.config.parent_frame,
+            &self.config.frame_id,
+            &self.config.child_frame_id,
+        );
+        let _ = self.tf.publish(&tf_msg).await;
     }
 
     async fn on_registered_scan(&mut self, msg: PointCloud2) {

@@ -45,10 +45,14 @@ class PGORustConfig(NativeModuleConfig):
     stdin_config: bool = True
     ready_timeout_sec: float = 10.0
 
-    frame_id: str = "map"
-    child_frame_id: str = "start_point"
+    # Frame chain: parent_frame → frame_id → child_frame_id → body_frame
+    # Defaults:           world  →   map    →   odom         →  base_link
+    # pgo publishes parent→world identity + world→odom SLAM correction;
+    # upstream odometry publishes odom→body. Matches pgo_cpp.
     parent_frame: str = "world"
-    body_frame: str = "current_point"
+    frame_id: str = "map"
+    child_frame_id: str = "odom"
+    body_frame: str = "base_link"
     tf_channel: str = "/tf#tf2_msgs.TFMessage"
 
     key_pose_delta_deg: float = 10.0
@@ -90,6 +94,9 @@ class PGORust(NativeModule, LoopClosure):
     global_map: Out[PointCloud2]
     pose_graph: Out[Graph3D]
     loop_closure_event: Out[GraphDelta3D]
+    # Note: TF is published to `tf_channel` (defaults to `/tf#tf2_msgs.TFMessage`)
+    # directly from the Rust binary, mirroring pgo_cpp. We don't expose it as
+    # an `Out` here because that would shadow the `tf` property on `Module`.
 
     @rpc
     def start(self) -> None:
