@@ -251,13 +251,6 @@ class RerunBridgeModule(Module):
                 return msg
             if is_rerun_multi(msg):
                 return msg
-            # Prefer to_rerun_multi when available — it lets the message
-            # render itself across nodes+edges sub-paths (or any other
-            # compound shape) without forcing every consumer to wire up
-            # an explicit visual_override.
-            to_rerun_multi = getattr(msg, "to_rerun_multi", None)
-            if callable(to_rerun_multi):
-                return cast("RerunData | None", to_rerun_multi(base_path=entity_path))
             if isinstance(msg, RerunConvertible):
                 return msg.to_rerun()
             return None
@@ -294,10 +287,14 @@ class RerunBridgeModule(Module):
         if not rerun_data:
             return
 
-        # TFMessage for example returns list of (entity_path, archetype) tuples
+        # Returned tuples may use absolute paths (e.g. TFMessage's
+        # "world/tf/...") or relative sub-paths (e.g. Graph3D's "nodes"
+        # / "edges"). Anything containing a "/" is treated as absolute;
+        # bare segments are joined under entity_path.
         if is_rerun_multi(rerun_data):
             for path, archetype in rerun_data:
-                rr.log(path, archetype)
+                full_path = path if "/" in path else f"{entity_path}/{path}"
+                rr.log(full_path, archetype)
         else:
             rr.log(entity_path, cast("Archetype", rerun_data))
 
