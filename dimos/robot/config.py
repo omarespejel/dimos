@@ -275,15 +275,17 @@ class RobotConfig(BaseModel):
             task_type: Override task type (default: self.task_type).
             task_name: Override task name (default: self.coordinator_task_name).
             priority: Override priority (default: self.task_priority).
-            **task_kwargs: Extra fields passed to TaskConfig (e.g., model_path,
+            **task_kwargs: Extra fields passed to task params (e.g., model_path,
                 ee_joint_id, hand, gripper_joint, gripper_open_pos, gripper_closed_pos).
         """
+        params = dict(task_kwargs.pop("params", {}) or {})
+        params.update(task_kwargs)
         return TaskConfig(
             name=task_name if task_name is not None else self.coordinator_task_name,
             type=task_type if task_type is not None else self.task_type,
             joint_names=self.coordinator_joint_names,
             priority=priority if priority is not None else self.task_priority,
-            **task_kwargs,
+            params=params,
         )
 
 

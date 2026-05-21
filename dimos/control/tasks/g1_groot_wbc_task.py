@@ -22,13 +22,12 @@ Reference implementation: g1_control/backends/groot_wbc_backend.py.
 Observation, action, and model-selection semantics are preserved
 verbatim — changing them drifts us away from the ONNX policies trained
 by GR00T-WholeBodyControl.
-
-CRITICAL: Uses t_now from CoordinatorState, never calls time.time().
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -43,11 +42,10 @@ from dimos.control.task import (
     JointCommandOutput,
     ResourceClaim,
 )
+from dimos.protocol.service.spec import BaseConfig
 from dimos.utils.logging_config import setup_logger
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from dimos.hardware.whole_body.spec import WholeBodyAdapter
     from dimos.msgs.geometry_msgs.Twist import Twist
 
@@ -328,28 +326,6 @@ class G1GrootWBCTask(BaseControlTask):
         self._cached_q_15 = self._default_15.copy()
         self._state_seen = False
 
-        # Lifecycle state machine.
-        #
-        #   _active   — task is registered and compute() is being invoked
-        #               by the coordinator.  Gate for the whole compute()
-        #               path; start()/stop() toggle this.
-        #   _armed    — policy outputs are emitted to the adapter.  Flip
-        #               via arm()/disarm().
-        #   _arming   — currently ramping current-pose → default_15 over
-        #               ``_arming_duration`` seconds.  Set by arm() with
-        #               a non-zero ramp, cleared when alpha reaches 1.
-        #   _arm_pending — arm() was called; compute() captures the ramp
-        #               start pose from state on the next tick and flips
-        #               into _arming (or _armed directly if ramp=0).
-        #   _dry_run  — compute() still runs the policy (obs history
-        #               stays hot) but returns None so the coordinator
-        #               sends no command to the adapter.  Throttled log
-        #               lets the operator see what WOULD have gone out.
-        #
-        # When active-but-unarmed, compute() echoes back the current
-        # joint positions so the PD error is zero and the robot sits in
-        # pure damping (kd-only) — this mirrors the reference backend's
-        # "hold current pose" inactive state.
         self._active = False
         self._armed = False
         self._arming = False
@@ -766,45 +742,46 @@ __all__ = [
 ]
 
 
-def create_task(cfg: Any, hardware: Any) -> G1GrootWBCTask:
-    from pathlib import Path
+class G1GrootWBCTaskParams(BaseConfig):
+    model_path: str | Path
+    hardware_id: str
+    auto_arm: bool = False
+    auto_dry_run: bool = False
+    default_ramp_seconds: float = 10.0
+    decimation: int | None = None
 
+
+def create_task(cfg: Any, hardware: Any) -> G1GrootWBCTask:
     from dimos.control.hardware_interface import ConnectedWholeBody
 
-    if cfg.model_path is None:
-        raise ValueError(
-            f"G1GrootWBCTask {cfg.name!r} requires model_path "
-            f"(directory containing balance.onnx + walk.onnx)"
-        )
-    if cfg.hardware_id is None:
-        raise ValueError(f"G1GrootWBCTask {cfg.name!r} requires hardware_id in TaskConfig")
-    hw = hardware.get(cfg.hardware_id) if hardware else None
+    params = G1GrootWBCTaskParams.model_validate(cfg.params)
+    hw = hardware.get(params.hardware_id) if hardware else None
     if hw is None:
         raise ValueError(
             f"G1GrootWBCTask {cfg.name!r} references unknown hardware "
-            f"{cfg.hardware_id!r}. Declare the hardware before the task "
+            f"{params.hardware_id!r}. Declare the hardware before the task "
             f"in the blueprint config."
         )
     if not isinstance(hw, ConnectedWholeBody):
         raise TypeError(
             f"G1GrootWBCTask {cfg.name!r} requires a WHOLE_BODY hardware "
-            f"component for {cfg.hardware_id!r}, got {type(hw).__name__}. "
+            f"component for {params.hardware_id!r}, got {type(hw).__name__}. "
             f"Set hardware_type=HardwareType.WHOLE_BODY."
         )
 
-    model_dir = Path(cfg.model_path)
+    model_dir = Path(params.model_path)
     kwargs: dict[str, Any] = dict(
         balance_onnx=model_dir / "balance.onnx",
         walk_onnx=model_dir / "walk.onnx",
         joint_names=cfg.joint_names,
         all_joint_names=hw.joint_names,
         priority=cfg.priority,
-        auto_arm=cfg.auto_arm,
-        auto_dry_run=cfg.auto_dry_run,
-        default_ramp_seconds=cfg.default_ramp_seconds,
+        auto_arm=params.auto_arm,
+        auto_dry_run=params.auto_dry_run,
+        default_ramp_seconds=params.default_ramp_seconds,
     )
-    if cfg.decimation is not None:
-        kwargs["decimation"] = cfg.decimation
+    if params.decimation is not None:
+        kwargs["decimation"] = params.decimation
     return G1GrootWBCTask(
         cfg.name,
         G1GrootWBCTaskConfig(**kwargs),

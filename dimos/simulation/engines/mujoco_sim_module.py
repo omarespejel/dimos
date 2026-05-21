@@ -188,6 +188,7 @@ class MujocoSimModule(
         self._cmd_vel = Twist.zero()
         self._last_cmd_vel_time = 0.0
         self._kinematic_base_z: float | None = None
+        self._shm_ready_signaled = False
         self._imu_gyro_slice: slice | None = None
         self._imu_accel_slice: slice | None = None
         self._imu_base_qpos_slice: slice | None = None
@@ -252,6 +253,7 @@ class MujocoSimModule(
             return
 
         self._shm = ManipShmWriter(shm_key)
+        self._shm_ready_signaled = False
         camera_configs = self._make_camera_configs()
         engine_assets: dict[str, bytes] | None = None
         if self.config.inject_legacy_assets:
@@ -282,7 +284,6 @@ class MujocoSimModule(
         if not self._engine.connect():
             raise RuntimeError("MujocoSimModule: engine.connect() failed")
 
-        self._shm.signal_ready(num_joints=len(joint_names))
         self._stop_event.clear()
 
         self._start_kinematic_base_control()
@@ -510,6 +511,7 @@ class MujocoSimModule(
 
         self._camera_info_base = None
         self._sim_hooks = None
+        self._shm_ready_signaled = False
         super().stop()
 
         if errors:
@@ -593,6 +595,9 @@ class MujocoSimModule(
             return
         if self._sim_hooks is not None:
             self._sim_hooks.post_step(engine)
+        if not self._shm_ready_signaled:
+            shm.signal_ready(num_joints=len(engine.joint_names))
+            self._shm_ready_signaled = True
 
         root_pose = engine.get_root_pose()
         if root_pose is not None:

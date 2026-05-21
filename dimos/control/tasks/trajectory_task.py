@@ -17,8 +17,6 @@
 Passive trajectory execution - called by coordinator each tick.
 Unlike JointTrajectoryController which owns a thread, this task
 is compute-only and relies on the coordinator for timing.
-
-CRITICAL: Uses t_now from CoordinatorState, never calls time.time()
 """
 
 from __future__ import annotations
@@ -58,8 +56,6 @@ class JointTrajectoryTask(BaseControlTask):
 
     Unlike JointTrajectoryController which owns a thread, this task
     is called by the coordinator at each tick.
-
-    CRITICAL: Uses t_now from CoordinatorState, never calls time.time()
 
     State Machine:
         IDLE ──execute()──► EXECUTING ──done──► COMPLETED

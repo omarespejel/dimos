@@ -114,8 +114,8 @@ def _arm_holder_config() -> TaskConfig:
         type="servo",
         joint_names=g1_arms,
         priority=10,
-        default_positions=ARM_DEFAULT_POSE,
         auto_start=True,
+        params={"default_positions": ARM_DEFAULT_POSE},
     )
 
 
@@ -265,13 +265,15 @@ def _coordinator_blueprint(selection: _BackendSelection) -> tuple[Blueprint, str
             type="g1_groot_wbc",
             joint_names=g1_legs_waist,
             priority=50,
-            model_path=_GROOT_MODEL_DIR,
-            hardware_id="g1",
             auto_start=True,
-            auto_arm=selection.auto_arm,
-            auto_dry_run=selection.auto_dry_run,
-            default_ramp_seconds=selection.default_ramp_seconds,
-            decimation=selection.decimation,
+            params={
+                "model_path": _GROOT_MODEL_DIR,
+                "hardware_id": "g1",
+                "auto_arm": selection.auto_arm,
+                "auto_dry_run": selection.auto_dry_run,
+                "default_ramp_seconds": selection.default_ramp_seconds,
+                "decimation": selection.decimation,
+            },
         ),
         *([selection.arm_holder] if selection.arm_holder is not None else []),
     ]

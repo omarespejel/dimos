@@ -19,8 +19,6 @@ directly to hardware each tick. Useful for joystick control, force feedback,
 or any velocity-mode real-time control.
 
 SAFETY: On timeout, sends zero velocities to stop motion (configurable).
-
-CRITICAL: Uses t_now from CoordinatorState, never calls time.time()
 """
 
 from __future__ import annotations
@@ -36,6 +34,7 @@ from dimos.control.task import (
     JointCommandOutput,
     ResourceClaim,
 )
+from dimos.protocol.service.spec import BaseConfig
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
@@ -274,11 +273,19 @@ __all__ = [
 ]
 
 
+class JointVelocityTaskParams(BaseConfig):
+    timeout: float = 0.2
+    zero_on_timeout: bool = True
+
+
 def create_task(cfg: Any, hardware: Any) -> JointVelocityTask:
+    params = JointVelocityTaskParams.model_validate(cfg.params)
     return JointVelocityTask(
         cfg.name,
         JointVelocityTaskConfig(
             joint_names=cfg.joint_names,
             priority=cfg.priority,
+            timeout=params.timeout,
+            zero_on_timeout=params.zero_on_timeout,
         ),
     )

@@ -19,13 +19,12 @@ inverse kinematics internally to output joint commands. Deltas are applied
 relative to the EE pose captured at engage time.
 
 Participates in joint-level arbitration.
-
-CRITICAL: Uses t_now from CoordinatorState, never calls time.time()
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import threading
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -44,11 +43,10 @@ from dimos.manipulation.planning.kinematics.pinocchio_ik import (
     check_joint_delta,
     pose_to_se3,
 )
+from dimos.protocol.service.spec import BaseConfig
 from dimos.utils.logging_config import setup_logger
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from numpy.typing import NDArray
 
     from dimos.msgs.geometry_msgs.Pose import Pose
@@ -362,19 +360,27 @@ __all__ = [
 ]
 
 
+class TeleopIKTaskParams(BaseConfig):
+    model_path: str | Path
+    ee_joint_id: int = 6
+    hand: Literal["left", "right"] | None = None
+    gripper_joint: str | None = None
+    gripper_open_pos: float = 0.0
+    gripper_closed_pos: float = 0.0
+
+
 def create_task(cfg: Any, hardware: Any) -> TeleopIKTask:
-    if cfg.model_path is None:
-        raise ValueError(f"TeleopIKTask {cfg.name!r} requires model_path in TaskConfig")
+    params = TeleopIKTaskParams.model_validate(cfg.params)
     return TeleopIKTask(
         cfg.name,
         TeleopIKTaskConfig(
             joint_names=cfg.joint_names,
-            model_path=cfg.model_path,
-            ee_joint_id=cfg.ee_joint_id,
+            model_path=params.model_path,
+            ee_joint_id=params.ee_joint_id,
             priority=cfg.priority,
-            hand=cfg.hand,
-            gripper_joint=cfg.gripper_joint,
-            gripper_open_pos=cfg.gripper_open_pos,
-            gripper_closed_pos=cfg.gripper_closed_pos,
+            hand=params.hand,
+            gripper_joint=params.gripper_joint,
+            gripper_open_pos=params.gripper_open_pos,
+            gripper_closed_pos=params.gripper_closed_pos,
         ),
     )
