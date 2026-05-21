@@ -620,7 +620,7 @@ def serve_graph(python_file: str, *, show_disconnected: bool, port: int) -> None
         def log_message(self, format: str, *args: object) -> None:
             pass
 
-    server = HTTPServer(("0.0.0.0", port), Handler)
+    server = HTTPServer(("127.0.0.1", port), Handler)
     actual_port = server.server_address[1]
     url = f"http://localhost:{actual_port}"
     print(f"Serving at {url}  (will exit after first request)")
