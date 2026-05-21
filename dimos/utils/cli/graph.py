@@ -144,7 +144,10 @@ def _load_blueprints(python_file: str) -> list[tuple[str, Blueprint]]:
         raise RuntimeError("No Blueprint instances found in module globals.")
 
     blueprints.reverse()
-    print(f"Found {len(blueprints)} blueprint(s): {', '.join(n for n, _ in blueprints)}")
+    print(
+        f"Found {len(blueprints)} blueprint(s): {', '.join(n for n, _ in blueprints)}",
+        file=sys.stderr,
+    )
     return blueprints
 
 
