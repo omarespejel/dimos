@@ -65,6 +65,10 @@ BaselineState = Literal[
     "idle", "initial_rotation", "path_following", "final_rotation", "arrived", "aborted"
 ]
 
+# Sentinel so callers can pass ``None`` to configure() to explicitly
+# clear ff/profile_config, distinct from "don't touch this field".
+_UNSET: object = object()
+
 
 @dataclass
 class BaselinePathFollowerTaskConfig:
@@ -283,8 +287,44 @@ class BaselinePathFollowerTask(BaseControlTask):
         return float(twist.linear.x), float(twist.linear.y), float(twist.angular.z)
 
     # ------------------------------------------------------------------
-    # Public API (called by runner)
+    # Public API (called by runner — typically over RPC from a tool)
     # ------------------------------------------------------------------
+
+    def configure(
+        self,
+        speed: float | None = None,
+        k_angular: float | None = None,
+        ff_config: FeedforwardGainConfig | None | object = _UNSET,
+        velocity_profile_config: VelocityProfileConfig | None | object = _UNSET,
+    ) -> bool:
+        """Override per-run knobs before start_path. ``ff_config`` and
+        ``velocity_profile_config`` use a sentinel so callers can
+        explicitly clear them by passing ``None`` (distinct from "don't
+        touch"). Only valid while idle/arrived/aborted — refuses while
+        the task is actively driving the robot.
+        """
+        if self.is_active():
+            logger.warning(
+                f"BaselinePathFollowerTask '{self._name}': cannot configure while active"
+            )
+            return False
+        if speed is not None:
+            self._config.speed = speed
+            self._controller._speed = speed  # PController exposes _speed
+        if k_angular is not None:
+            self._config.k_angular = k_angular
+            self._controller._k_angular = k_angular
+        if ff_config is not _UNSET:
+            self._config.ff_config = ff_config  # type: ignore[assignment]
+            self._ff = FeedforwardGainCompensator(ff_config) if ff_config is not None else None
+        if velocity_profile_config is not _UNSET:
+            self._config.velocity_profile_config = velocity_profile_config  # type: ignore[assignment]
+            self._profile_cap = (
+                PathSpeedCap(velocity_profile_config)
+                if velocity_profile_config is not None
+                else None
+            )
+        return True
 
     def start_path(self, path: Path, current_odom: PoseStamped) -> bool:
         if path is None or len(path.poses) < 2:
