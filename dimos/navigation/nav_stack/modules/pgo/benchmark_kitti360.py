@@ -60,9 +60,7 @@ def main() -> None:
     parser.add_argument("--kitti360-root", type=Path, required=True)
     parser.add_argument("--sequence", type=int, default=2)
     parser.add_argument("--max-scans", type=int, default=None)
-    parser.add_argument(
-        "--publish-interval-sec", type=float, default=DEFAULT_PUBLISH_INTERVAL_SEC
-    )
+    parser.add_argument("--publish-interval-sec", type=float, default=DEFAULT_PUBLISH_INTERVAL_SEC)
     parser.add_argument("--output-json", type=Path, default=None)
     args = parser.parse_args()
 
