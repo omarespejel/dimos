@@ -145,3 +145,16 @@
   problem: shoulda done this a while ago on native modules (was causing a problem with replay tests)
   solution: Author self-note (not a review request). No external comment to address; code change already implicit in the PR.
   commit: null
+- pr: 2099
+  comment_id: 3285980874
+  author: jeff-hykin
+  file: dimos/msgs/nav_msgs/Graph3D.py
+  line: 181
+  problem: |
+    for 3d graphs to be visualized correctly, they need to output multiple rerun entities.
+    Could make to_rerun handle that but for now this seemed most straightforward
+  solution: |
+    Author self-note (not a review request). Jeff is flagging a refactor opportunity —
+    `to_rerun` could be extended to return multiple entities so callers don't have to do it
+    inline. No external action required; deferred to a follow-up PR at Jeff's discretion.
+  commit: null
