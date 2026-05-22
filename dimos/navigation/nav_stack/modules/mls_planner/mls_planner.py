@@ -22,7 +22,10 @@ piecewise.
 
 from __future__ import annotations
 
+import time
 from typing import Any
+
+import numpy as np
 
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
@@ -36,6 +39,45 @@ logger = setup_logger()
 
 class MLSPlannerConfig(ModuleConfig):
     world_frame: str = "map"
+    voxel_size: float = 0.1
+    robot_height: float = 1.0
+
+
+def _extract_surfaces(points: np.ndarray, voxel_size: float, robot_height: float) -> np.ndarray:
+    """Find walkable surface tops in a voxelized point cloud.
+
+    Iterate through all the columns, find continuous areas of
+    free space. If the free space column is at least robot height,
+    add the bottom of this range as a surface.
+    """
+    if len(points) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    indices = np.floor(points / voxel_size).astype(np.int64)
+    ix, iy, iz = indices[:, 0], indices[:, 1], indices[:, 2]
+
+    order = np.lexsort((iz, iy, ix))
+    sx, sy, sz = ix[order], iy[order], iz[order]
+
+    height_cells = int(np.ceil(robot_height / voxel_size))
+
+    next_same_col = np.zeros(len(sx), dtype=bool)
+    next_same_col[:-1] = (sx[:-1] == sx[1:]) & (sy[:-1] == sy[1:])
+
+    gap = np.empty(len(sx), dtype=np.int64)
+    gap[:-1] = sz[1:] - sz[:-1]
+    gap[-1] = 0
+
+    is_surface = (~next_same_col) | (gap > height_cells)
+
+    surf_ix = sx[is_surface]
+    surf_iy = sy[is_surface]
+    surf_iz = sz[is_surface]
+
+    x = (surf_ix.astype(np.float32) + 0.5) * voxel_size
+    y = (surf_iy.astype(np.float32) + 0.5) * voxel_size
+    z = (surf_iz.astype(np.float32) + 1.0) * voxel_size
+    return np.column_stack([x, y, z]).astype(np.float32)
 
 
 class MLSPlanner(Module):
@@ -51,8 +93,19 @@ class MLSPlanner(Module):
         super().__init__(**kwargs)
         self._latest_start: Odometry | None = None
 
-    async def handle_global_map(self, _msg: PointCloud2) -> None:
-        return
+    async def handle_global_map(self, msg: PointCloud2) -> None:
+        points, _ = msg.as_numpy()
+        if points is None or len(points) == 0:
+            return
+        surface_points = _extract_surfaces(points, self.config.voxel_size, self.config.robot_height)
+        logger.info("Surfaces extracted", count=len(surface_points))
+        self.surface_map.publish(
+            PointCloud2.from_numpy(
+                surface_points,
+                frame_id=self.config.world_frame,
+                timestamp=time.time(),
+            )
+        )
 
     async def handle_start_pose(self, msg: Odometry) -> None:
         self._latest_start = msg
