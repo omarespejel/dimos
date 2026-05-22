@@ -21,6 +21,9 @@ limitations under the License.
     <title>DimOS Scene Viewer</title>
     <script src="https://cdn.babylonjs.com/babylon.js"></script>
     <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+    <!-- Havok WASM physics. HavokPhysics() returns a promise; the plugin
+         is wired in app.js once it resolves. -->
+    <script src="https://cdn.babylonjs.com/havok/HavokPhysics_umd.js"></script>
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>

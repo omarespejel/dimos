@@ -61,6 +61,33 @@ const sceneMeshes = [];
 const collisionMeshes = [];
 const robotMeshes = [];
 const maxAutoSceneBytes = 2 * 1024 * 1024 * 1024;
+
+// Havok physics. Right-handed, z-up: gravity is -Z.
+// `physicsReady` is a promise that resolves once HavokPhysics() returns and
+// the plugin is wired. Consumers (collision-mesh wrapper, entity spawn)
+// await it before creating aggregates.
+const physicsGravity = new BABYLON.Vector3(0, 0, -9.8);
+const physicsReady = (async () => {
+  if (typeof HavokPhysics !== "function") {
+    console.warn("HavokPhysics not loaded — physics disabled");
+    return false;
+  }
+  try {
+    const havok = await HavokPhysics();
+    scene.enablePhysics(physicsGravity, new BABYLON.HavokPlugin(true, havok));
+    console.log("Havok physics enabled");
+    return true;
+  } catch (error) {
+    console.error("Havok init failed:", error);
+    return false;
+  }
+})();
+
+// Entity world. Browser is authoritative for state; Python pushes
+// spawn/despawn/teleport via WS, browser reports per-tick state back.
+const entities = new Map();              // entity_id -> {mesh, aggregate, descriptor}
+let entityBroadcastIntervalMs = 1000 / 30;   // ~30 Hz default
+let lastEntityBroadcast = 0;
 const params = new URLSearchParams(window.location.search);
 const useRobotMesh = params.get("robot") !== "proxy";
 const sceneMode = params.get("scene") || "auto";
@@ -193,8 +220,10 @@ function createCollisionMaterial() {
 function setCollisionVisibility(visible) {
   collisionVisible = visible;
   for (const mesh of collisionMeshes) {
+    // Only toggle visibility — setEnabled(false) would also stop the
+    // PhysicsAggregate from colliding, which defeats the point of
+    // running Havok against the cooked collision scene.
     mesh.visibility = visible ? 1 : 0;
-    mesh.setEnabled(visible);
   }
   setButtonActive("toggleCollision", visible);
 }
@@ -528,11 +557,26 @@ async function loadCollisionAsset(config) {
     mesh.isPickable = true;
     mesh.material = createCollisionMaterial();
     mesh.visibility = collisionVisible ? 1 : 0;
-    mesh.setEnabled(collisionVisible);
+    // Don't setEnabled(false) — Havok needs the mesh active to collide.
+    // setCollisionVisibility() toggles only the visibility for display.
     mesh.metadata = { dimosCollisionMesh: true };
     collisionMeshes.push(mesh);
   }
   if (sceneMeshes.length === 0) fitCameraToMeshes(collisionMeshes);
+
+  // Wrap each collision mesh with a static (mass=0) PhysicsAggregate so
+  // entities + the character controller actually collide with the scene.
+  if (await physicsReady) {
+    for (const mesh of collisionMeshes) {
+      if (mesh.physicsBody) continue; // idempotent
+      try {
+        new BABYLON.PhysicsAggregate(mesh, BABYLON.PhysicsShapeType.MESH, { mass: 0 }, scene);
+      } catch (error) {
+        console.warn(`collision physics aggregate failed for ${mesh.name}:`, error);
+      }
+    }
+  }
+
   setStatus("live");
 }
 
@@ -883,6 +927,201 @@ function updatePointCloud(payload) {
   perfCounters.pointcloudRecreates += 1;
 }
 
+// ─── Entity world ───────────────────────────────────────────────────────
+//
+// Python sends spawn/despawn/set_pose/apply_velocity over WS (JSON,
+// dispatched in the worker handler below). State is broadcast back per
+// Havok physics tick, throttled to ~30 Hz.
+
+function physicsShapeFromHint(hint) {
+  switch (hint) {
+    case "box":
+      return BABYLON.PhysicsShapeType.BOX;
+    case "sphere":
+      return BABYLON.PhysicsShapeType.SPHERE;
+    case "cylinder":
+      return BABYLON.PhysicsShapeType.CYLINDER;
+    case "mesh":
+    default:
+      return BABYLON.PhysicsShapeType.MESH;
+  }
+}
+
+function buildPrimitiveMesh(descriptor) {
+  const ext = descriptor.extents || [];
+  switch (descriptor.shape_hint) {
+    case "box": {
+      const w = ext[0] || 1.0;
+      const h = ext[1] || 1.0;
+      const d = ext[2] || 1.0;
+      return BABYLON.MeshBuilder.CreateBox(
+        `entity:${descriptor.entity_id}`,
+        { width: w, height: h, depth: d },
+        scene,
+      );
+    }
+    case "sphere": {
+      const r = ext[0] || 0.5;
+      return BABYLON.MeshBuilder.CreateSphere(
+        `entity:${descriptor.entity_id}`,
+        { diameter: 2 * r },
+        scene,
+      );
+    }
+    case "cylinder": {
+      const r = ext[0] || 0.5;
+      const h = ext[1] || 1.0;
+      return BABYLON.MeshBuilder.CreateCylinder(
+        `entity:${descriptor.entity_id}`,
+        { diameterTop: 2 * r, diameterBottom: 2 * r, height: h },
+        scene,
+      );
+    }
+    default:
+      return null;
+  }
+}
+
+function applyPoseWire(mesh, pose) {
+  mesh.position.set(pose.x || 0, pose.y || 0, pose.z || 0);
+  if (!mesh.rotationQuaternion) {
+    mesh.rotationQuaternion = BABYLON.Quaternion.Identity();
+  }
+  mesh.rotationQuaternion.set(
+    pose.qx || 0,
+    pose.qy || 0,
+    pose.qz || 0,
+    pose.qw === undefined ? 1 : pose.qw,
+  );
+}
+
+async function handleEntitySpawn(payload) {
+  const desc = payload.descriptor || {};
+  const id = desc.entity_id;
+  if (!id) return;
+  if (entities.has(id)) {
+    // Idempotent re-spawn (e.g. reconnect replay): just apply the pose.
+    handleEntitySetPose({ entity_id: id, pose: payload.pose || {} });
+    return;
+  }
+  if (!(await physicsReady)) {
+    console.warn(`entity_spawn ${id}: physics not ready, dropping`);
+    return;
+  }
+  if (desc.shape_hint === "mesh") {
+    // Deferred: GLB-backed entity meshes. MVP supports primitives only.
+    console.warn(`entity_spawn ${id}: shape_hint=mesh not yet supported (MVP: primitives)`);
+    return;
+  }
+  const mesh = buildPrimitiveMesh(desc);
+  if (!mesh) {
+    console.warn(`entity_spawn ${id}: cannot build shape_hint=${desc.shape_hint}`);
+    return;
+  }
+  applyPoseWire(mesh, payload.pose || {});
+
+  // mass=0 → kinematic (program-driven via set_entity_pose). Matches the
+  // semantics in entity.py: dynamic with mass>0 actually gets simulated.
+  const wantsKinematic = desc.kind !== "dynamic" || (desc.mass || 0) === 0;
+  const mass = wantsKinematic ? 0 : desc.mass;
+  let aggregate;
+  try {
+    aggregate = new BABYLON.PhysicsAggregate(
+      mesh,
+      physicsShapeFromHint(desc.shape_hint),
+      { mass },
+      scene,
+    );
+  } catch (error) {
+    console.warn(`entity_spawn ${id}: aggregate failed:`, error);
+    mesh.dispose();
+    return;
+  }
+  // Kinematic bodies: keep prestep enabled so set_entity_pose teleports
+  // are picked up before the next integration.
+  if (wantsKinematic && aggregate.body && "disablePreStep" in aggregate.body) {
+    aggregate.body.disablePreStep = false;
+  }
+  entities.set(id, {
+    mesh,
+    aggregate,
+    descriptor: desc,
+    kinematic: wantsKinematic,
+  });
+}
+
+function handleEntityDespawn(payload) {
+  const entry = entities.get(payload.entity_id);
+  if (!entry) return;
+  try {
+    entry.aggregate.dispose();
+  } catch (_) {
+    // best-effort
+  }
+  try {
+    entry.mesh.dispose();
+  } catch (_) {
+    // best-effort
+  }
+  entities.delete(payload.entity_id);
+}
+
+function handleEntitySetPose(payload) {
+  const entry = entities.get(payload.entity_id);
+  if (!entry) return;
+  applyPoseWire(entry.mesh, payload.pose || {});
+  // For dynamic bodies, zero velocities so the teleport doesn't carry
+  // stale momentum into the next step.
+  if (!entry.kinematic && entry.aggregate.body) {
+    try {
+      entry.aggregate.body.setLinearVelocity(BABYLON.Vector3.Zero());
+      entry.aggregate.body.setAngularVelocity(BABYLON.Vector3.Zero());
+    } catch (_) {
+      // ignore
+    }
+  }
+}
+
+function handleEntityApplyVelocity(payload) {
+  const entry = entities.get(payload.entity_id);
+  if (!entry || entry.kinematic) return;
+  const t = payload.twist || {};
+  try {
+    entry.aggregate.body.setLinearVelocity(
+      new BABYLON.Vector3(t.lx || 0, t.ly || 0, t.lz || 0),
+    );
+    entry.aggregate.body.setAngularVelocity(
+      new BABYLON.Vector3(t.ax || 0, t.ay || 0, t.az || 0),
+    );
+  } catch (error) {
+    console.warn(`apply_velocity ${payload.entity_id} failed:`, error);
+  }
+}
+
+function broadcastEntityStates() {
+  if (entities.size === 0) return;
+  const now = performance.now();
+  if (now - lastEntityBroadcast < entityBroadcastIntervalMs) return;
+  lastEntityBroadcast = now;
+  const ts = Date.now() / 1000.0;
+  const states = [];
+  for (const [id, entry] of entities) {
+    const p = entry.mesh.position;
+    const q = entry.mesh.rotationQuaternion || BABYLON.Quaternion.Identity();
+    states.push({
+      entity_id: id,
+      frame_id: "world",
+      ts,
+      pose: { x: p.x, y: p.y, z: p.z, qw: q.w, qx: q.x, qy: q.y, qz: q.z },
+    });
+  }
+  sendSocketPayload({ type: "entity_states", states });
+}
+
+physicsReady.then((ok) => {
+  if (ok) scene.onAfterPhysicsObservable.add(broadcastEntityStates);
+});
+
 function connectStreamWorker() {
   const worker = new Worker("/static/stream_worker.js");
   streamRef.worker = worker;
@@ -900,6 +1139,18 @@ function connectStreamWorker() {
         }
         if (message.payload.type === "pointcloud") {
           updatePointCloud(message.payload);
+        }
+        if (message.payload.type === "entity_spawn") {
+          handleEntitySpawn(message.payload);
+        }
+        if (message.payload.type === "entity_despawn") {
+          handleEntityDespawn(message.payload);
+        }
+        if (message.payload.type === "entity_set_pose") {
+          handleEntitySetPose(message.payload);
+        }
+        if (message.payload.type === "entity_apply_velocity") {
+          handleEntityApplyVelocity(message.payload);
         }
         break;
       case "robot_pose":
