@@ -200,8 +200,13 @@ class HostedTeleopModule(Module):
         # state_reliable mirrors cmd_unreliable but ordered+reliable, robot↔
         # operator. Phase 1.5: carries JSON ping/pong for clock sync; future
         # low-rate control-plane events (mode switch, etc.) ride here too.
+        # CF Realtime bridges datachannels publisher→subscriber only, so we
+        # use two channels: state_reliable (operator→robot inbound) and
+        # state_reliable_back (robot→operator outbound for pongs/state).
         self._state_channel = None
         self._state_channel_id: int | None = None
+        self._state_back_channel = None
+        self._state_back_channel_id: int | None = None
 
         self._video_track = CameraVideoTrack()
 
@@ -267,10 +272,16 @@ class HostedTeleopModule(Module):
     def _connect_blocking(self) -> None:
         assert self._loop is not None
         future = asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
-        future.result(timeout=20.0)
+        # Must exceed the HTTP timeout below + ICE gathering. create_session
+        # on the broker now does multiple CF round-trips (session + publisher
+        # track add for video), so give it room.
+        future.result(timeout=45.0)
 
     async def _connect(self) -> None:
-        self._http = httpx.AsyncClient(timeout=10.0)
+        # 30s read timeout: the broker's create_session makes 2 CF calls when
+        # video is enabled (session + add_tracks), and add_tracks itself has a
+        # 30s CF-side timeout. 10s here would give up before the broker can.
+        self._http = httpx.AsyncClient(timeout=30.0)
 
         ice_servers = [RTCIceServer(urls=u) for u in self.config.stun_urls]
         for url in self.config.turn_urls or []:
@@ -289,9 +300,9 @@ class HostedTeleopModule(Module):
         # as soon as the answer is applied.
         sctp_init = self._pc.createDataChannel("_sctp_init")
 
-        # Video track must be added before createOffer so its m-section
-        # appears in the initial SDP. Track is sendonly from the robot's
-        # perspective; broker mirrors it sendonly toward the operator.
+        # Robot→operator camera. Adds an m=video (sendonly) line to the offer;
+        # the broker declares the matching publisher track in the /sessions/new
+        # tracks array so the SFU binds it.
         self._pc.addTrack(self._video_track)
 
         @self._pc.on("connectionstatechange")
@@ -299,8 +310,6 @@ class HostedTeleopModule(Module):
             assert self._pc is not None
             logger.info(f"PC state: {self._pc.connectionState}")
             if self._pc.connectionState == "connected":
-                # Discard everything captured before the wire was ready;
-                # the first frame the operator sees is "from this instant".
                 self._video_track.arm()
 
         offer = await self._pc.createOffer()
@@ -325,6 +334,15 @@ class HostedTeleopModule(Module):
             "sdp_offer": self._pc.localDescription.sdp,
         }
         resp = await self._http.post(url, json=body, headers=self._auth_headers())
+        if resp.status_code >= 400:
+            # Surface the broker's error body — raise_for_status() discards it.
+            # A FastAPI HTTPException gives JSON {"detail": ...}; Caddy's own
+            # 502 gives an HTML page (→ upstream crashed/unreachable).
+            logger.error(
+                "Broker POST /sessions -> %s: %s",
+                resp.status_code,
+                resp.text[:1000],
+            )
         resp.raise_for_status()
         data = resp.json()
         self._session_id = data["session_id"]
@@ -354,6 +372,8 @@ class HostedTeleopModule(Module):
         self._cmd_channel_id = None
         self._close_state_channel()
         self._state_channel_id = None
+        self._close_state_back_channel()
+        self._state_back_channel_id = None
         if self._pc is not None:
             await self._pc.close()
             self._pc = None
@@ -420,6 +440,15 @@ class HostedTeleopModule(Module):
             if state_sub_id_int is not None:
                 self._open_state_channel(state_sub_id_int)
 
+        state_back_pub_id = data.get("state_back_channel_publisher_id")
+        state_back_pub_id_int = int(state_back_pub_id) if state_back_pub_id is not None else None
+
+        if state_back_pub_id_int != self._state_back_channel_id:
+            self._close_state_back_channel()
+            self._state_back_channel_id = state_back_pub_id_int
+            if state_back_pub_id_int is not None:
+                self._open_state_back_channel(state_back_pub_id_int)
+
     def _open_cmd_channel(self, sctp_id: int) -> None:
         if self._pc is None:
             return
@@ -444,6 +473,8 @@ class HostedTeleopModule(Module):
         @channel.on("close")
         def _on_close() -> None:
             logger.info("cmd_unreliable channel closed")
+
+        logger.info(f"cmd_unreliable readyState immediately after create: {channel.readyState}")
 
         self._cmd_channel = channel
 
@@ -484,6 +515,8 @@ class HostedTeleopModule(Module):
         def _on_close() -> None:
             logger.info("state_reliable channel closed")
 
+        logger.info(f"state_reliable readyState immediately after create: {channel.readyState}")
+
         self._state_channel = channel
 
     def _close_state_channel(self) -> None:
@@ -493,6 +526,48 @@ class HostedTeleopModule(Module):
             except Exception:
                 pass
             self._state_channel = None
+
+    def _open_state_back_channel(self, sctp_id: int) -> None:
+        """Open the negotiated ``state_reliable_back`` publisher channel.
+
+        CF Realtime datachannels are unidirectional in their bridging — the
+        existing ``state_reliable`` carries operator→robot only. This second
+        channel carries the reverse direction (robot→operator) for clock-sync
+        pong replies and any future robot-originated state updates.
+        """
+        if self._pc is None:
+            return
+        logger.info(
+            f"Operator joined — opening negotiated state_reliable_back on SCTP id {sctp_id}"
+        )
+        channel = self._pc.createDataChannel(
+            "state_reliable_back",
+            ordered=True,
+            negotiated=True,
+            id=sctp_id,
+        )
+
+        @channel.on("open")
+        def _on_open() -> None:
+            logger.info("state_reliable_back channel OPEN")
+
+        @channel.on("close")
+        def _on_close() -> None:
+            logger.info("state_reliable_back channel closed")
+
+        logger.info(
+            f"state_reliable_back readyState immediately after create: {channel.readyState}"
+        )
+
+        self._state_back_channel = channel
+
+    def _close_state_back_channel(self) -> None:
+        if self._state_back_channel is not None:
+            try:
+                self._state_back_channel.close()
+            except Exception:
+                pass
+            self._state_back_channel = None
 
     def _on_state_message(self, data: Any) -> None:
         """Handle one JSON message from ``state_reliable``.
@@ -520,8 +595,18 @@ class HostedTeleopModule(Module):
             if client_ts is None:
                 return
             pong = json.dumps({"type": "pong", "client_ts": client_ts, "robot_ts": time.time()})
-            if self._state_channel is not None and self._state_channel.readyState == "open":
-                self._state_channel.send(pong)
+            # Prefer the reverse-direction channel (CF only bridges robot →
+            # operator on this one). Fall back to state_reliable for older
+            # brokers that don't provide a back channel — that path won't
+            # actually route through CF, but at least we don't crash.
+            out = self._state_back_channel or self._state_channel
+            if out is not None and out.readyState == "open":
+                out.send(pong)
+                logger.info(
+                    f"state_reliable: ping received (client_ts={client_ts}), pong sent on {out.label}"
+                )
+            else:
+                logger.warning("state_reliable: ping received but no open channel for pong")
         else:
             logger.debug(f"state_reliable: unknown message type {kind!r}")
 

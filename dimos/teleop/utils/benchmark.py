@@ -414,12 +414,22 @@ class TeleopBenchmarkModule(Module):
         graph_lines: list[str],
     ) -> str:
         """Render the markdown report body for the active (non-empty) streams."""
+        # If an external tool (e.g. data/notes/benchmarks/netem/apply.sh)
+        # left a profile name at this path, record it in the report header
+        # so the conditions of the run are part of the artifact itself.
+        netem_profile: str | None = None
+        try:
+            netem_profile = Path("/tmp/dimos_netem_profile").read_text().strip() or None
+        except OSError:
+            pass
+
         lines = [
             "# Hosted Teleop Benchmark Report",
             "",
             f"- **Timestamp:** {timestamp}",
             f"- **Duration:** {duration_s:.1f} s",
             f"- **Active streams:** {len(active)}",
+            *([f"- **netem profile:** {netem_profile}"] if netem_profile else []),
             "",
             "> E2E latency is **uncalibrated** — browser/robot clocks are not "
             "synced (Phase 1.5 adds a clock-sync handshake). Treat it as "
