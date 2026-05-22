@@ -22,7 +22,7 @@ from dimos.spec.utils import Spec
 
 
 class BabylonSceneViewerConfig(ModuleConfig):
-    """Configuration for the in-process Babylon viewer / kinematic sim."""
+    """Configuration for the in-process Babylon viewer / browser-physics sim."""
 
     mjcf_path: str = ""
     port: int = 8091

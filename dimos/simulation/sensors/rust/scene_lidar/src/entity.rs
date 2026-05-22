@@ -291,3 +291,36 @@ fn ray_cylinder_z(
 
     best
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_payload(json: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(json.len() as u32).to_be_bytes());
+        out.extend_from_slice(json.as_bytes());
+        out
+    }
+
+    #[test]
+    fn decodes_python_entity_batch_wire_format() {
+        let bytes = encode_payload(
+            r#"{"ts":1.0,"entities":[{"id":"box_1","kind":"dynamic","shape":"box","extents":[0.8,0.8,1.2],"mass":8.0,"pose":{"x":2.0,"y":0.0,"z":0.6,"qw":1.0,"qx":0.0,"qy":0.0,"qz":0.0}}]}"#,
+        );
+
+        let batch = EntityStateBatch::decode(&bytes).unwrap();
+        assert_eq!(batch.entries.len(), 1);
+
+        let hit = raycast(&batch.entries[0], Vec3::new(0.0, 0.0, 0.6), Vec3::X, 10.0);
+        let (_, dist) = hit.expect("ray should hit the decoded box");
+        assert!((dist - 1.6).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn empty_batch_clears_entity_table() {
+        let bytes = encode_payload(r#"{"ts":1.0,"entities":[]}"#);
+        let batch = EntityStateBatch::decode(&bytes).unwrap();
+        assert!(batch.entries.is_empty());
+    }
+}

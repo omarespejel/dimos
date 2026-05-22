@@ -55,7 +55,6 @@ from dimos.experimental.pimsim.geometry import (
     media_type,
     path_contains,
 )
-from dimos.experimental.pimsim.kinematic import KinematicBaseSim
 from dimos.experimental.pimsim.robot_meshes import (
     RobotMeshes,
     apply_state,
@@ -128,10 +127,12 @@ class BabylonSceneViewerModule(Module):
     clicked_point: Out[PointStamped]
     point_goal: Out[PointStamped]
     cmd_vel: Out[Twist]
-    # Authoritative robot pose when ``enable_sim=True``. Integrated from
-    # the WS Drive cmd_vel inside the module — lets the browser viewer
-    # stand in for MuJoCo entirely for nav-stack testing (lidar reads
-    # this as its sensor pose).
+    # Optional command input used by browser-physics mode. This gives the
+    # planner/teleop stack a normal cmd_vel topic while the browser owns
+    # collision and pose integration.
+    nav_cmd_vel: In[Twist]
+    # Authoritative robot pose when ``enable_sim=True``. Published from
+    # the browser-side character controller after collision resolution.
     sim_odom: Out[PoseStamped]
     # Entity world (browser is authoritative; these republish for dimos consumers).
     entity_descriptors: Out[EntityDescriptor]
@@ -162,12 +163,13 @@ class BabylonSceneViewerModule(Module):
         camera_jpeg_quality: int = _DEFAULT_CAMERA_JPEG_QUALITY,
         camera_name: str = "camera",
         workspace_name: str = "workspace",
-        # Browser-physics-only kinematic base. Set enable_sim=True to
-        # have the module integrate cmd_vel locally and publish sim_odom
-        # — lets the babylon viewer stand in for MuJoCo for nav testing.
+        # Browser-physics-only base. Set enable_sim=True to have the browser
+        # own collision/pose integration and publish sim_odom back through
+        # this module.
         enable_sim: bool = False,
         sim_rate: float = 100.0,
         vehicle_height: float = 0.75,
+        step_offset: float = 0.22,
         init_x: float = 0.0,
         init_y: float = 0.0,
         init_z: float = 0.0,
@@ -224,28 +226,21 @@ class BabylonSceneViewerModule(Module):
         self._uvicorn_server: uvicorn.Server | None = None
         self._server_thread: threading.Thread | None = None
         self._broadcast_thread: threading.Thread | None = None
-        self._sim_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._server_loop: asyncio.AbstractEventLoop | None = None
         self._clients: set[WebSocket] = set()
 
-        # Browser-physics base. Off by default — only the smoketest
-        # blueprint enables it. When on, integrates incoming cmd_vel at
-        # sim_rate Hz, publishes sim_odom, and primes _latest_base_*
-        # so the robot mesh in the browser tracks the integrated pose.
-        if enable_sim:
-            self._base: KinematicBaseSim | None = KinematicBaseSim(
-                init_x=init_x,
-                init_y=init_y,
-                init_z=init_z,
-                init_yaw=init_yaw,
-                vehicle_height=vehicle_height,
-                sim_rate=sim_rate,
-                lock_z=lock_z,
-            )
-        else:
-            self._base = None
-        self._sim_dt = 1.0 / float(sim_rate)
+        self._browser_physics_enabled = enable_sim
+        self._browser_sim_rate = float(sim_rate)
+        self._browser_vehicle_height = float(vehicle_height)
+        self._browser_step_offset = float(step_offset)
+        self._browser_initial_pose = {
+            "x": float(init_x),
+            "y": float(init_y),
+            "z": float(init_z if not lock_z else init_z + vehicle_height),
+            "yaw": float(init_yaw),
+            "lockZ": bool(lock_z),
+        }
 
         # Entity world. The browser owns physics state; this table is a
         # local mirror used for (a) reconnect replay (so a fresh tab can
@@ -275,6 +270,10 @@ class BabylonSceneViewerModule(Module):
 
         self.register_disposable(Disposable(self.joint_state.subscribe(self._on_joint_state)))
         self.register_disposable(Disposable(self.odom.subscribe(self._on_odom)))
+        try:
+            self.register_disposable(Disposable(self.nav_cmd_vel.subscribe(self._on_nav_cmd_vel)))
+        except Exception:
+            logger.debug("BabylonViewer: nav_cmd_vel not wired; browser drive only")
         self.register_disposable(Disposable(self.path.subscribe(self._on_path)))
         self.register_disposable(
             Disposable(self.pointcloud_overlay.subscribe(self._on_pointcloud_overlay))
@@ -294,14 +293,6 @@ class BabylonSceneViewerModule(Module):
         )
         self._broadcast_thread.start()
 
-        if self._base is not None:
-            self._sim_thread = threading.Thread(
-                target=self._sim_loop,
-                name="babylon-viewer-sim",
-                daemon=True,
-            )
-            self._sim_thread.start()
-
         logger.info("Babylon scene viewer: http://localhost:%s/", self._port)
 
     @rpc
@@ -311,8 +302,6 @@ class BabylonSceneViewerModule(Module):
             self._uvicorn_server.should_exit = True
         if self._broadcast_thread and self._broadcast_thread.is_alive():
             self._broadcast_thread.join(timeout=2.0)
-        if self._sim_thread and self._sim_thread.is_alive():
-            self._sim_thread.join(timeout=2.0)
         if self._server_thread and self._server_thread.is_alive():
             self._server_thread.join(timeout=2.0)
         super().stop()
@@ -388,6 +377,11 @@ class BabylonSceneViewerModule(Module):
                 "sceneScale": self._scene_scale,
                 "scenePosition": list(self._scene_translation),
                 "sceneWxyz": list(scene_wxyz),
+                "browserPhysics": self._browser_physics_enabled,
+                "browserPhysicsHz": self._browser_sim_rate,
+                "browserPhysicsInitialPose": self._browser_initial_pose,
+                "vehicleHeight": self._browser_vehicle_height,
+                "stepOffset": self._browser_step_offset,
             },
             headers=_NO_CACHE_HEADERS,
         )
@@ -500,7 +494,13 @@ class BabylonSceneViewerModule(Module):
             )
             if self._mujoco_sim is not None:
                 self._respawn_with_policy_reset(self._mujoco_sim.respawn)
-            self.cmd_vel.publish(Twist.zero())
+            zero = Twist.zero()
+            self.cmd_vel.publish(zero)
+            if self._browser_physics_enabled:
+                self._broadcast_cmd_vel(zero)
+                self._broadcast_json_from_thread(
+                    {"type": "sim_respawn", "pose": self._browser_initial_pose}
+                )
             return
         if message_type == "respawn_at":
             point = message.get("point")
@@ -509,6 +509,7 @@ class BabylonSceneViewerModule(Module):
             try:
                 x = float(point[0])
                 y = float(point[1])
+                z = float(point[2]) if len(point) > 2 else 0.0
             except (TypeError, ValueError):
                 return
             logger.info(
@@ -519,14 +520,23 @@ class BabylonSceneViewerModule(Module):
             )
             if self._mujoco_sim is not None:
                 self._respawn_with_policy_reset(lambda: self._mujoco_sim.respawn_at(x, y))
-            self.cmd_vel.publish(Twist.zero())
+            zero = Twist.zero()
+            self.cmd_vel.publish(zero)
+            if self._browser_physics_enabled:
+                self._broadcast_cmd_vel(zero)
+                pose = dict(self._browser_initial_pose)
+                pose.update({"x": x, "y": y, "z": z + self._browser_vehicle_height})
+                self._broadcast_json_from_thread({"type": "sim_respawn", "pose": pose})
             return
         if message_type == "cmd_vel":
             twist = self._parse_twist(message)
             if twist is not None:
                 self.cmd_vel.publish(twist)
-                if self._base is not None:
-                    self._base.set_command(twist)
+                if self._browser_physics_enabled:
+                    self._broadcast_cmd_vel(twist)
+            return
+        if message_type == "sim_odom":
+            self._handle_browser_sim_odom(message)
             return
         if message_type == "arm_joint":
             name = message.get("name")
@@ -608,6 +618,50 @@ class BabylonSceneViewerModule(Module):
         except (TypeError, ValueError):
             return None
 
+    def _on_nav_cmd_vel(self, twist: Twist) -> None:
+        if self._browser_physics_enabled:
+            self._broadcast_cmd_vel(twist)
+
+    def _broadcast_cmd_vel(self, twist: Twist) -> None:
+        self._broadcast_json_from_thread(
+            {
+                "type": "cmd_vel",
+                "linear": [twist.linear.x, twist.linear.y, twist.linear.z],
+                "angular": [twist.angular.x, twist.angular.y, twist.angular.z],
+            }
+        )
+
+    def _handle_browser_sim_odom(self, message: dict[str, Any]) -> None:
+        pose = message.get("pose")
+        if not isinstance(pose, dict):
+            return
+        try:
+            x = float(pose.get("x", 0.0))
+            y = float(pose.get("y", 0.0))
+            z = float(pose.get("z", 0.0))
+            qx = float(pose.get("qx", 0.0))
+            qy = float(pose.get("qy", 0.0))
+            qz = float(pose.get("qz", 0.0))
+            qw = float(pose.get("qw", 1.0))
+        except (TypeError, ValueError):
+            return
+
+        with self._state_lock:
+            self._latest_base_pos = np.array([x, y, z], dtype=np.float64)
+            self._latest_base_wxyz = np.array([qw, qx, qy, qz], dtype=np.float64)
+
+        try:
+            self.sim_odom.publish(
+                PoseStamped(
+                    ts=time.time(),
+                    frame_id="map",
+                    position=[x, y, z],
+                    orientation=[qx, qy, qz, qw],
+                )
+            )
+        except Exception:
+            logger.exception("BabylonViewer: browser sim_odom publish failed")
+
     def _broadcast_loop(self) -> None:
         while not self._stop_event.is_set():
             loop = self._server_loop
@@ -620,45 +674,6 @@ class BabylonSceneViewerModule(Module):
                         loop,
                     )
             time.sleep(self._broadcast_dt)
-
-    def _sim_loop(self) -> None:
-        """Integrate the kinematic base + publish sim_odom.
-
-        Updates ``_latest_base_pos`` / ``_latest_base_wxyz`` so the browser
-        robot mesh tracks the integrated pose (same path the external odom
-        IN uses). Runs at the configured sim_rate Hz; the broadcast loop
-        + the lidar consumer subsample as needed.
-        """
-        if self._base is None:
-            return
-        dt = self._sim_dt
-        next_tick = time.perf_counter()
-        while not self._stop_event.is_set():
-            snap = self._base.step(dt)
-            with self._state_lock:
-                self._latest_base_pos = np.array([snap.x, snap.y, snap.z], dtype=np.float64)
-                quat = snap.quaternion
-                self._latest_base_wxyz = np.array(
-                    [quat.w, quat.x, quat.y, quat.z], dtype=np.float64
-                )
-            try:
-                self.sim_odom.publish(
-                    PoseStamped(
-                        ts=time.time(),
-                        frame_id="map",
-                        position=[snap.x, snap.y, snap.z],
-                        orientation=[quat.x, quat.y, quat.z, quat.w],
-                    )
-                )
-            except Exception:
-                logger.exception("BabylonViewer: sim_odom publish failed")
-            next_tick += dt
-            sleep_for = next_tick - time.perf_counter()
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-            else:
-                # Behind schedule (slow consumer) — skip catchup to avoid runaway.
-                next_tick = time.perf_counter()
 
     async def _broadcast_state(
         self,
@@ -941,10 +956,12 @@ class BabylonSceneViewerModule(Module):
         """Add an entity to the browser sim. Idempotent on entity_id."""
         with self._entity_lock:
             self._entities[descriptor.entity_id] = descriptor
+            self._entity_poses[descriptor.entity_id] = pose
         self.entity_descriptors.publish(descriptor)
         self._broadcast_json_from_thread(
             {"type": "entity_spawn", "descriptor": descriptor.to_wire(), "pose": pose_to_wire(pose)}
         )
+        self._publish_entity_snapshot()
         return True
 
     @rpc
@@ -955,6 +972,7 @@ class BabylonSceneViewerModule(Module):
         if not existed:
             return False
         self._broadcast_json_from_thread({"type": "entity_despawn", "entity_id": entity_id})
+        self._publish_entity_snapshot()
         return True
 
     @rpc
@@ -963,9 +981,11 @@ class BabylonSceneViewerModule(Module):
         with self._entity_lock:
             if entity_id not in self._entities:
                 return False
+            self._entity_poses[entity_id] = pose
         self._broadcast_json_from_thread(
             {"type": "entity_set_pose", "entity_id": entity_id, "pose": pose_to_wire(pose)}
         )
+        self._publish_entity_snapshot()
         return True
 
     @rpc
@@ -989,7 +1009,7 @@ class BabylonSceneViewerModule(Module):
             return sorted(self._entities.keys())
 
     def _handle_entity_test_add(self, point: list[float]) -> None:
-        """HUD-driven smoke spawn: drops a 40cm dynamic cube at ``point``.
+        """HUD-driven smoke spawn: drops a visible dynamic obstacle at ``point``.
 
         Stays in the WS handler path (not a public RPC) since it only
         exists to drive the Add button — production callers should
@@ -1005,8 +1025,8 @@ class BabylonSceneViewerModule(Module):
             entity_id=f"box_{self._test_entity_counter}",
             kind="dynamic",
             shape_hint="box",
-            extents=(0.4, 0.4, 0.4),
-            mass=2.0,
+            extents=(0.8, 0.8, 1.2),
+            mass=8.0,
         )
         pose = Pose(x, y, z)
         self.spawn_entity(descriptor, pose)
@@ -1014,8 +1034,11 @@ class BabylonSceneViewerModule(Module):
     def _handle_entity_clear(self) -> None:
         with self._entity_lock:
             ids = list(self._entities.keys())
+            self._entities.clear()
+            self._entity_poses.clear()
         for entity_id in ids:
-            self.despawn_entity(entity_id)
+            self._broadcast_json_from_thread({"type": "entity_despawn", "entity_id": entity_id})
+        self._publish_entity_snapshot()
 
     def _publish_entity_states(self, states_wire: list[dict[str, Any]]) -> None:
         """Browser → python entity state batch. Publish the aggregated
@@ -1037,23 +1060,26 @@ class BabylonSceneViewerModule(Module):
                 self._entity_poses[state.entity_id] = state.pose
             batch_entries.append((desc, state.pose))
             ts = max(ts, state.ts)
-        if batch_entries:
-            self.entity_state_batch.publish(EntityStateBatch(entries=batch_entries, ts=ts))
+        self.entity_state_batch.publish(EntityStateBatch(entries=batch_entries, ts=ts))
+
+    def _publish_entity_snapshot(self) -> None:
+        with self._entity_lock:
+            entries = [
+                (desc, self._entity_poses.get(entity_id, Pose()))
+                for entity_id, desc in self._entities.items()
+            ]
+        self.entity_state_batch.publish(EntityStateBatch(entries=entries, ts=time.time()))
 
     def _entity_spawn_messages(self) -> list[dict[str, Any]]:
-        """Replay payload: a fresh tab gets spawn commands for every entity.
-
-        Initial pose is the identity (browser physics will integrate from
-        there once the upstream caller next pushes set_entity_pose). For
-        kinematic-only entities this is fine; dynamic entities accept
-        whatever the next state tick reflects.
-        """
+        """Replay payload: a fresh tab gets spawn commands for every entity."""
         with self._entity_lock:
-            entities = list(self._entities.values())
-        identity = Pose()
+            entities = [
+                (descriptor, self._entity_poses.get(entity_id, Pose()))
+                for entity_id, descriptor in self._entities.items()
+            ]
         return [
-            {"type": "entity_spawn", "descriptor": d.to_wire(), "pose": pose_to_wire(identity)}
-            for d in entities
+            {"type": "entity_spawn", "descriptor": d.to_wire(), "pose": pose_to_wire(pose)}
+            for d, pose in entities
         ]
 
     def _broadcast_json_from_thread(self, payload: dict[str, Any]) -> None:

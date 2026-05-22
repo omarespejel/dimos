@@ -129,6 +129,21 @@ const driveSendPeriod = 0.08;
 const driveLinearSpeed = 0.35;
 const driveStrafeSpeed = 0.25;
 const driveAngularSpeed = 0.8;
+let browserPhysicsEnabled = false;
+let browserPhysicsPose = { x: 0, y: 0, z: 0.75, yaw: 0 };
+let browserPhysicsCommand = {
+  linear: [0, 0, 0],
+  angular: [0, 0, 0],
+};
+let browserPhysicsLastStepMs = null;
+let browserPhysicsLastOdomMs = 0;
+let browserVehicleHeight = 0.75;
+let browserStepOffset = 0.22;
+const browserMaxStepDown = 0.5;
+const browserGroundProbeExtra = 1.0;
+const browserPhysicsOdomPeriodMs = 1000 / 50;
+const browserCharacterRadius = ROBOT_COLLIDER_RADIUS;
+const browserCollisionProbeHeights = [0.25, 0.75, 1.2];
 const pointcloudHeaderBytes = 8;
 const robotPoseHeaderBytes = 16;
 const stateQueueMaxLength = 8;
@@ -391,6 +406,7 @@ function sendDriveCommand(force = false) {
   if (!force && isZero && signature === lastDriveSignature) return;
 
   if (sendSocketPayload({ type: "cmd_vel", ...twist })) {
+    if (browserPhysicsEnabled) setBrowserPhysicsCommand(twist);
     lastDriveSendTime = now;
     lastDriveSignature = signature;
   }
@@ -401,6 +417,189 @@ function setDriveEnabled(enabled) {
   setButtonActive("toggleDrive", enabled);
   setStatus(enabled ? "drive: WASD turn/move, QE strafe" : "live");
   if (!enabled) sendDriveCommand(true);
+}
+
+function setBrowserPhysicsCommand(twist) {
+  if (!twist) return;
+  const linear = Array.isArray(twist.linear) ? twist.linear : [0, 0, 0];
+  const angular = Array.isArray(twist.angular) ? twist.angular : [0, 0, 0];
+  browserPhysicsCommand = {
+    linear: [Number(linear[0]) || 0, Number(linear[1]) || 0, Number(linear[2]) || 0],
+    angular: [Number(angular[0]) || 0, Number(angular[1]) || 0, Number(angular[2]) || 0],
+  };
+}
+
+function setBrowserPhysicsPose(pose, publish = true) {
+  if (!pose) return;
+  browserPhysicsPose = {
+    x: Number(pose.x) || 0,
+    y: Number(pose.y) || 0,
+    z: Number(pose.z) || 0,
+    yaw: Number(pose.yaw) || 0,
+  };
+  browserPhysicsLastStepMs = performance.now();
+  if (publish) publishBrowserSimOdom(true);
+}
+
+function yawQuaternion(yaw) {
+  return BABYLON.Quaternion.FromEulerAngles(0, 0, yaw);
+}
+
+function capsuleQuaternion(yaw) {
+  return yawQuaternion(yaw).multiply(BABYLON.Quaternion.FromEulerAngles(Math.PI / 2, 0, 0));
+}
+
+function publishBrowserSimOdom(force = false) {
+  if (!browserPhysicsEnabled) return;
+  const now = performance.now();
+  if (!force && now - browserPhysicsLastOdomMs < browserPhysicsOdomPeriodMs) return;
+  browserPhysicsLastOdomMs = now;
+  const q = yawQuaternion(browserPhysicsPose.yaw);
+  sendSocketPayload({
+    type: "sim_odom",
+    pose: {
+      x: browserPhysicsPose.x,
+      y: browserPhysicsPose.y,
+      z: browserPhysicsPose.z,
+      qx: q.x,
+      qy: q.y,
+      qz: q.z,
+      qw: q.w,
+    },
+  });
+}
+
+function horizontalCollisionDistance(origin, direction, maxDistance) {
+  if (collisionMeshes.length === 0 || maxDistance <= 1e-6) return maxDistance;
+  let allowed = maxDistance;
+  const groundZ = origin.z - browserVehicleHeight;
+  for (const height of browserCollisionProbeHeights) {
+    const rayOrigin = new BABYLON.Vector3(origin.x, origin.y, groundZ + height);
+    const ray = new BABYLON.Ray(rayOrigin, direction, maxDistance + browserCharacterRadius);
+    const pick = scene.pickWithRay(
+      ray,
+      (mesh) => collisionMeshes.includes(mesh),
+    );
+    if (pick && pick.hit && Number.isFinite(pick.distance)) {
+      allowed = Math.min(allowed, Math.max(0, pick.distance - browserCharacterRadius));
+    }
+  }
+  return allowed;
+}
+
+function groundHeightAt(x, y, referenceBaseZ) {
+  if (collisionMeshes.length === 0) return null;
+  const origin = new BABYLON.Vector3(
+    x,
+    y,
+    referenceBaseZ + browserStepOffset + browserGroundProbeExtra,
+  );
+  const length =
+    browserVehicleHeight + browserStepOffset + browserMaxStepDown + browserGroundProbeExtra;
+  const ray = new BABYLON.Ray(origin, new BABYLON.Vector3(0, 0, -1), length);
+  const pick = scene.pickWithRay(ray, (mesh) => collisionMeshes.includes(mesh));
+  if (pick && pick.hit && pick.pickedPoint) return pick.pickedPoint.z;
+  return null;
+}
+
+function snapCandidateToGround(candidate, currentBaseZ) {
+  const currentGroundZ = currentBaseZ - browserVehicleHeight;
+  const groundZ = groundHeightAt(candidate.x, candidate.y, currentBaseZ);
+  if (groundZ === null) return candidate;
+  const stepDelta = groundZ - currentGroundZ;
+  if (stepDelta > browserStepOffset || stepDelta < -browserMaxStepDown) return null;
+  return new BABYLON.Vector3(candidate.x, candidate.y, groundZ + browserVehicleHeight);
+}
+
+function resolvePlanarMove(position, delta) {
+  const distance = Math.hypot(delta.x, delta.y);
+  if (distance <= 1e-8 || collisionMeshes.length === 0) {
+    return new BABYLON.Vector3(position.x + delta.x, position.y + delta.y, position.z);
+  }
+  const direction = new BABYLON.Vector3(delta.x / distance, delta.y / distance, 0);
+  const allowed = horizontalCollisionDistance(position, direction, distance);
+  if (allowed >= distance - 1e-5) {
+    const snapped = snapCandidateToGround(
+      new BABYLON.Vector3(position.x + delta.x, position.y + delta.y, position.z),
+      position.z,
+    );
+    return snapped || position.clone();
+  }
+
+  // Cheap slide: try each axis independently when the diagonal path is blocked.
+  const candidates = [
+    new BABYLON.Vector3(delta.x, 0, 0),
+    new BABYLON.Vector3(0, delta.y, 0),
+  ];
+  let best = BABYLON.Vector3.Zero();
+  for (const candidate of candidates) {
+    const d = Math.hypot(candidate.x, candidate.y);
+    if (d <= 1e-8) continue;
+    const dir = new BABYLON.Vector3(candidate.x / d, candidate.y / d, 0);
+    const a = horizontalCollisionDistance(position, dir, d);
+    const moved = dir.scale(a);
+    const snapped = snapCandidateToGround(
+      new BABYLON.Vector3(position.x + moved.x, position.y + moved.y, position.z),
+      position.z,
+    );
+    if (snapped && a > best.length()) {
+      best = new BABYLON.Vector3(snapped.x - position.x, snapped.y - position.y, snapped.z - position.z);
+    }
+  }
+  return new BABYLON.Vector3(position.x + best.x, position.y + best.y, position.z + best.z);
+}
+
+function snapBrowserPhysicsToGround(publish = false) {
+  if (!browserPhysicsEnabled || collisionMeshes.length === 0) return;
+  const groundZ = groundHeightAt(
+    browserPhysicsPose.x,
+    browserPhysicsPose.y,
+    browserPhysicsPose.z,
+  );
+  if (groundZ === null) return;
+  browserPhysicsPose = {
+    ...browserPhysicsPose,
+    z: groundZ + browserVehicleHeight,
+  };
+  if (publish) publishBrowserSimOdom(true);
+}
+
+function stepBrowserPhysics() {
+  if (!browserPhysicsEnabled) return;
+  const now = performance.now();
+  const previous = browserPhysicsLastStepMs ?? now;
+  browserPhysicsLastStepMs = now;
+  const dt = Math.min(Math.max((now - previous) / 1000, 0), 0.05);
+  if (dt <= 0) return;
+
+  const linear = browserPhysicsCommand.linear;
+  const angular = browserPhysicsCommand.angular;
+  const yaw = browserPhysicsPose.yaw + (angular[2] || 0) * dt;
+  const c = Math.cos(yaw);
+  const s = Math.sin(yaw);
+  const vx = c * (linear[0] || 0) - s * (linear[1] || 0);
+  const vy = s * (linear[0] || 0) + c * (linear[1] || 0);
+  const current = new BABYLON.Vector3(
+    browserPhysicsPose.x,
+    browserPhysicsPose.y,
+    browserPhysicsPose.z,
+  );
+  const next = resolvePlanarMove(current, new BABYLON.Vector3(vx * dt, vy * dt, 0));
+  browserPhysicsPose = { x: next.x, y: next.y, z: next.z, yaw };
+  if (robotColliderMesh) {
+    robotColliderMesh.position.set(next.x, next.y, next.z);
+    robotColliderMesh.rotationQuaternion = capsuleQuaternion(yaw);
+  }
+  publishBrowserSimOdom(false);
+}
+
+function configureBrowserPhysics(config) {
+  browserPhysicsEnabled = Boolean(config.browserPhysics);
+  if (!browserPhysicsEnabled) return;
+  browserVehicleHeight = Number(config.vehicleHeight) || browserVehicleHeight;
+  browserStepOffset = Number(config.stepOffset) || browserStepOffset;
+  setBrowserPhysicsPose(config.browserPhysicsInitialPose || {}, false);
+  setStatus("browser physics ready");
 }
 
 function setSceneDepthWrite(enabled) {
@@ -587,6 +786,7 @@ async function loadCollisionAsset(config) {
     }
   }
 
+  snapBrowserPhysicsToGround(true);
   setStatus("live");
 }
 
@@ -598,13 +798,7 @@ function pickScenePoint() {
     camera,
   );
   const meshes = collisionMeshes.length > 0 ? collisionMeshes : sceneMeshes;
-  if (collisionMeshes.length > 0 && !collisionVisible) {
-    for (const mesh of collisionMeshes) mesh.setEnabled(true);
-  }
   const pick = scene.pickWithRay(ray, (mesh) => meshes.includes(mesh));
-  if (collisionMeshes.length > 0 && !collisionVisible) {
-    for (const mesh of collisionMeshes) mesh.setEnabled(false);
-  }
   if (pick && pick.hit && pick.pickedPoint) return pick.pickedPoint;
   if (Math.abs(ray.direction.z) < 1e-6) return null;
   const distance = -ray.origin.z / ray.direction.z;
@@ -655,6 +849,47 @@ async function setupRobotCollider() {
   // kinematic capsule so Havok-driven entities collide with the robot
   // as it's driven through the world by odom.
   if (!(await physicsReady)) return;
+  if (browserPhysicsEnabled) {
+    robotColliderMesh = BABYLON.MeshBuilder.CreateCapsule(
+      "robotCollider",
+      {
+        height: ROBOT_COLLIDER_HEIGHT,
+        radius: ROBOT_COLLIDER_RADIUS,
+        tessellation: 12,
+        subdivisions: 1,
+      },
+      scene,
+    );
+    robotColliderMesh.position = new BABYLON.Vector3(
+      browserPhysicsPose.x,
+      browserPhysicsPose.y,
+      browserPhysicsPose.z,
+    );
+    robotColliderMesh.rotationQuaternion = capsuleQuaternion(browserPhysicsPose.yaw);
+    robotColliderMesh.isVisible = false;
+    robotColliderMesh.isPickable = false;
+    try {
+      robotColliderAggregate = new BABYLON.PhysicsAggregate(
+        robotColliderMesh,
+        BABYLON.PhysicsShapeType.CAPSULE,
+        { mass: 0 },
+        scene,
+      );
+      if (
+        robotColliderAggregate.body
+        && "disablePreStep" in robotColliderAggregate.body
+      ) {
+        robotColliderAggregate.body.disablePreStep = false;
+      }
+      console.log("browser physics robot collider initialized");
+    } catch (error) {
+      console.warn("browser robot collider aggregate failed:", error);
+      robotColliderMesh.dispose();
+      robotColliderMesh = null;
+      robotColliderAggregate = null;
+    }
+    return;
+  }
   let rootName = null;
   for (const name of bodyNameList) {
     if (robotRootBodyNames.has(name)) {
@@ -1119,6 +1354,7 @@ async function handleEntitySpawn(payload) {
     descriptor: desc,
     kinematic: wantsKinematic,
   });
+  broadcastEntityStates(true);
 }
 
 function handleEntityDespawn(payload) {
@@ -1135,6 +1371,7 @@ function handleEntityDespawn(payload) {
     // best-effort
   }
   entities.delete(payload.entity_id);
+  broadcastEntityStates(true);
 }
 
 function handleEntitySetPose(payload) {
@@ -1169,10 +1406,10 @@ function handleEntityApplyVelocity(payload) {
   }
 }
 
-function broadcastEntityStates() {
-  if (entities.size === 0) return;
+function broadcastEntityStates(force = false) {
+  if (entities.size === 0 && !force) return;
   const now = performance.now();
-  if (now - lastEntityBroadcast < entityBroadcastIntervalMs) return;
+  if (!force && now - lastEntityBroadcast < entityBroadcastIntervalMs) return;
   lastEntityBroadcast = now;
   const ts = Date.now() / 1000.0;
   const states = [];
@@ -1203,6 +1440,7 @@ function connectStreamWorker() {
       case "status":
         streamRef.ready = Boolean(message.ready);
         setStatus(message.status);
+        if (streamRef.ready && browserPhysicsEnabled) publishBrowserSimOdom(true);
         break;
       case "state":
         if (message.payload.type === "state") {
@@ -1222,6 +1460,12 @@ function connectStreamWorker() {
         }
         if (message.payload.type === "entity_apply_velocity") {
           handleEntityApplyVelocity(message.payload);
+        }
+        if (message.payload.type === "cmd_vel") {
+          setBrowserPhysicsCommand(message.payload);
+        }
+        if (message.payload.type === "sim_respawn") {
+          setBrowserPhysicsPose(message.payload.pose || {}, true);
         }
         break;
       case "robot_pose":
@@ -1599,6 +1843,7 @@ function _updateSlidersFromState(joints) {
   try {
     const config = await loadConfig();
     sceneConfig = config;
+    configureBrowserPhysics(config);
     await loadRobot();
     setupRobotCollider();   // fire-and-forget; awaits physicsReady internally
     connectStreamWorker();
@@ -1652,6 +1897,7 @@ window.addEventListener("blur", () => {
 });
 
 function renderFrame() {
+  stepBrowserPhysics();
   applyQueuedState();
   updateKeyboardCamera();
   sendDriveCommand(false);

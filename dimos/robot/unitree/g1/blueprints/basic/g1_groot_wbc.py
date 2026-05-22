@@ -475,6 +475,7 @@ def _babylon_blueprint(viewer_mjcf_path: str | Path, cmd_vel_topic: str) -> Blue
             enable_sim=True,
             sim_rate=_env_float("DIMOS_BABYLON_SIM_RATE_HZ", 100.0),
             vehicle_height=_env_float("DIMOS_BABYLON_VEHICLE_HEIGHT", 0.75),
+            step_offset=_env_float("DIMOS_BABYLON_STEP_OFFSET", 0.22),
             lock_z=True,
         )
 

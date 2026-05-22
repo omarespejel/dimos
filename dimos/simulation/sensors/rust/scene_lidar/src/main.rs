@@ -284,6 +284,7 @@ struct SceneLidar {
     directions: Vec<Vec3>,
     last_scan: Option<Instant>,
     entities: Vec<Entity>,
+    last_entity_count: usize,
 }
 
 impl SceneLidar {
@@ -362,6 +363,13 @@ impl SceneLidar {
         // browser physics tick (~30 Hz), so we always have a fresh
         // snapshot. Despawned entities drop out by simply not appearing
         // in the next batch.
+        if msg.entries.len() != self.last_entity_count {
+            eprintln!(
+                "scene_lidar: entity table now {} entries",
+                msg.entries.len()
+            );
+            self.last_entity_count = msg.entries.len();
+        }
         self.entities = msg.entries;
     }
 }
