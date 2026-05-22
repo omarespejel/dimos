@@ -42,6 +42,12 @@ from dimos.experimental.pimsim.config import (
     HumanoidControlSpec,
     MujocoRespawnSpec,
 )
+from dimos.experimental.pimsim.entity import (
+    EntityDescriptor,
+    EntityState,
+    pose_to_wire,
+    twist_to_wire,
+)
 from dimos.experimental.pimsim.geometry import (
     compose_scene_mesh_wxyz,
     dimos_joint_to_mjcf,
@@ -54,6 +60,7 @@ from dimos.experimental.pimsim.robot_meshes import (
     load_robot_meshes,
 )
 from dimos.msgs.geometry_msgs.PointStamped import PointStamped
+from dimos.msgs.geometry_msgs.Pose import Pose
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
@@ -119,6 +126,9 @@ class BabylonSceneViewerModule(Module):
     clicked_point: Out[PointStamped]
     point_goal: Out[PointStamped]
     cmd_vel: Out[Twist]
+    # Entity world (browser is authoritative; these republish for dimos consumers).
+    entity_descriptors: Out[EntityDescriptor]
+    entity_states: Out[EntityState]
     _mujoco_sim: MujocoRespawnSpec | None = None
     _robot_ctrl: HumanoidControlSpec | None = None
     _coordinator_ctrl: CoordinatorControlSpec | None = None
@@ -197,6 +207,12 @@ class BabylonSceneViewerModule(Module):
         self._stop_event = threading.Event()
         self._server_loop: asyncio.AbstractEventLoop | None = None
         self._clients: set[WebSocket] = set()
+
+        # Entity world. The browser owns physics state; this table is a
+        # local mirror used for (a) reconnect replay (so a fresh tab can
+        # rebuild the world) and (b) `list_entities` queries.
+        self._entity_lock = threading.Lock()
+        self._entities: dict[str, EntityDescriptor] = {}
 
     @rpc
     def start(self) -> None:
@@ -407,6 +423,10 @@ class BabylonSceneViewerModule(Module):
                 pointcloud_payload = self._latest_pointcloud_payload
             if pointcloud_payload is not None:
                 await websocket.send_bytes(pointcloud_payload)
+            # Replay entity descriptors so a fresh tab rebuilds the world
+            # the browser-side physics is otherwise oblivious to.
+            for spawn in self._entity_spawn_messages():
+                await websocket.send_json(spawn)
             while True:
                 message = await websocket.receive_json()
                 self._handle_client_message(message)
@@ -481,6 +501,9 @@ class BabylonSceneViewerModule(Module):
                 return
             logger.info("BabylonViewer: set_dry_run=%s", enabled)
             self._coordinator_ctrl.set_dry_run(enabled=enabled)
+            return
+        if message_type == "entity_states":
+            self._publish_entity_states(message.get("states") or [])
             return
         if message_type not in {"clicked_point", "point_goal"}:
             return
@@ -804,3 +827,108 @@ class BabylonSceneViewerModule(Module):
         positions = np.ascontiguousarray(points.astype(np.float32, copy=False))
         colors = np.ascontiguousarray(colors)
         return bytes(header) + positions.reshape(-1).tobytes() + colors.reshape(-1).tobytes()
+
+    # ─── Entity world ────────────────────────────────────────────────────
+    #
+    # Browser (Havok) owns physics state. Python adds/removes/teleports via
+    # RPC → JSON over WS; browser publishes per-tick `entity_states` JSON
+    # back. We mirror the descriptor table for reconnect replay only.
+
+    @rpc
+    def spawn_entity(self, descriptor: EntityDescriptor, pose: Pose) -> bool:
+        """Add an entity to the browser sim. Idempotent on entity_id."""
+        with self._entity_lock:
+            self._entities[descriptor.entity_id] = descriptor
+        self.entity_descriptors.publish(descriptor)
+        self._broadcast_json_from_thread(
+            {"type": "entity_spawn", "descriptor": descriptor.to_wire(), "pose": pose_to_wire(pose)}
+        )
+        return True
+
+    @rpc
+    def despawn_entity(self, entity_id: str) -> bool:
+        with self._entity_lock:
+            existed = self._entities.pop(entity_id, None) is not None
+        if not existed:
+            return False
+        self._broadcast_json_from_thread({"type": "entity_despawn", "entity_id": entity_id})
+        return True
+
+    @rpc
+    def set_entity_pose(self, entity_id: str, pose: Pose) -> bool:
+        """Teleport the entity. Browser applies as a kinematic pose write."""
+        with self._entity_lock:
+            if entity_id not in self._entities:
+                return False
+        self._broadcast_json_from_thread(
+            {"type": "entity_set_pose", "entity_id": entity_id, "pose": pose_to_wire(pose)}
+        )
+        return True
+
+    @rpc
+    def apply_entity_velocity(self, entity_id: str, twist: Twist) -> bool:
+        """Set linear+angular velocity on a dynamic entity."""
+        with self._entity_lock:
+            if entity_id not in self._entities:
+                return False
+        self._broadcast_json_from_thread(
+            {
+                "type": "entity_apply_velocity",
+                "entity_id": entity_id,
+                "twist": twist_to_wire(twist),
+            }
+        )
+        return True
+
+    @rpc
+    def list_entities(self) -> list[str]:
+        with self._entity_lock:
+            return sorted(self._entities.keys())
+
+    def _publish_entity_states(self, states_wire: list[dict[str, Any]]) -> None:
+        """Browser → python entity state batch. Republish on the Out port."""
+        for raw in states_wire:
+            try:
+                state = EntityState.from_wire(raw)
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("BabylonViewer: dropping malformed entity_state: %s", exc)
+                continue
+            with self._entity_lock:
+                if state.entity_id not in self._entities:
+                    # Browser sent state for an entity we don't know — most
+                    # likely a despawn race. Drop silently.
+                    continue
+            self.entity_states.publish(state)
+
+    def _entity_spawn_messages(self) -> list[dict[str, Any]]:
+        """Replay payload: a fresh tab gets spawn commands for every entity.
+
+        Initial pose is the identity (browser physics will integrate from
+        there once the upstream caller next pushes set_entity_pose). For
+        kinematic-only entities this is fine; dynamic entities accept
+        whatever the next state tick reflects.
+        """
+        with self._entity_lock:
+            entities = list(self._entities.values())
+        identity = Pose()
+        return [
+            {"type": "entity_spawn", "descriptor": d.to_wire(), "pose": pose_to_wire(identity)}
+            for d in entities
+        ]
+
+    def _broadcast_json_from_thread(self, payload: dict[str, Any]) -> None:
+        """JSON analog of `_broadcast_bytes_from_thread`."""
+        loop = self._server_loop
+        if loop is None or not self._clients:
+            return
+        asyncio.run_coroutine_threadsafe(self._broadcast_json(payload), loop)
+
+    async def _broadcast_json(self, payload: dict[str, Any]) -> None:
+        dead: list[WebSocket] = []
+        for websocket in tuple(self._clients):
+            try:
+                await websocket.send_json(payload)
+            except Exception:
+                dead.append(websocket)
+        for websocket in dead:
+            self._clients.discard(websocket)
