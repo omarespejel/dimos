@@ -84,7 +84,7 @@ class FastLio2Config(NativeModuleConfig):
     # Converted to init_pose CLI arg [x, y, z, qx, qy, qz, qw] in model_post_init.
     mount: Pose = Pose()
 
-    frame_id: str = "start_point"
+    frame_id: str = "odom"
     child_frame_id: str = "current_point"
     sensor_frame: str = "mid360_link"
 

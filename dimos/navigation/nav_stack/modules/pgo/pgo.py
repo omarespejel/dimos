@@ -43,7 +43,7 @@ class PGOConfig(NativeModuleConfig):
     ready_timeout_sec: float = 10.0
 
     frame_id: str = "map"
-    child_frame_id: str = "start_point"
+    child_frame_id: str = "odom"
     parent_frame: str = "world"
     body_frame: str = "current_point"
     tf_channel: str = "/tf#tf2_msgs.TFMessage"

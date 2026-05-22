@@ -50,7 +50,7 @@ def create_nav_stack(
     record: bool = False,
     world_frame: str = "world",
     map_frame: str = "map",
-    start_point_frame: str = "start_point",
+    odom_frame: str = "odom",
     current_point_frame: str = "current_point",
     terrain_analysis: dict[str, Any] | None = None,
     terrain_map_ext: dict[str, Any] | None = None,
@@ -87,7 +87,7 @@ def create_nav_stack(
         **{
             "parent_frame": world_frame,
             "frame_id": map_frame,
-            "child_frame_id": start_point_frame,
+            "child_frame_id": odom_frame,
             "body_frame": current_point_frame,
             **(pgo or {}),
         }
