@@ -158,3 +158,29 @@
     `to_rerun` could be extended to return multiple entities so callers don't have to do it
     inline. No external action required; deferred to a follow-up PR at Jeff's discretion.
   commit: null
+- pr: 2099
+  comment_id: 4463622504
+  author: codecov[bot]
+  file: null
+  line: null
+  problem: Patch coverage 56.9%; 334 lines missing coverage in new files (test_pgo_synthetic_drift, rosbag_fixtures, test_pgo_loop_closure, test_pgo_rosbag, Graph3D, GraphDelta3D). All tests successful.
+  solution: 'bot summary — informational. New code is largely test scaffolding and message types; missing-line counts in test files (152, 54, 48, 37) reflect the runtime-conditional branches that only execute when a bag fixture is present (CI does not bundle the rosbags). No action required by autofix monitor.'
+  commit: null
+- pr: 2099
+  comment_id: 4465232348
+  author: greptile-apps[bot]
+  file: null
+  line: null
+  problem: |
+    Greptile auto-summary on commit 273fd2252 (autofix.ci). Confidence 3/5.
+    Re-raises two prior-round concerns:
+    (1) searchByScanContext branch ordering: SC-returned-then-ICP-rejected candidate suppresses
+        searchByPosition fallback (simple_pgo.cpp).
+    (2) SyntheticDriftPlaybackModule._playback_error not exposed via @rpc, so test_position_search_misses_drifted_loop can pass silently when PGO never ran (test_pgo_synthetic_drift.py).
+  solution: |
+    bot summary — issues already tracked. (1) is recorded under comment_id 3253752397 with
+    solution "skipped: substantive C++ control-flow change in loop-closure path, exceeds easy budget".
+    (2) is recorded under comment_id 3254529445 with the same skip rationale. No new action
+    required; this comment is the bot's regenerated summary triggered by the autofix.ci commit
+    (273fd2252) which only re-wrapped one argparse argument and added no new behavior.
+  commit: null
