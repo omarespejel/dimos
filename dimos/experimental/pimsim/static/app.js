@@ -88,6 +88,16 @@ const physicsReady = (async () => {
 const entities = new Map();              // entity_id -> {mesh, aggregate, descriptor}
 let entityBroadcastIntervalMs = 1000 / 30;   // ~30 Hz default
 let lastEntityBroadcast = 0;
+
+// Kinematic robot collider. Parented to the root body node so the odom-
+// driven transform drags it through the world; entities collide with it.
+// Humanoid defaults — adjust per robot if needed (no real-world cost to
+// being a bit oversized for nav testing).
+const ROBOT_COLLIDER_HEIGHT = 1.4;
+const ROBOT_COLLIDER_RADIUS = 0.25;
+const ROBOT_COLLIDER_Z_OFFSET = 0.7;    // capsule center above the root body origin
+let robotColliderMesh = null;
+let robotColliderAggregate = null;
 const params = new URLSearchParams(window.location.search);
 const useRobotMesh = params.get("robot") !== "proxy";
 const sceneMode = params.get("scene") || "auto";
@@ -637,6 +647,67 @@ async function loadRobot() {
     mesh.rotationQuaternion = quatWxyz(geom.wxyz);
     mesh.isPickable = false;
     robotMeshes.push(mesh);
+  }
+}
+
+async function setupRobotCollider() {
+  // Find the root body node (pelvis/torso/body_1) and wrap it with a
+  // kinematic capsule so Havok-driven entities collide with the robot
+  // as it's driven through the world by odom.
+  if (!(await physicsReady)) return;
+  let rootName = null;
+  for (const name of bodyNameList) {
+    if (robotRootBodyNames.has(name)) {
+      rootName = name;
+      break;
+    }
+  }
+  if (rootName === null) {
+    console.warn("robot collider: no root body found (looked for pelvis/torso/body_1)");
+    return;
+  }
+  const rootNode = bodyNodes.get(rootName);
+  if (!rootNode) return;
+
+  // CreateCapsule is Y-axis by default; rotate to align with our Z-up scene.
+  robotColliderMesh = BABYLON.MeshBuilder.CreateCapsule(
+    "robotCollider",
+    {
+      height: ROBOT_COLLIDER_HEIGHT,
+      radius: ROBOT_COLLIDER_RADIUS,
+      tessellation: 12,
+      subdivisions: 1,
+    },
+    scene,
+  );
+  robotColliderMesh.rotation = new BABYLON.Vector3(Math.PI / 2, 0, 0);
+  robotColliderMesh.position = new BABYLON.Vector3(0, 0, ROBOT_COLLIDER_Z_OFFSET);
+  robotColliderMesh.isVisible = false;
+  robotColliderMesh.isPickable = false;
+  robotColliderMesh.parent = rootNode;
+
+  try {
+    robotColliderAggregate = new BABYLON.PhysicsAggregate(
+      robotColliderMesh,
+      BABYLON.PhysicsShapeType.CAPSULE,
+      { mass: 0 },
+      scene,
+    );
+    // Kinematic bodies: prestep enabled so the parent-driven worldMatrix
+    // is read into the physics body each tick. Entities then collide
+    // against the capsule's current pose.
+    if (
+      robotColliderAggregate.body
+      && "disablePreStep" in robotColliderAggregate.body
+    ) {
+      robotColliderAggregate.body.disablePreStep = false;
+    }
+    console.log(`robot collider attached to body "${rootName}"`);
+  } catch (error) {
+    console.warn("robot collider aggregate failed:", error);
+    robotColliderMesh.dispose();
+    robotColliderMesh = null;
+    robotColliderAggregate = null;
   }
 }
 
@@ -1529,6 +1600,7 @@ function _updateSlidersFromState(joints) {
     const config = await loadConfig();
     sceneConfig = config;
     await loadRobot();
+    setupRobotCollider();   // fire-and-forget; awaits physicsReady internally
     connectStreamWorker();
     installClickPublisher();
     setStatus("live");
