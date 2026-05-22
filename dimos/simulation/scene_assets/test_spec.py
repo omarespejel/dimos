@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from dimos.simulation.scene_assets.sidecar import SceneCookSidecar
 from dimos.simulation.scene_assets.spec import ARTIFACT_FRAMES, load_scene_package
 
 
@@ -76,3 +77,43 @@ def test_load_scene_package_accepts_expected_artifact_frames(tmp_path: Path) -> 
     assert package.visual_path == tmp_path / "visual.glb"
     assert package.browser_collision_path == tmp_path / "collision.glb"
     assert package.mujoco_model_path == tmp_path / "compiled.mjb"
+
+
+def test_scene_cook_sidecar_removes_interactable_collision() -> None:
+    sidecar = SceneCookSidecar.from_dict(
+        {
+            "collision": {
+                "prim_overrides": {
+                    "Floor": {"type": "plane"},
+                },
+            },
+            "interactables": [
+                {
+                    "id": "chair_016",
+                    "source_prim_paths": ["Chair.016_*"],
+                    "remove_from_static": True,
+                }
+            ],
+        }
+    )
+
+    collision = sidecar.effective_collision_spec()
+
+    assert collision.resolve("Floor")["type"] == "plane"
+    assert collision.resolve("Chair.016_seat")["type"] == "skip"
+
+
+def test_load_scene_package_preserves_packaged_entities(tmp_path: Path) -> None:
+    raw = _metadata(tmp_path)
+    raw["entities"] = [
+        {
+            "id": "chair_016",
+            "descriptor": {"entity_id": "chair_016", "shape_hint": "box"},
+        }
+    ]
+    metadata_path = tmp_path / "scene.meta.json"
+    metadata_path.write_text(json.dumps(raw))
+
+    package = load_scene_package(metadata_path)
+
+    assert package.entities[0]["id"] == "chair_016"

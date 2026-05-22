@@ -31,7 +31,9 @@ from dimos.simulation.mujoco.collision_spec import CollisionSpec
 from dimos.simulation.mujoco.scene_mesh_to_mjcf import load_or_bake
 from dimos.simulation.scene_assets.browser_collision import cook_browser_collision
 from dimos.simulation.scene_assets.inspect import inspect_scene_asset
+from dimos.simulation.scene_assets.interactables import cook_interactable_assets
 from dimos.simulation.scene_assets.mesh_scene import SceneMeshAlignment
+from dimos.simulation.scene_assets.sidecar import SceneCookSidecar
 from dimos.simulation.scene_assets.spec import (
     BrowserCollisionSpec,
     BrowserVisualSpec,
@@ -56,6 +58,7 @@ def cook_scene_package(
     robot_mjcf_path: str | Path | None = None,
     meshdir: str | Path | None = None,
     collision_spec: CollisionSpec | None = None,
+    cook_sidecar: SceneCookSidecar | None = None,
     visual_spec: BrowserVisualSpec | None = None,
     browser_collision_spec: BrowserCollisionSpec | None = None,
     mujoco_spec: MujocoSceneSpec | None = None,
@@ -77,11 +80,13 @@ def cook_scene_package(
         browser_collision=browser_collision,
         mujoco=mujoco,
     )
+    sidecar = cook_sidecar or SceneCookSidecar.auto_discover(source)
+    effective_collision_spec = sidecar.effective_collision_spec(collision_spec)
 
     package_dir = (
         Path(output_dir).expanduser().resolve()
         if output_dir is not None
-        else SCENE_PACKAGE_CACHE_DIR / _cache_key(cook_spec, robot_mjcf_path, meshdir)
+        else SCENE_PACKAGE_CACHE_DIR / _cache_key(cook_spec, robot_mjcf_path, meshdir, sidecar)
     )
     browser_dir = package_dir / "browser"
     package_dir.mkdir(parents=True, exist_ok=True)
@@ -90,11 +95,28 @@ def cook_scene_package(
         "source": inspect_scene_asset(source).to_json_dict(),
         "cook_spec": _cook_spec_json(cook_spec),
     }
+    if sidecar.path is not None or sidecar.interactables:
+        stats["authored_sidecar"] = sidecar.to_json_dict()
+
+    entities = cook_interactable_assets(
+        source,
+        package_dir,
+        sidecar=sidecar,
+        alignment=align,
+        rebake=rebake,
+    )
+    if entities:
+        stats["interactables"] = {
+            "count": len(entities),
+            "ids": [entity["id"] for entity in entities],
+            "static_visual_filter": "blender-prepass",
+        }
 
     visual_result = cook_browser_visual(
         source,
         browser_dir,
         spec=visual,
+        exclude_prim_patterns=sidecar.visual_exclude_patterns(),
         rebake=rebake,
     )
     if visual_result is not None:
@@ -108,7 +130,7 @@ def cook_scene_package(
         browser_dir,
         alignment=SceneMeshAlignment(y_up=False),
         spec=browser_collision,
-        collision_spec=collision_spec,
+        collision_spec=effective_collision_spec,
         rebake=rebake,
     )
     if browser_collision_result is not None:
@@ -124,7 +146,7 @@ def cook_scene_package(
             robot_mjcf_path=robot_mjcf_path,
             alignment=align,
             meshdir=meshdir,
-            collision_spec=collision_spec,
+            collision_spec=effective_collision_spec,
             include_visual_mesh=mujoco.include_visual_mesh,
             rebake=rebake,
         )
@@ -146,6 +168,7 @@ def cook_scene_package(
         mujoco_model_path=mujoco_model_path,
         mujoco_wrapper_path=mujoco_wrapper_path,
         metadata_path=package_dir / "scene.meta.json",
+        entities=entities,
         stats=stats,
     )
     package.write_metadata()
@@ -157,10 +180,12 @@ def _cache_key(
     cook_spec: SceneCookSpec,
     robot_mjcf_path: str | Path | None,
     meshdir: str | Path | None,
+    sidecar: SceneCookSidecar,
 ) -> str:
     h = hashlib.sha256()
     h.update(cook_spec.source_path.read_bytes())
     h.update(json.dumps(_cook_spec_json(cook_spec), sort_keys=True).encode())
+    h.update(json.dumps(sidecar.to_json_dict(), sort_keys=True).encode())
     if robot_mjcf_path is not None:
         robot_path = Path(robot_mjcf_path).expanduser().resolve()
         h.update(robot_path.read_bytes())
@@ -188,6 +213,7 @@ def cli_main() -> None:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--robot-mjcf", type=Path)
     parser.add_argument("--meshdir", type=Path)
+    parser.add_argument("--cook-spec", type=Path)
     parser.add_argument("--scale", type=float, default=1.0)
     parser.add_argument("--translation", type=_parse_xyz, default=(0.0, 0.0, 0.0))
     parser.add_argument("--rotation-zyx-deg", type=_parse_xyz, default=(0.0, 0.0, 0.0))
@@ -224,6 +250,7 @@ def cli_main() -> None:
         ),
         robot_mjcf_path=None if args.no_mujoco else args.robot_mjcf,
         meshdir=args.meshdir,
+        cook_sidecar=SceneCookSidecar.from_json(args.cook_spec) if args.cook_spec else None,
         visual_spec=BrowserVisualSpec(
             enabled=not args.no_visual,
             optimizer=args.visual_optimizer,

@@ -466,6 +466,7 @@ def _babylon_blueprint(viewer_mjcf_path: str | Path, cmd_vel_topic: str) -> Blue
                 scene_rotation_zyx_deg=scene_package.alignment.rotation_zyx_deg,
                 scene_y_up=scene_package.alignment.y_up,
                 browser_collision_path=browser_collision_path,
+                initial_entities=scene_package.entities,
             )
         kwargs.update(
             pointcloud_hz=_env_float("DIMOS_BABYLON_POINTCLOUD_HZ", 2.0),

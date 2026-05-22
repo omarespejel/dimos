@@ -92,6 +92,7 @@ class ScenePackage:
     mujoco_model_path: Path | None = None
     mujoco_wrapper_path: Path | None = None
     metadata_path: Path | None = None
+    entities: list[dict[str, Any]] = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -110,6 +111,7 @@ class ScenePackage:
                     str(self.mujoco_wrapper_path) if self.mujoco_wrapper_path else None
                 ),
             },
+            "entities": self.entities,
             "stats": self.stats,
         }
 
@@ -142,6 +144,7 @@ def load_scene_package(path: str | Path) -> ScenePackage:
             Path(artifacts["mujoco_wrapper"]) if artifacts.get("mujoco_wrapper") else None
         ),
         metadata_path=metadata_path,
+        entities=raw.get("entities", []),
         stats=raw.get("stats", {}),
     )
 

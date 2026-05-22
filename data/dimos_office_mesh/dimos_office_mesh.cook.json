@@ -1,0 +1,336 @@
+{
+  "$schema": "https://dimensional.dev/schemas/dimos/scene-cook-sidecar.v1.json",
+  "collision": {
+    "prim_overrides": {
+      "Floor": {
+        "type": "plane"
+      }
+    }
+  },
+  "interactables": [
+    {
+      "id": "office_chair_000",
+      "source_prim_paths": [
+        "Chair_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_001",
+      "source_prim_paths": [
+        "Chair.001_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_002",
+      "source_prim_paths": [
+        "Chair.002_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_003",
+      "source_prim_paths": [
+        "Chair.003_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_004",
+      "source_prim_paths": [
+        "Chair.004_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_005",
+      "source_prim_paths": [
+        "Chair.005_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_006",
+      "source_prim_paths": [
+        "Chair.006_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_007",
+      "source_prim_paths": [
+        "Chair.007_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_008",
+      "source_prim_paths": [
+        "Chair.008_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_009",
+      "source_prim_paths": [
+        "Chair.009_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_010",
+      "source_prim_paths": [
+        "Chair.010_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_011",
+      "source_prim_paths": [
+        "Chair.011_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_012",
+      "source_prim_paths": [
+        "Chair.012_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_013",
+      "source_prim_paths": [
+        "Chair.013_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_014",
+      "source_prim_paths": [
+        "Chair.014_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_015",
+      "source_prim_paths": [
+        "Chair.015_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_chair_016",
+      "source_prim_paths": [
+        "Chair.016_*"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 8.0,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "chair",
+        "office",
+        "movable"
+      ]
+    },
+    {
+      "id": "office_printer_005",
+      "source_prim_paths": [
+        "Printer.005"
+      ],
+      "remove_from_static": true,
+      "spawn": "initial",
+      "kind": "dynamic",
+      "mass": 2.5,
+      "physics": {
+        "shape": "box"
+      },
+      "tags": [
+        "printer",
+        "office",
+        "movable"
+      ]
+    }
+  ]
+}

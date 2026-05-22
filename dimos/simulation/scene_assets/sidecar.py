@@ -1,0 +1,182 @@
+# Copyright 2025-2026 Dimensional Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Authored scene-cook sidecar.
+
+The existing ``<scene>.collision.json`` file remains the low-level collision
+contract.  ``<scene>.cook.json`` is the wider authored-scene contract: it can
+carry the same collision policy plus a small, explicit list of objects that
+should be removed from static cooks and respawned as pimsim entities.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field, replace
+import fnmatch
+import json
+from pathlib import Path
+from typing import Any, Literal
+
+from dimos.simulation.mujoco.collision_spec import CollisionSpec, OverrideConfig
+from dimos.simulation.scene_assets.mesh_scene import ScenePrimMesh
+from dimos.utils.logging_config import setup_logger
+
+logger = setup_logger()
+
+CookEntitySpawn = Literal["initial", "manual"]
+CookEntityKind = Literal["dynamic", "kinematic", "static"]
+CookEntityShape = Literal["box", "sphere", "cylinder", "mesh"]
+
+_COOK_SIDECAR_SUFFIXES = (".cook.json", ".scene.json")
+
+
+@dataclass(frozen=True)
+class InteractableSpec:
+    """One hand-authored runtime entity extracted from a source scene."""
+
+    id: str
+    source_prim_paths: tuple[str, ...]
+    remove_from_static: bool = True
+    spawn: CookEntitySpawn = "initial"
+    kind: CookEntityKind = "dynamic"
+    mass: float = 1.0
+    tags: tuple[str, ...] = ()
+    physics: dict[str, Any] = field(default_factory=dict)
+    visual: dict[str, Any] = field(default_factory=dict)
+    sensor: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> InteractableSpec:
+        prims = raw.get("source_prim_paths", raw.get("prim_paths", ()))
+        if isinstance(prims, str):
+            prims = (prims,)
+        if not prims:
+            raise ValueError(f"interactable {raw.get('id')!r} has no source_prim_paths")
+        tags = raw.get("tags", ())
+        if isinstance(tags, str):
+            tags = (tags,)
+        return cls(
+            id=str(raw["id"]),
+            source_prim_paths=tuple(str(pattern) for pattern in prims),
+            remove_from_static=bool(raw.get("remove_from_static", True)),
+            spawn=raw.get("spawn", "initial"),
+            kind=raw.get("kind", "dynamic"),
+            mass=float(raw.get("mass", 1.0)),
+            tags=tuple(str(tag) for tag in tags),
+            physics=dict(raw.get("physics", {})),
+            visual=dict(raw.get("visual", {})),
+            sensor=dict(raw.get("sensor", {})),
+        )
+
+    def to_json_dict(self) -> dict[str, Any]:
+        raw = asdict(self)
+        raw["source_prim_paths"] = list(self.source_prim_paths)
+        raw["tags"] = list(self.tags)
+        return raw
+
+    def matches(self, prim: ScenePrimMesh) -> bool:
+        prim_path = prim.prim_path or prim.name
+        return any(match_prim_pattern(prim_path, pattern) for pattern in self.source_prim_paths)
+
+
+@dataclass(frozen=True)
+class SceneCookSidecar:
+    """Authored policy loaded from ``<scene>.cook.json``.
+
+    ``collision`` is exactly the older collision sidecar schema.  Interactables
+    add surgical scene knowledge without forcing every object in a scene to
+    become semantic metadata.
+    """
+
+    path: Path | None = None
+    collision: CollisionSpec = field(default_factory=CollisionSpec)
+    interactables: tuple[InteractableSpec, ...] = ()
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any], *, path: Path | None = None) -> SceneCookSidecar:
+        collision_raw = raw.get("collision")
+        if isinstance(collision_raw, dict):
+            collision = CollisionSpec.from_dict(collision_raw)
+        else:
+            # Accept old collision keys at top-level so authored sidecars can be
+            # promoted without wrapping every existing key manually.
+            collision = CollisionSpec.from_dict(raw)
+        interactables = tuple(
+            InteractableSpec.from_dict(item) for item in raw.get("interactables", ())
+        )
+        return cls(path=path, collision=collision, interactables=interactables)
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> SceneCookSidecar:
+        sidecar_path = Path(path).expanduser().resolve()
+        return cls.from_dict(json.loads(sidecar_path.read_text()), path=sidecar_path)
+
+    @classmethod
+    def auto_discover(cls, scene_path: str | Path) -> SceneCookSidecar:
+        source = Path(scene_path).expanduser().resolve()
+        for suffix in _COOK_SIDECAR_SUFFIXES:
+            sidecar = source.with_suffix(suffix)
+            if sidecar.exists():
+                logger.info("loading scene cook sidecar: %s", sidecar)
+                return cls.from_json(sidecar)
+
+        legacy_collision = source.with_suffix(".collision.json")
+        if legacy_collision.exists():
+            logger.info("loading legacy collision sidecar: %s", legacy_collision)
+            return cls(path=legacy_collision, collision=CollisionSpec.from_json(legacy_collision))
+        return cls()
+
+    def effective_collision_spec(
+        self, base_collision: CollisionSpec | None = None
+    ) -> CollisionSpec:
+        """Return collision policy with interactables removed from static cooks."""
+        collision = base_collision or self.collision
+        prim_overrides: dict[str, OverrideConfig] = dict(collision.prim_overrides)
+        for interactable in self.interactables:
+            if not interactable.remove_from_static:
+                continue
+            for pattern in interactable.source_prim_paths:
+                prim_overrides.setdefault(pattern, {"type": "skip"})
+        return replace(collision, prim_overrides=prim_overrides)
+
+    def visual_exclude_patterns(self) -> list[str]:
+        patterns: list[str] = []
+        for interactable in self.interactables:
+            if interactable.remove_from_static:
+                for pattern in interactable.source_prim_paths:
+                    patterns.append(pattern)
+                    patterns.append(pattern.lstrip("/").rsplit("/", 1)[-1])
+        return patterns
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "path": str(self.path) if self.path else None,
+            "collision": asdict(self.collision),
+            "interactables": [item.to_json_dict() for item in self.interactables],
+        }
+
+
+def match_prim_pattern(prim_path: str, pattern: str) -> bool:
+    stripped = prim_path.lstrip("/")
+    sanitized = "".join(c if c.isalnum() else "_" for c in stripped)
+    basename = stripped.rsplit("/", 1)[-1]
+    candidates = (prim_path, stripped, sanitized, basename)
+    return any(fnmatch.fnmatchcase(candidate, pattern) for candidate in candidates)
+
+
+__all__ = [
+    "InteractableSpec",
+    "SceneCookSidecar",
+    "match_prim_pattern",
+]

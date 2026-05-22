@@ -1497,6 +1497,35 @@ function applyPoseWire(mesh, pose) {
   );
 }
 
+async function attachEntityVisual(descriptor, colliderMesh) {
+  if (!descriptor.mesh_ref) return [];
+  try {
+    const result = await BABYLON.SceneLoader.ImportMeshAsync(
+      null,
+      "/assets/",
+      descriptor.mesh_ref,
+      scene,
+    );
+    const nodes = [...(result.meshes || []), ...(result.transformNodes || [])];
+    for (const node of nodes) {
+      if (node === colliderMesh) continue;
+      if (!node.parent) {
+        node.parent = colliderMesh;
+      }
+      if ("isPickable" in node) {
+        node.isPickable = false;
+      }
+    }
+    if (nodes.length > 0) {
+      colliderMesh.isVisible = false;
+    }
+    return nodes;
+  } catch (error) {
+    console.warn(`entity ${descriptor.entity_id}: failed to load mesh_ref`, error);
+    return [];
+  }
+}
+
 async function handleEntitySpawn(payload) {
   const desc = payload.descriptor || {};
   const id = desc.entity_id;
@@ -1510,14 +1539,11 @@ async function handleEntitySpawn(payload) {
     console.warn(`entity_spawn ${id}: physics not ready, dropping`);
     return;
   }
-  if (desc.shape_hint === "mesh") {
-    // Deferred: GLB-backed entity meshes. MVP supports primitives only.
-    console.warn(`entity_spawn ${id}: shape_hint=mesh not yet supported (MVP: primitives)`);
-    return;
-  }
   const mesh = buildPrimitiveMesh(desc);
   if (!mesh) {
-    console.warn(`entity_spawn ${id}: cannot build shape_hint=${desc.shape_hint}`);
+    console.warn(
+      `entity_spawn ${id}: cannot build shape_hint=${desc.shape_hint}; use a primitive collider`,
+    );
     return;
   }
   applyPoseWire(mesh, payload.pose || {});
@@ -1544,9 +1570,11 @@ async function handleEntitySpawn(payload) {
   if (wantsKinematic && aggregate.body && "disablePreStep" in aggregate.body) {
     aggregate.body.disablePreStep = false;
   }
+  const visualNodes = await attachEntityVisual(desc, mesh);
   entities.set(id, {
     mesh,
     aggregate,
+    visualNodes,
     descriptor: desc,
     kinematic: wantsKinematic,
   });

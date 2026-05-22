@@ -1,0 +1,34 @@
+{
+  "source_blend": "Source_File.blend",
+  "frame": "Blender Z-up world coordinates (identity from .ply native \u2014 verified)",
+  "files": {
+    "mesh_glb": "dimos_office_mesh.glb",
+    "reference_cloud_ply": "dimos_office_pointcloud.ply",
+    "note": "Both files share the exact same source frame. Load both with the same SceneMeshAlignment in dimos and they will co-register as they do in Blender. The original data/dimos_office/dimos_office.ply (with full Gaussian properties, used by SplatCameraModule for head-camera rendering) is in the same frame as well, since Blender's PLY importer applies no transform on import."
+  },
+  "reference_world_identity": true,
+  "before": {
+    "verts": 13998068,
+    "polys": 13955526
+  },
+  "after": {
+    "verts": 938955,
+    "polys": 1521396
+  },
+  "decimate_ratio": 0.05,
+  "ref_pointcloud_n_verts": 1000000,
+  "default_alignment_for_dimos": {
+    "scale": 2.0,
+    "translation": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "rotation_zyx_deg": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "y_up": false
+  }
+}

@@ -46,6 +46,7 @@ from dimos.experimental.pimsim.entity import (
     EntityDescriptor,
     EntityState,
     EntityStateBatch,
+    pose_from_wire,
     pose_to_wire,
     twist_to_wire,
 )
@@ -178,6 +179,7 @@ class BabylonSceneViewerModule(Module):
         init_z: float = 0.0,
         init_yaw: float = 0.0,
         lock_z: bool = True,
+        initial_entities: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -249,6 +251,8 @@ class BabylonSceneViewerModule(Module):
             "yaw": float(init_yaw),
             "lockZ": bool(lock_z),
         }
+        self._initial_entities = initial_entities or []
+        self._entity_asset_paths = self._collect_entity_asset_paths(self._initial_entities)
 
         # Entity world. The browser owns physics state; this table is a
         # local mirror used for (a) reconnect replay (so a fresh tab can
@@ -293,6 +297,8 @@ class BabylonSceneViewerModule(Module):
             )
         except Exception:
             logger.debug("BabylonViewer: workspace_image not wired; skipping second camera")
+
+        self._install_initial_entities()
 
         self._broadcast_thread = threading.Thread(
             target=self._broadcast_loop,
@@ -421,12 +427,22 @@ class BabylonSceneViewerModule(Module):
         )
 
     async def _asset(self, request: Request) -> Response:
-        if (self._scene_path is None or not self._scene_path.exists()) and (
-            self._browser_collision_path is None or not self._browser_collision_path.exists()
-        ):
+        has_scene_asset = self._scene_path is not None and self._scene_path.exists()
+        has_collision_asset = (
+            self._browser_collision_path is not None and self._browser_collision_path.exists()
+        )
+        if not has_scene_asset and not has_collision_asset and not self._entity_asset_paths:
             return Response("scene asset not configured", status_code=404)
 
         asset_name = request.path_params["asset_name"]
+        entity_asset = self._entity_asset_paths.get(asset_name)
+        if entity_asset is not None and entity_asset.exists():
+            return FileResponse(
+                entity_asset,
+                media_type=media_type(entity_asset),
+                headers=_NO_CACHE_HEADERS,
+            )
+
         if self._scene_path is not None and _matches_asset_name(
             asset_name,
             "scene",
@@ -1050,6 +1066,30 @@ class BabylonSceneViewerModule(Module):
         for entity_id in ids:
             self._broadcast_json_from_thread({"type": "entity_despawn", "entity_id": entity_id})
         self._publish_entity_snapshot()
+
+    def _install_initial_entities(self) -> None:
+        for raw in self._initial_entities:
+            if raw.get("spawn", "initial") != "initial":
+                continue
+            try:
+                descriptor = EntityDescriptor.from_wire(raw["descriptor"])
+                pose = pose_from_wire(raw["initial_pose"])
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("BabylonViewer: dropping bad packaged entity: %s", exc)
+                continue
+            self.spawn_entity(descriptor, pose)
+
+    @staticmethod
+    def _collect_entity_asset_paths(entities: list[dict[str, Any]]) -> dict[str, Path]:
+        assets: dict[str, Path] = {}
+        for raw in entities:
+            descriptor = raw.get("descriptor", {})
+            mesh_ref = descriptor.get("mesh_ref")
+            visual_path = raw.get("visual_path")
+            if not isinstance(mesh_ref, str) or not isinstance(visual_path, str):
+                continue
+            assets[mesh_ref] = Path(visual_path).expanduser().resolve()
+        return assets
 
     def _publish_entity_states(self, states_wire: list[dict[str, Any]]) -> None:
         """Browser → python entity state batch. Publish the aggregated

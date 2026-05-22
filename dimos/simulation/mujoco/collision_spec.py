@@ -169,10 +169,11 @@ class CollisionSpec:
     split_component_min_faces: int = 16
 
     @classmethod
-    def from_json(cls, path: Path | str) -> CollisionSpec:
-        """Load a sidecar.  Unknown keys are ignored to keep the format forwards-compatible."""
-        path = Path(path)
-        raw = json.loads(path.read_text())
+    def from_dict(cls, raw: dict[str, Any]) -> CollisionSpec:
+        """Build a collision spec from decoded JSON.
+
+        Unknown keys are ignored to keep authored sidecars forwards-compatible.
+        """
         known = {
             "default",
             "fill_threshold",
@@ -196,6 +197,13 @@ class CollisionSpec:
         kwargs = {k: v for k, v in raw.items() if k in known}
         # Ignore "$schema" and any future top-level keys silently.
         return cls(**kwargs)
+
+    @classmethod
+    def from_json(cls, path: Path | str) -> CollisionSpec:
+        """Load a sidecar.  Unknown keys are ignored to keep the format forwards-compatible."""
+        path = Path(path)
+        raw = json.loads(path.read_text())
+        return cls.from_dict(raw)
 
     @classmethod
     def auto_discover(cls, scene_path: Path | str) -> CollisionSpec:
