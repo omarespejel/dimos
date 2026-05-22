@@ -1,0 +1,41 @@
+# Copyright 2026 Dimensional Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Blueprint + entrypoint for the path-planner evaluator.
+
+Wires the Evaluator and StraightLinePlanner together and bridges all
+streams to rerun. Run with::
+
+    python -m dimos.navigation.nav_stack.evaluator.main
+"""
+
+from __future__ import annotations
+
+from dimos.core.coordination.blueprints import Blueprint, autoconnect
+from dimos.core.coordination.module_coordinator import ModuleCoordinator
+from dimos.navigation.nav_stack.evaluator.evaluator import Evaluator
+from dimos.navigation.nav_stack.evaluator.straight_line_planner import StraightLinePlanner
+from dimos.visualization.rerun.bridge import RerunBridgeModule
+
+
+def create_evaluator_blueprint() -> Blueprint:
+    return autoconnect(
+        Evaluator.blueprint(),
+        StraightLinePlanner.blueprint(),
+        RerunBridgeModule.blueprint(),
+    )
+
+
+if __name__ == "__main__":
+    ModuleCoordinator.build(create_evaluator_blueprint()).loop()
