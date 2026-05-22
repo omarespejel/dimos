@@ -49,7 +49,7 @@ class ScenarioResult:
 
 
 class EvaluatorConfig(ModuleConfig):
-    # Pause between publishing each input (map → start → goal) so the planner
+    # Pause between publishing each input so the planner
     # has all three before its goal-trigger fires. LCM doesn't order topics.
     input_publish_delay: float = 0.2
     # Max seconds to wait for the planner's path reply per scenario.

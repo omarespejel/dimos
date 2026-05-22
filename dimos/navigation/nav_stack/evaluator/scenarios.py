@@ -29,8 +29,10 @@ import numpy as np
 from dimos.msgs.geometry_msgs.Pose import Pose
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
+from dimos.navigation.nav_stack.evaluator.mesh_loader import load_voxelized_mesh
 
 WORLD_FRAME = "map"
+MESH_PATH = "/home/andrew/Downloads/model.glb"
 
 
 @dataclass
@@ -90,33 +92,16 @@ def _map_with_walls(*walls: np.ndarray) -> PointCloud2:
     return _cloud(np.vstack([_floor(), *walls]))
 
 
+def _mesh_scene(name: str, mesh_path: str, expect_path: bool = True) -> PlannerScenario:
+    points = load_voxelized_mesh(mesh_path)
+    return PlannerScenario(
+        name=name,
+        global_map=_cloud(points),
+        start_pose=_odom(-5.0, 0.0),
+        goal_pose=_odom(5.0, 0.0),
+        expect_path=expect_path,
+    )
+
+
 def default_scenarios() -> list[PlannerScenario]:
-    """A small starter set covering reachable / unreachable / detour cases."""
-    return [
-        PlannerScenario(
-            name="open_field",
-            global_map=_empty_map(),
-            start_pose=_odom(0.0, 0.0),
-            goal_pose=_odom(5.0, 0.0),
-            expect_path=True,
-        ),
-        PlannerScenario(
-            name="wall_with_detour",
-            global_map=_map_with_walls(_wall(2.0, -1.5, 2.0, 1.5)),
-            start_pose=_odom(0.0, 0.0),
-            goal_pose=_odom(5.0, 0.0),
-            expect_path=True,
-        ),
-        PlannerScenario(
-            name="sealed_box",
-            global_map=_map_with_walls(
-                _wall(4.0, -1.0, 6.0, -1.0),
-                _wall(4.0, 1.0, 6.0, 1.0),
-                _wall(4.0, -1.0, 4.0, 1.0),
-                _wall(6.0, -1.0, 6.0, 1.0),
-            ),
-            start_pose=_odom(0.0, 0.0),
-            goal_pose=_odom(5.0, 0.0),
-            expect_path=False,
-        ),
-    ]
+    return [_mesh_scene("loaded_mesh", MESH_PATH)]
