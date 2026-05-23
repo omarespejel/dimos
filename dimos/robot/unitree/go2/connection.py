@@ -294,21 +294,18 @@ class GO2Connection(Module, Camera, Pointcloud):
             DEFAULT_CAMERA_FRAME: self.config.camera_link_frame,
             DEFAULT_CAMERA_OPTICAL_FRAME: self.config.camera_optical_frame,
         }
-        stamped_statics = [
-            Transform(
-                translation=t.translation,
-                rotation=t.rotation,
-                frame_id=frame_remap.get(t.frame_id, t.frame_id),
-                child_frame_id=frame_remap.get(t.child_frame_id, t.child_frame_id),
-            )
-            for t in self.static_transforms.values()
-        ]
         if self.config.static_publish_rate > 0:
             period = 1.0 / self.config.static_publish_rate
             while True:
-                now = time.time()
-                for st in stamped_statics:
-                    st.ts = now
+                stamped_statics = [
+                    Transform(
+                        translation=t.translation,
+                        rotation=t.rotation,
+                        frame_id=frame_remap.get(t.frame_id, t.frame_id),
+                        child_frame_id=frame_remap.get(t.child_frame_id, t.child_frame_id),
+                    )
+                    for t in self.static_transforms.values()
+                ]
                 self.tf.publish(*stamped_statics)
                 self.camera_info.publish(self.camera_info_static)
                 time.sleep(period)
