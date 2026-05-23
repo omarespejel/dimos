@@ -716,17 +716,28 @@ class PointCloud2(Timestamped):
         if len(points) == 0:
             return rr.Points3D([]) if mode != "boxes" else rr.Boxes3D(centers=[])
 
+        # Per-point colors stored in the tensor (range [0, 1] float, by Open3D
+        # convention). Used unless the caller passes an explicit ``colors`` arg.
+        tensor_colors: np.ndarray | None = None
+        if "colors" in self._pcd_tensor.point:
+            tensor_colors = self._pcd_tensor.point["colors"].numpy()
+
         if bottom_cutoff is not None:
-            points = points[points[:, 2] >= bottom_cutoff]
+            keep = points[:, 2] >= bottom_cutoff
+            points = points[keep]
+            if tensor_colors is not None:
+                tensor_colors = tensor_colors[keep]
             if len(points) == 0:
                 return rr.Points3D([]) if mode != "boxes" else rr.Boxes3D(centers=[])
 
-        # Use class_ids for height-based colormap (viewer resolves colors via AnnotationContext)
-        # Fall back to explicit colors when provided
+        # Priority: explicit ``colors`` kwarg > per-point tensor colors >
+        # height-based turbo via AnnotationContext class_ids.
         class_ids = None
         point_colors = None
         if colors is not None:
             point_colors = colors
+        elif tensor_colors is not None:
+            point_colors = (tensor_colors * 255).astype(np.uint8)
         else:
             z = points[:, 2]
             class_ids = ((z - z.min()) / (z.max() - z.min() + 1e-8) * 255).astype(np.uint8)

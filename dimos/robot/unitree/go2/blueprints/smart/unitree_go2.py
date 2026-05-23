@@ -31,6 +31,7 @@ from dimos.navigation.movement_manager.movement_manager import MovementManager
 from dimos.navigation.patrolling.module import PatrollingModule
 from dimos.navigation.replanning_a_star.module import ReplanningAStarPlanner
 from dimos.perception.fiducial.marker_tf_module import MarkerTfModule
+from dimos.perception.lidar_color_module import LidarColorModule
 from dimos.robot.unitree.go2.blueprints.basic.unitree_go2_basic import unitree_go2_basic
 
 unitree_go2 = autoconnect(
@@ -41,6 +42,7 @@ unitree_go2 = autoconnect(
     WavefrontFrontierExplorer.blueprint(),
     PatrollingModule.blueprint(),
     MovementManager.blueprint(),
+    LidarColorModule.blueprint(),
 ).global_config(n_workers=10, robot_model="unitree_go2")
 
 

@@ -47,7 +47,10 @@ def _convert_camera_info(camera_info: Any) -> Any:
 
 
 def _convert_global_map(grid: Any) -> Any:
-    return grid.to_rerun(bottom_cutoff=0)
+    # No bottom_cutoff: the world frame origin sits at the lidar's start
+    # pose (~0.4 m above the floor), so the floor lives at negative z and a
+    # cutoff of 0 would clip it.
+    return grid.to_rerun()
 
 
 def _convert_navigation_costmap(grid: Any) -> Any:

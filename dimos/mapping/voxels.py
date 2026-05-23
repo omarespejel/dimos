@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import open3d as o3d  # type: ignore[import-untyped]
 import open3d.core as o3c  # type: ignore[import-untyped]
 
@@ -57,6 +58,7 @@ class VoxelGrid:
         self._voxel_size = voxel_size
         self._carve_columns = carve_columns
         self._frame_id = frame_id
+        self._block_count = block_count
 
         dev = (
             o3c.Device(device)
@@ -83,6 +85,11 @@ class VoxelGrid:
         self._latest_frame_ts: float = 0.0
         self._disposed = False
 
+        # Per-voxel colors. Lazy: only allocated when an input frame actually
+        # carries a ``colors`` channel. Same keys as ``_voxel_hashmap``, values
+        # are ``uint8[3]`` RGB (compact; we convert to float [0,1] on output).
+        self._color_hashmap: o3c.HashMap | None = None
+
     def _check_disposed(self) -> None:
         if self._disposed:
             raise RuntimeError("VoxelGrid has been disposed and cannot be used")
@@ -101,10 +108,28 @@ class VoxelGrid:
         vox = (pts / self._voxel_size).floor().to(self._key_dtype)
         keys_Nx3 = vox.contiguous()
 
+        # Pull colors if the cloud has them. Open3D convention: colors live
+        # at ``point["colors"]`` as float32 in [0, 1] with shape (N, 3).
+        colors_u8: o3c.Tensor | None = None
+        if "colors" in pcd.point:
+            c_f32 = pcd.point["colors"].to(self._dev, o3c.float32)
+            # Clamp defensively in case upstream wrote out-of-range values.
+            colors_u8 = (c_f32.clip(0.0, 1.0) * 255.0).to(o3c.uint8).contiguous()
+
+        # Carve (or skip) — for both the occupancy hashmap and (if active) colors.
         if self._carve_columns:
-            self._carve_and_insert(keys_Nx3)
-        else:
-            self._voxel_hashmap.activate(keys_Nx3)
+            to_erase = self._compute_carve_keys(keys_Nx3)
+            if to_erase.shape[0] > 0:
+                self._voxel_hashmap.erase(to_erase)
+                if self._color_hashmap is not None:
+                    self._color_hashmap.erase(to_erase)
+
+        self._voxel_hashmap.activate(keys_Nx3)
+
+        # Write per-voxel colors if the input had them. Latest-wins for
+        # multiple points landing in the same voxel within this batch.
+        if colors_u8 is not None and keys_Nx3.shape[0] > 0:
+            self._write_colors(keys_Nx3, colors_u8)
 
         self.get_global_pointcloud.invalidate_cache(self)
         self.get_global_pointcloud2.invalidate_cache(self)
@@ -117,11 +142,10 @@ class VoxelGrid:
         if str(self._dev).startswith("CUDA"):
             o3c.cuda.release_cache()
 
-    def _carve_and_insert(self, new_keys: o3c.Tensor) -> None:
-        """Column carving: remove all existing voxels sharing (X,Y) with new_keys, then insert."""
+    def _compute_carve_keys(self, new_keys: o3c.Tensor) -> o3c.Tensor:
+        """Find existing voxel keys sharing an (X, Y) column with any ``new_keys``."""
         if new_keys.shape[0] == 0:
-            self._voxel_hashmap.activate(new_keys)
-            return
+            return o3c.Tensor.zeros((0, 3), self._key_dtype, self._dev)
 
         xy_keys = new_keys[:, :2].contiguous()
 
@@ -138,19 +162,34 @@ class VoxelGrid:
 
         active_indices = self._voxel_hashmap.active_buf_indices()
         if active_indices.shape[0] == 0:
-            self._voxel_hashmap.activate(new_keys)
-            return
+            return o3c.Tensor.zeros((0, 3), self._key_dtype, self._dev)
 
         existing_keys = self._voxel_hashmap.key_tensor()[active_indices]
         existing_xy = existing_keys[:, :2].contiguous()
 
         _, found_mask = xy_hashmap.find(existing_xy)
+        return existing_keys[found_mask]
 
-        to_erase = existing_keys[found_mask]
-        if to_erase.shape[0] > 0:
-            self._voxel_hashmap.erase(to_erase)
+    def _ensure_color_hashmap(self) -> o3c.HashMap:
+        if self._color_hashmap is None:
+            self._color_hashmap = o3c.HashMap(
+                init_capacity=self._block_count,
+                key_dtype=self._key_dtype,
+                key_element_shape=o3c.SizeVector([3]),
+                value_dtypes=[o3c.uint8],
+                value_element_shapes=[o3c.SizeVector([3])],
+                device=self._dev,
+            )
+        return self._color_hashmap
 
-        self._voxel_hashmap.activate(new_keys)
+    def _write_colors(self, keys: o3c.Tensor, colors_u8: o3c.Tensor) -> None:
+        """Activate keys in the color hashmap and overwrite their values."""
+        ch = self._ensure_color_hashmap()
+        buf_indices, _ = ch.activate(keys)
+        # Open3D HashMap stores values in a (capacity, *value_shape) tensor.
+        # Indexing by ``buf_indices`` lets us overwrite both newly inserted
+        # entries and any already-existing ones (latest-wins semantics).
+        ch.value_tensor(0)[buf_indices] = colors_u8
 
     @simple_mcache
     def get_global_pointcloud2(self) -> PointCloud2:
@@ -171,6 +210,26 @@ class VoxelGrid:
         pts = voxel_coords.to(cpu) + (self._voxel_size * 0.5)
         out = o3d.t.geometry.PointCloud(device=cpu)
         out.point["positions"] = pts
+
+        # Attach colors if any frame ever provided them. Voxels added by
+        # uncolored frames (or wiped by carving then re-added without colors)
+        # are absent from the color hashmap — fill those with neutral gray.
+        if self._color_hashmap is not None and voxel_coords.shape[0] > 0:
+            keys = (voxel_coords / self._voxel_size).floor().to(self._key_dtype).contiguous()
+            buf_indices, masks = self._color_hashmap.find(keys)
+            value_tensor = self._color_hashmap.value_tensor(0)  # (capacity, 3) uint8
+
+            masks_np = masks.cpu().numpy()
+            n = keys.shape[0]
+            colors_u8 = np.full((n, 3), 128, dtype=np.uint8)  # neutral gray default
+            if masks_np.any():
+                # Index only the buffer slots that actually hold valid colors.
+                found_idx = buf_indices[masks].to(cpu).numpy()
+                colors_u8[masks_np] = value_tensor.cpu().numpy()[found_idx]
+
+            out.point["colors"] = o3c.Tensor(
+                (colors_u8.astype(np.float32) / 255.0), dtype=o3c.float32, device=cpu
+            )
         return out
 
     def size(self) -> int:
@@ -189,6 +248,7 @@ class VoxelGrid:
         self.get_global_pointcloud2.invalidate_cache(self)  # type: ignore[attr-defined]
         self.vbg = None
         self._voxel_hashmap = None
+        self._color_hashmap = None
 
 
 class VoxelMapTransformer(Transformer[PointCloud2, PointCloud2]):
