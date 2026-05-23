@@ -268,6 +268,7 @@ def nav_stack_rerun_config(
     visual_override.setdefault("world/_pgo_global_map", _hide)
     visual_override.setdefault("world/_fastlio_global_map", _hide)
     visual_override.setdefault("world/map_override", _hide)
+    visual_override.setdefault("world/_go2_onboard_lidar", _hide)
     visual_override.setdefault(
         "world/registered_scan", _registered_scan_colors if show_registered_scan else _hide
     )
