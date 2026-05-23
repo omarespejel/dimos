@@ -110,6 +110,7 @@ const sceneMode = params.get("scene") || "auto";
 const showPerfHud = params.get("perf") === "1";
 let sceneConfig = null;
 let sceneLoadStarted = false;
+let sceneVisible = true;
 let pathMesh = null;
 let lidarMesh = null;
 let lidarMaterial = null;
@@ -267,8 +268,36 @@ function setButtonActive(id, active) {
   document.getElementById(id).dataset.active = String(active);
 }
 
+function setRenderableVisible(node, visible) {
+  if (!node) return;
+  if ("isVisible" in node) node.isVisible = visible;
+  if ("visibility" in node) node.visibility = visible ? 1 : 0;
+}
+
+function setEntityVisualsVisible(entry, visible) {
+  if (!entry) return;
+  if (entry.visualNodes && entry.visualNodes.length > 0) {
+    for (const node of entry.visualNodes) {
+      setRenderableVisible(node, visible);
+    }
+    return;
+  }
+  // Primitive entities often use their physics mesh as the visible mesh.
+  // Hide the renderable surface only; keep the body enabled for Havok and
+  // for browser->native entity-state publication.
+  setRenderableVisible(entry.mesh, visible);
+}
+
+function setAllEntityVisualsVisible(visible) {
+  for (const entry of entities.values()) {
+    setEntityVisualsVisible(entry, visible);
+  }
+}
+
 function setSceneVisibility(visible) {
-  for (const mesh of sceneMeshes) mesh.setEnabled(visible);
+  sceneVisible = visible;
+  for (const mesh of sceneMeshes) setRenderableVisible(mesh, visible);
+  setAllEntityVisualsVisible(visible);
   setButtonActive("toggleScene", visible);
 }
 
@@ -286,11 +315,13 @@ function setLidarVisibility(visible) {
 function createCollisionMaterial() {
   if (collisionMaterial) return collisionMaterial;
   collisionMaterial = new BABYLON.StandardMaterial("collisionDebugMaterial", scene);
-  collisionMaterial.diffuseColor = new BABYLON.Color3(0.0, 0.95, 1.0);
-  collisionMaterial.emissiveColor = new BABYLON.Color3(0.0, 0.45, 0.55);
-  collisionMaterial.alpha = 0.45;
+  collisionMaterial.diffuseColor = BABYLON.Color3.FromHexString("#00d7ff");
+  collisionMaterial.emissiveColor = BABYLON.Color3.FromHexString("#00a8ff");
+  collisionMaterial.specularColor = BABYLON.Color3.Black();
+  collisionMaterial.alpha = 0.55;
   collisionMaterial.wireframe = true;
   collisionMaterial.backFaceCulling = false;
+  collisionMaterial.disableLighting = true;
   collisionMaterial.transparencyMode = BABYLON.Material.MATERIAL_ALPHABLEND;
   return collisionMaterial;
 }
@@ -1676,13 +1707,15 @@ async function handleEntitySpawn(payload) {
   if (desc.shape_hint !== "mesh") {
     visualNodes = await attachEntityVisual(desc, mesh);
   }
-  entities.set(id, {
+  const entry = {
     mesh,
     aggregate,
     visualNodes,
     descriptor: desc,
     kinematic: wantsKinematic,
-  });
+  };
+  entities.set(id, entry);
+  setEntityVisualsVisible(entry, sceneVisible);
   if (ui.setEntityStatus) ui.setEntityStatus(`${entities.size} active`);
   broadcastEntityStates(true);
 }
