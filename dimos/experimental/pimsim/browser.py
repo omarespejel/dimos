@@ -14,13 +14,11 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 from pathlib import Path
 
 STATIC_DIR = Path(__file__).with_name("static")
 INDEX_PATH = STATIC_DIR / "index.html"
 
 
-@lru_cache(maxsize=1)
 def index_html() -> str:
     return INDEX_PATH.read_text()

@@ -14,6 +14,7 @@
 
 const canvas = document.getElementById("renderCanvas");
 const statusEl = document.getElementById("status");
+const ui = window.PimSimUI || {};
 const engine = new BABYLON.Engine(canvas, true, {
   preserveDrawingBuffer: false,
   stencil: false,
@@ -223,6 +224,10 @@ function unregisterCollisionMesh(mesh) {
 }
 
 function setStatus(message) {
+  if (ui.setStatus) {
+    ui.setStatus(message);
+    return;
+  }
   statusEl.textContent = message;
 }
 
@@ -255,6 +260,10 @@ function updatePerfCounters() {
 }
 
 function setButtonActive(id, active) {
+  if (ui.setButtonActive) {
+    ui.setButtonActive(id, active);
+    return;
+  }
   document.getElementById(id).dataset.active = String(active);
 }
 
@@ -1661,6 +1670,7 @@ async function handleEntitySpawn(payload) {
     descriptor: desc,
     kinematic: wantsKinematic,
   });
+  if (ui.setEntityStatus) ui.setEntityStatus(`${entities.size} active`);
   broadcastEntityStates(true);
 }
 
@@ -1678,6 +1688,7 @@ function handleEntityDespawn(payload) {
     // best-effort
   }
   entities.delete(payload.entity_id);
+  if (ui.setEntityStatus) ui.setEntityStatus(`${entities.size} active`);
   broadcastEntityStates(true);
 }
 
@@ -1847,45 +1858,12 @@ function connectStreamWorker() {
   return worker;
 }
 
-// Per-camera state. Each entry tracks its <img> element, label, and
-// the last object URL so we can revoke it after the next swap.
-const _cameraTargets = {
-  // First camera ("camera" by default) lives in the primary panel.
-  // Any other named camera (e.g. "workspace") lives in the secondary
-  // panel. The mapping is by exact name match so dimos-side renames
-  // need to be mirrored here.
-  primary: {
-    img: () => document.getElementById("cameraImg"),
-    label: () => document.getElementById("cameraLabel"),
-    panel: () => document.getElementById("cameraPanel"),
-    lastUrl: null,
-  },
-  workspace: {
-    img: () => document.getElementById("workspaceImg"),
-    label: () => document.getElementById("workspaceLabel"),
-    panel: () => document.getElementById("workspacePanel"),
-    lastUrl: null,
-  },
-};
-
 function updateCameraFrame(cameraName, buffer, jpegOffset) {
-  const jpegBytes = new Uint8Array(buffer, jpegOffset);
-  const blob = new Blob([jpegBytes], { type: "image/jpeg" });
-  const url = URL.createObjectURL(blob);
-
-  const target = cameraName === "workspace"
-    ? _cameraTargets.workspace
-    : _cameraTargets.primary;
-  const img = target.img();
-  const label = target.label();
-  const panel = target.panel();
-  if (img) {
-    img.src = url;
-    if (target.lastUrl) URL.revokeObjectURL(target.lastUrl);
-    target.lastUrl = url;
+  if (ui.updateCameraFrame) {
+    ui.updateCameraFrame(cameraName, buffer, jpegOffset);
+    return;
   }
-  if (label) label.textContent = cameraName;
-  if (panel) panel.dataset.hasFrame = "true";
+  console.warn("camera frame dropped: PimSimUI.updateCameraFrame unavailable", cameraName);
 }
 
 function installClickPublisher() {
@@ -1988,10 +1966,10 @@ document.getElementById("respawnRobot").onclick = () => {
 document.getElementById("toggleLidar").onclick = () => setLidarVisibility(!lidarVisible);
 document.getElementById("toggleCamera").onclick = () => {
   const btn = document.getElementById("toggleCamera");
-  const panel = document.getElementById("cameraPanel");
   const active = btn.dataset.active !== "true";
   btn.dataset.active = active ? "true" : "false";
-  if (panel) panel.dataset.active = active ? "true" : "false";
+  if (ui.setPanelActive) ui.setPanelActive("cameraPanel", active);
+  else document.getElementById("cameraPanel").dataset.active = active ? "true" : "false";
 };
 document.getElementById("navClick").onclick = () => setClickMode("nav");
 document.getElementById("pointClick").onclick = () => setClickMode("point");
@@ -2052,10 +2030,10 @@ document.getElementById("policyDryRun").onclick = () => {
 // Toggle visibility
 document.getElementById("armsToggle").onclick = () => {
   const btn = document.getElementById("armsToggle");
-  const panel = document.getElementById("armsPanel");
   const active = btn.dataset.active !== "true";
   btn.dataset.active = active ? "true" : "false";
-  panel.dataset.active = active ? "true" : "false";
+  if (ui.setPanelActive) ui.setPanelActive("armsPanel", active);
+  else document.getElementById("armsPanel").dataset.active = active ? "true" : "false";
 };
 
 // Release: stop publishing arm commands (hand control back to MC)

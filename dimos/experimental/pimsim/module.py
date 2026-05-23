@@ -353,17 +353,14 @@ class BabylonSceneViewerModule(Module):
 
     async def _index(self, request: Request) -> HTMLResponse:
         html = index_html()
-        app_js = STATIC_DIR / "app.js"
-        style_css = STATIC_DIR / "style.css"
-        if app_js.exists():
+        for asset_name in ("style.css", "ui.js", "app.js"):
+            asset_path = STATIC_DIR / asset_name
+            if not asset_path.exists():
+                continue
+            token = _asset_token(asset_path)
             html = html.replace(
-                'src="/static/app.js"',
-                f'src="/static/app.js?v={_asset_token(app_js)}"',
-            )
-        if style_css.exists():
-            html = html.replace(
-                'href="/static/style.css"',
-                f'href="/static/style.css?v={_asset_token(style_css)}"',
+                f'"/static/{asset_name}"',
+                f'"/static/{asset_name}?v={token}"',
             )
         return HTMLResponse(html, headers=_NO_CACHE_HEADERS)
 

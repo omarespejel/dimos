@@ -18,7 +18,7 @@ limitations under the License.
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>DimOS Scene Viewer</title>
+    <title>DimOS Operator Console</title>
     <script src="https://cdn.babylonjs.com/babylon.js"></script>
     <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
     <!-- Havok WASM physics. HavokPhysics() returns a promise; the plugin
@@ -27,72 +27,165 @@ limitations under the License.
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
-    <canvas id="renderCanvas"></canvas>
-    <div id="cameraPanel" data-active="true" data-has-frame="false">
-      <div id="cameraHeader">
-        <span id="cameraLabel">camera</span>
-      </div>
-      <img id="cameraImg" alt="" />
-      <div id="cameraEmpty">waiting for frames…</div>
-    </div>
-    <div id="workspacePanel" data-active="true" data-has-frame="false">
-      <div id="workspaceHeader">
-        <span id="workspaceLabel">workspace</span>
-      </div>
-      <img id="workspaceImg" alt="" />
-    </div>
-    <div id="armsPanel" data-active="false">
-      <div id="armsHeader">Arm joints</div>
-      <div id="armsColumns">
-        <div class="arm-col">
-          <div class="arm-col-title">Left</div>
-          <div id="leftArmSliders" class="arm-sliders"></div>
+    <main class="console-frame">
+      <header class="console-top">
+        <div class="brand">DIMENSIONAL</div>
+        <div class="console-title">PIMSIM OPERATOR CONSOLE</div>
+        <div class="console-version">V0.4</div>
+      </header>
+
+      <section class="top-stats">
+        <article class="module stat">
+          <div class="label">Robot</div>
+          <div class="value" id="robotLabel">G1 / Go2</div>
+        </article>
+        <article class="module stat">
+          <div class="label">Scene</div>
+          <div class="value" id="sceneLabel">Auto</div>
+        </article>
+        <article class="module stat">
+          <div class="label">Mode</div>
+          <div class="value cyan" id="modeLabel">Pimsim</div>
+        </article>
+        <article class="module stat">
+          <div class="label">Stream</div>
+          <div class="value teal" id="streamLabel">Boot</div>
+        </article>
+        <article class="module stat">
+          <div class="label">Physics</div>
+          <div class="value" id="physicsLabel">Havok</div>
+        </article>
+        <article class="module stat">
+          <div class="label">Operator</div>
+          <div class="value">Local</div>
+        </article>
+        <button class="module stop-button" id="respawnRobot" type="button">RESPAWN</button>
+      </section>
+
+      <section class="module proof-window">
+        <div class="window-bar">
+          <span>LIVE SIM VIEWPORT</span>
+          <span id="status">starting</span>
         </div>
-        <div class="arm-col">
-          <div class="arm-col-title">Right</div>
-          <div id="rightArmSliders" class="arm-sliders"></div>
+        <div class="video-surface">
+          <canvas id="renderCanvas"></canvas>
+          <div class="viewport-tags">
+            <div class="tag">BABYLON + HAVOK</div>
+            <div class="tag">LCM BRIDGE</div>
+            <div class="tag">BROWSER PHYSICS READY</div>
+          </div>
+          <div class="view-label">WHAT OPERATOR SEES</div>
+          <div class="reticle" aria-hidden="true"></div>
+          <div class="live-status">
+            <div>ACTIVE TASK: <strong id="activeTaskLabel">Manual / policy bridge</strong></div>
+            <div id="speedLabel">SPEED 0.0 M/S</div>
+            <div>VIDEO <span id="videoLabel" class="active">LIVE</span></div>
+            <div id="controlLabel">CONTROL LOCAL</div>
+          </div>
         </div>
-      </div>
-    </div>
-    <div id="hud">
-      <div class="hud-group">
-        <span class="hud-label">View</span>
-        <button id="toggleScene" data-active="true">Scene</button>
-        <button id="toggleCollision" data-active="false">Collision</button>
-        <button id="toggleRobot" data-active="true">Robot</button>
-        <button id="toggleCamera" data-active="true">Camera</button>
-        <button id="toggleLidar" data-active="true">Lidar</button>
-        <button id="toggleDepth" data-active="true">Depth</button>
-        <button id="toggleWire" data-active="false">Wire</button>
-        <button id="forceVisible" data-active="false">Force</button>
-      </div>
-      <div class="hud-group">
-        <span class="hud-label">Policy</span>
-        <button id="policyArm" data-active="false" title="Arm/disarm the coordinator's control tasks">Arm</button>
-        <button id="policyDryRun" data-active="true" title="Dry-run: task computes but coordinator does not write to hardware">Dry-run</button>
-      </div>
-      <div class="hud-group">
-        <span class="hud-label">Arms</span>
-        <button id="armsToggle" data-active="false">Sliders</button>
-        <button id="armsRelease">Release</button>
-      </div>
-      <div class="hud-group">
-        <span class="hud-label">Interact</span>
-        <button id="toggleDrive" data-active="false">Drive</button>
-        <button id="navClick" data-active="false">Nav</button>
-        <button id="pointClick" data-active="false">Point</button>
-        <button id="spawnClick" data-active="false">Spawn</button>
-        <button id="focusRobot">Focus</button>
-        <button id="loadScene">Load Scene</button>
-        <button id="respawnRobot">Respawn</button>
-      </div>
-      <div class="hud-group">
-        <span class="hud-label">Entities</span>
-        <button id="entityAdd" title="Drop a dynamic Havok box above the camera target">Add</button>
-        <button id="entityClear" title="Despawn every entity in the scene">Clear</button>
-      </div>
-      <span id="status">starting</span>
-    </div>
+      </section>
+
+      <aside class="right-stack">
+        <section class="module patrol">
+          <div class="label">Session</div>
+          <div class="session-line"><span>Runtime</span><strong id="runtimeLabel">00:00:00</strong></div>
+          <div class="session-line"><span>Drive</span><strong id="driveStateLabel">Disabled</strong></div>
+          <div class="session-line"><span>Click mode</span><strong id="clickModeLabel">None</strong></div>
+          <div class="session-line"><span>Entities</span><strong id="entityStateLabel">Ready</strong></div>
+        </section>
+
+        <section class="module camera-feed" id="cameraPanel" data-active="true" data-has-frame="false">
+          <div class="panel-header">
+            <span id="cameraLabel">camera</span>
+            <button id="toggleCamera" data-active="true" type="button">Hide</button>
+          </div>
+          <img id="cameraImg" alt="" />
+          <div id="cameraEmpty">waiting for frames</div>
+        </section>
+
+        <section class="module camera-feed secondary" id="workspacePanel" data-active="true" data-has-frame="false">
+          <div class="panel-header">
+            <span id="workspaceLabel">workspace</span>
+          </div>
+          <img id="workspaceImg" alt="" />
+        </section>
+
+        <section class="module log-panel">
+          <div class="label">Session Log</div>
+          <div class="log-list" id="sessionLog">
+            <div class="log-item"><span>--:--</span><span>Console booting</span></div>
+          </div>
+        </section>
+      </aside>
+
+      <section class="module controls-drive">
+        <div class="label">Drive Controls</div>
+        <div class="keys">
+          <div class="key blank"></div>
+          <div class="key">W</div>
+          <div class="key blank"></div>
+          <div class="key">A</div>
+          <div class="key">S</div>
+          <div class="key">D</div>
+        </div>
+        <button id="toggleDrive" data-active="false" type="button">Enable Drive</button>
+      </section>
+
+      <section class="module command-panel" id="hud">
+        <div class="control-head">
+          <div class="label">Operator Actions</div>
+          <div class="badge">LIVE CONTROLS</div>
+        </div>
+        <div class="action-grid">
+          <button id="policyArm" data-active="false" type="button">Arm Policy</button>
+          <button id="policyDryRun" data-active="true" type="button">Dry Run</button>
+          <button id="navClick" data-active="false" type="button">Nav Click</button>
+          <button id="pointClick" data-active="false" type="button">Point Click</button>
+          <button id="spawnClick" data-active="false" type="button">Spawn Point</button>
+          <button id="focusRobot" type="button">Focus Robot</button>
+          <button id="loadScene" type="button">Load Scene</button>
+          <button id="entityAdd" type="button">Drop Box</button>
+          <button id="entityClear" type="button">Clear Entities</button>
+          <button id="armsToggle" data-active="false" type="button">Arm Sliders</button>
+          <button id="armsRelease" type="button">Release Arms</button>
+        </div>
+      </section>
+
+      <section class="module view-panel">
+        <div class="control-head">
+          <div class="label">Viewport Layers</div>
+          <div class="badge">DISPLAY</div>
+        </div>
+        <div class="view-grid">
+          <button id="toggleScene" data-active="true" type="button">Scene</button>
+          <button id="toggleCollision" data-active="false" type="button">Collision</button>
+          <button id="toggleRobot" data-active="true" type="button">Robot</button>
+          <button id="toggleLidar" data-active="true" type="button">Lidar</button>
+          <button id="toggleDepth" data-active="true" type="button">Depth</button>
+          <button id="toggleWire" data-active="false" type="button">Wire</button>
+          <button id="forceVisible" data-active="false" type="button">Force Visible</button>
+        </div>
+      </section>
+
+      <section class="module arms-panel" id="armsPanel" data-active="false">
+        <div class="panel-header">
+          <span id="armsHeader">Arm joints</span>
+          <span class="panel-note">direct joint command</span>
+        </div>
+        <div id="armsColumns">
+          <div class="arm-col">
+            <div class="arm-col-title">Left</div>
+            <div id="leftArmSliders" class="arm-sliders"></div>
+          </div>
+          <div class="arm-col">
+            <div class="arm-col-title">Right</div>
+            <div id="rightArmSliders" class="arm-sliders"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/ui.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>
