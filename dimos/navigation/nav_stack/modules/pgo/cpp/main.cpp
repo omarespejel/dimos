@@ -368,8 +368,10 @@ int main(int argc, char** argv)
 
         if (!pgo.addKeyPose(cloud_with_pose)) {
             // Not a keyframe — still broadcast TF and corrected odom
+            M3D corr_r = pgo.offsetR() * cloud_with_pose.pose.r;
+            V3D corr_t = pgo.offsetR() * cloud_with_pose.pose.t + pgo.offsetT();
             nav_msgs::Odometry corrected = build_odometry(
-                pgo.offsetR(), pgo.offsetT(), cur_time, frame_id, child_frame_id);
+                corr_r, corr_t, cur_time, frame_id, child_frame_id);
             lcm.publish(corrected_odom_topic, &corrected);
 
             auto tf_msg = build_tf_message(
@@ -413,9 +415,11 @@ int main(int argc, char** argv)
                     cloud_with_pose.pose.t.x(), cloud_with_pose.pose.t.y(), cloud_with_pose.pose.t.z());
         }
 
-        // Publish corrected odometry (map → odom correction)
+        // Publish corrected odometry
+        M3D corr_r = pgo.offsetR() * cloud_with_pose.pose.r;
+        V3D corr_t = pgo.offsetR() * cloud_with_pose.pose.t + pgo.offsetT();
         nav_msgs::Odometry corrected = build_odometry(
-            pgo.offsetR(), pgo.offsetT(), cur_time, frame_id, child_frame_id);
+            corr_r, corr_t, cur_time, frame_id, child_frame_id);
         lcm.publish(corrected_odom_topic, &corrected);
 
         auto tf_msg = build_tf_message(
