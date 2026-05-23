@@ -1484,6 +1484,85 @@ function buildPrimitiveMesh(descriptor) {
   }
 }
 
+async function buildMeshEntity(descriptor) {
+  if (!descriptor.mesh_ref) {
+    console.warn(`entity_spawn ${descriptor.entity_id}: mesh shape requires mesh_ref`);
+    return null;
+  }
+  let result;
+  try {
+    result = await BABYLON.SceneLoader.ImportMeshAsync(
+      null,
+      "/assets/",
+      descriptor.mesh_ref,
+      scene,
+    );
+  } catch (error) {
+    console.warn(`entity_spawn ${descriptor.entity_id}: failed to import mesh_ref`, error);
+    return null;
+  }
+
+  for (const light of result.lights || []) light.dispose();
+  for (const camera of result.cameras || []) camera.dispose();
+
+  const nodes = [...(result.meshes || []), ...(result.transformNodes || [])];
+  const meshes = (result.meshes || []).filter(
+    (mesh) => mesh.getTotalVertices && mesh.getTotalVertices() > 0,
+  );
+  if (meshes.length === 0) {
+    console.warn(`entity_spawn ${descriptor.entity_id}: mesh_ref has no renderable meshes`);
+    for (const node of nodes) node.dispose?.();
+    return null;
+  }
+
+  for (const node of nodes) {
+    node.computeWorldMatrix?.(true);
+    if ("isPickable" in node) {
+      node.isPickable = false;
+    }
+  }
+
+  const collider = BABYLON.Mesh.MergeMeshes(
+    meshes,
+    false,
+    true,
+    undefined,
+    false,
+    true,
+  );
+  if (!collider) {
+    console.warn(`entity_spawn ${descriptor.entity_id}: failed to merge mesh collider`);
+    for (const node of nodes) node.dispose?.();
+    return null;
+  }
+  collider.computeWorldMatrix(true);
+  collider.bakeCurrentTransformIntoVertices();
+  collider.name = `entity:${descriptor.entity_id}`;
+  collider.position.set(0, 0, 0);
+  collider.scaling.set(1, 1, 1);
+  collider.rotationQuaternion = BABYLON.Quaternion.Identity();
+  collider.isVisible = false;
+  collider.isPickable = false;
+  collider.metadata = { dimosEntityCollider: true, entityId: descriptor.entity_id };
+
+  for (const node of nodes) {
+    if (node === collider) continue;
+    if (!node.parent) {
+      node.parent = collider;
+    }
+  }
+  return { mesh: collider, visualNodes: nodes };
+}
+
+async function buildEntityMesh(descriptor) {
+  if (descriptor.shape_hint === "mesh") {
+    return buildMeshEntity(descriptor);
+  }
+  const mesh = buildPrimitiveMesh(descriptor);
+  if (!mesh) return null;
+  return { mesh, visualNodes: [] };
+}
+
 function applyPoseWire(mesh, pose) {
   mesh.position.set(pose.x || 0, pose.y || 0, pose.z || 0);
   if (!mesh.rotationQuaternion) {
@@ -1539,13 +1618,14 @@ async function handleEntitySpawn(payload) {
     console.warn(`entity_spawn ${id}: physics not ready, dropping`);
     return;
   }
-  const mesh = buildPrimitiveMesh(desc);
-  if (!mesh) {
+  const built = await buildEntityMesh(desc);
+  if (!built) {
     console.warn(
-      `entity_spawn ${id}: cannot build shape_hint=${desc.shape_hint}; use a primitive collider`,
+      `entity_spawn ${id}: cannot build shape_hint=${desc.shape_hint}`,
     );
     return;
   }
+  const mesh = built.mesh;
   applyPoseWire(mesh, payload.pose || {});
 
   // mass=0 → kinematic (program-driven via set_entity_pose). Matches the
@@ -1570,7 +1650,10 @@ async function handleEntitySpawn(payload) {
   if (wantsKinematic && aggregate.body && "disablePreStep" in aggregate.body) {
     aggregate.body.disablePreStep = false;
   }
-  const visualNodes = await attachEntityVisual(desc, mesh);
+  let visualNodes = built.visualNodes;
+  if (desc.shape_hint !== "mesh") {
+    visualNodes = await attachEntityVisual(desc, mesh);
+  }
   entities.set(id, {
     mesh,
     aggregate,

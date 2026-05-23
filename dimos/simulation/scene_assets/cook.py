@@ -31,8 +31,8 @@ from dimos.simulation.mujoco.collision_spec import CollisionSpec
 from dimos.simulation.mujoco.scene_mesh_to_mjcf import load_or_bake
 from dimos.simulation.scene_assets.browser_collision import cook_browser_collision
 from dimos.simulation.scene_assets.inspect import inspect_scene_asset
-from dimos.simulation.scene_assets.interactables import cook_interactable_assets
 from dimos.simulation.scene_assets.mesh_scene import SceneMeshAlignment
+from dimos.simulation.scene_assets.plan import build_scene_cook_plan
 from dimos.simulation.scene_assets.sidecar import SceneCookSidecar
 from dimos.simulation.scene_assets.spec import (
     BrowserCollisionSpec,
@@ -41,6 +41,7 @@ from dimos.simulation.scene_assets.spec import (
     SceneCookSpec,
     ScenePackage,
 )
+from dimos.simulation.scene_assets.visual_blender import cook_plan_visual_assets
 from dimos.simulation.scene_assets.visual_glb import cook_browser_visual
 from dimos.utils.logging_config import setup_logger
 
@@ -48,6 +49,7 @@ logger = setup_logger()
 
 SCENE_PACKAGE_CACHE_DIR = Path.home() / ".cache" / "dimos" / "scene_packages"
 _CACHE_KEY_LEN = 12
+_COOK_VERSION = 2
 
 
 def cook_scene_package(
@@ -81,7 +83,6 @@ def cook_scene_package(
         mujoco=mujoco,
     )
     sidecar = cook_sidecar or SceneCookSidecar.auto_discover(source)
-    effective_collision_spec = sidecar.effective_collision_spec(collision_spec)
 
     package_dir = (
         Path(output_dir).expanduser().resolve()
@@ -94,29 +95,41 @@ def cook_scene_package(
     stats: dict[str, Any] = {
         "source": inspect_scene_asset(source).to_json_dict(),
         "cook_spec": _cook_spec_json(cook_spec),
+        "cook_version": _COOK_VERSION,
     }
     if sidecar.path is not None or sidecar.interactables:
         stats["authored_sidecar"] = sidecar.to_json_dict()
 
-    entities = cook_interactable_assets(
+    plan = build_scene_cook_plan(
         source,
-        package_dir,
         sidecar=sidecar,
         alignment=align,
-        rebake=rebake,
+        output_dir=package_dir,
+        collision_spec=collision_spec,
     )
+    stats["cook_plan"] = plan.to_json_dict()
+
+    entities = plan.entities_metadata()
     if entities:
         stats["interactables"] = {
             "count": len(entities),
             "ids": [entity["id"] for entity in entities],
-            "static_visual_filter": "blender-prepass",
+            "static_visual_filter": "plan/blender",
         }
 
+    visual_source = source
+    if plan.has_entities and visual.enabled:
+        visual_source = cook_plan_visual_assets(
+            source,
+            package_dir,
+            plan=plan,
+            rebake=rebake,
+        )
+
     visual_result = cook_browser_visual(
-        source,
+        visual_source,
         browser_dir,
         spec=visual,
-        exclude_prim_patterns=sidecar.visual_exclude_patterns(),
         rebake=rebake,
     )
     if visual_result is not None:
@@ -130,7 +143,7 @@ def cook_scene_package(
         browser_dir,
         alignment=SceneMeshAlignment(y_up=False),
         spec=browser_collision,
-        collision_spec=effective_collision_spec,
+        collision_spec=plan.collision_spec,
         rebake=rebake,
     )
     if browser_collision_result is not None:
@@ -146,7 +159,7 @@ def cook_scene_package(
             robot_mjcf_path=robot_mjcf_path,
             alignment=align,
             meshdir=meshdir,
-            collision_spec=effective_collision_spec,
+            collision_spec=plan.collision_spec,
             include_visual_mesh=mujoco.include_visual_mesh,
             rebake=rebake,
         )
@@ -184,6 +197,7 @@ def _cache_key(
 ) -> str:
     h = hashlib.sha256()
     h.update(cook_spec.source_path.read_bytes())
+    h.update(str(_COOK_VERSION).encode())
     h.update(json.dumps(_cook_spec_json(cook_spec), sort_keys=True).encode())
     h.update(json.dumps(sidecar.to_json_dict(), sort_keys=True).encode())
     if robot_mjcf_path is not None:

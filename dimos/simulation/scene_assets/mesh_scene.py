@@ -33,10 +33,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
 import open3d as o3d  # type: ignore[import-untyped]
+
+_TRIMESH_DUPLICATE_SUFFIX_RE = re.compile(r"_[0-9a-f]{6}$", re.IGNORECASE)
 
 
 @dataclass
@@ -415,6 +418,9 @@ class ScenePrimMesh:
     prim_path: str | None = None
     """Original scene-graph path when the source format provides one."""
 
+    visual_node_name: str | None = None
+    """Stable source node name used by visual extraction when available."""
+
 
 def split_disconnected_scene_prims(
     prims: list[ScenePrimMesh],
@@ -553,6 +559,8 @@ def _load_glb_prims(path: Path, alignment: SceneMeshAlignment) -> list[ScenePrim
 
     scene = loaded
     prims: list[ScenePrimMesh] = []
+    name_counts: dict[str, int] = {}
+    prim_path_counts: dict[str, int] = {}
     for node_name in scene.graph.nodes_geometry:
         xform, geom_name = scene.graph[node_name]
         geom = scene.geometry.get(geom_name)
@@ -572,16 +580,39 @@ def _load_glb_prims(path: Path, alignment: SceneMeshAlignment) -> list[ScenePrim
         # Scene-root → dimos world via SceneMeshAlignment.
         pts_world = (R @ (s * pts_stage).T).T + T
 
-        clean = "".join(c if c.isalnum() else "_" for c in str(node_name))
+        stable_node = _stable_trimesh_node_name(str(node_name))
+        stable_prim_path = _unique_stable_name(
+            f"{stable_node}_{geom_name}",
+            prim_path_counts,
+        )
+        clean = _unique_stable_name(_sanitize_scene_name(stable_prim_path), name_counts)
         prims.append(
             ScenePrimMesh(
-                name=f"{clean}__{len(prims)}",
+                name=clean,
                 vertices=pts_world.astype(np.float32),
                 triangles=faces,
-                prim_path=str(node_name),
+                prim_path=stable_prim_path,
+                visual_node_name=stable_node,
             )
         )
-    return prims
+    return sorted(prims, key=lambda prim: prim.prim_path or prim.name)
+
+
+def _stable_trimesh_node_name(node_name: str) -> str:
+    """Drop random duplicate suffixes that trimesh adds to glTF nodes."""
+    return _TRIMESH_DUPLICATE_SUFFIX_RE.sub("", node_name)
+
+
+def _sanitize_scene_name(raw: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in raw)
+
+
+def _unique_stable_name(raw: str, counts: dict[str, int]) -> str:
+    count = counts.get(raw, 0)
+    counts[raw] = count + 1
+    if count == 0:
+        return raw
+    return f"{raw}__{count:03d}"
 
 
 def load_scene_prims(

@@ -22,13 +22,13 @@ should be removed from static cooks and respawned as pimsim entities.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 import fnmatch
 import json
 from pathlib import Path
 from typing import Any, Literal
 
-from dimos.simulation.mujoco.collision_spec import CollisionSpec, OverrideConfig
+from dimos.simulation.mujoco.collision_spec import CollisionSpec
 from dimos.simulation.scene_assets.mesh_scene import ScenePrimMesh
 from dimos.utils.logging_config import setup_logger
 
@@ -36,7 +36,6 @@ logger = setup_logger()
 
 CookEntitySpawn = Literal["initial", "manual"]
 CookEntityKind = Literal["dynamic", "kinematic", "static"]
-CookEntityShape = Literal["box", "sphere", "cylinder", "mesh"]
 
 _COOK_SIDECAR_SUFFIXES = (".cook.json", ".scene.json")
 
@@ -86,8 +85,14 @@ class InteractableSpec:
         return raw
 
     def matches(self, prim: ScenePrimMesh) -> bool:
-        prim_path = prim.prim_path or prim.name
-        return any(match_prim_pattern(prim_path, pattern) for pattern in self.source_prim_paths)
+        prim_candidates = tuple(
+            candidate for candidate in (prim.visual_node_name, prim.prim_path) if candidate
+        )
+        return any(
+            match_prim_pattern(candidate, pattern, include_sanitized=False)
+            for candidate in prim_candidates
+            for pattern in self.source_prim_paths
+        )
 
 
 @dataclass(frozen=True)
@@ -137,28 +142,6 @@ class SceneCookSidecar:
             return cls(path=legacy_collision, collision=CollisionSpec.from_json(legacy_collision))
         return cls()
 
-    def effective_collision_spec(
-        self, base_collision: CollisionSpec | None = None
-    ) -> CollisionSpec:
-        """Return collision policy with interactables removed from static cooks."""
-        collision = base_collision or self.collision
-        prim_overrides: dict[str, OverrideConfig] = dict(collision.prim_overrides)
-        for interactable in self.interactables:
-            if not interactable.remove_from_static:
-                continue
-            for pattern in interactable.source_prim_paths:
-                prim_overrides.setdefault(pattern, {"type": "skip"})
-        return replace(collision, prim_overrides=prim_overrides)
-
-    def visual_exclude_patterns(self) -> list[str]:
-        patterns: list[str] = []
-        for interactable in self.interactables:
-            if interactable.remove_from_static:
-                for pattern in interactable.source_prim_paths:
-                    patterns.append(pattern)
-                    patterns.append(pattern.lstrip("/").rsplit("/", 1)[-1])
-        return patterns
-
     def to_json_dict(self) -> dict[str, Any]:
         return {
             "path": str(self.path) if self.path else None,
@@ -167,11 +150,18 @@ class SceneCookSidecar:
         }
 
 
-def match_prim_pattern(prim_path: str, pattern: str) -> bool:
+def match_prim_pattern(
+    prim_path: str,
+    pattern: str,
+    *,
+    include_sanitized: bool = True,
+) -> bool:
     stripped = prim_path.lstrip("/")
     sanitized = "".join(c if c.isalnum() else "_" for c in stripped)
     basename = stripped.rsplit("/", 1)[-1]
-    candidates = (prim_path, stripped, sanitized, basename)
+    candidates = [prim_path, stripped, basename]
+    if include_sanitized:
+        candidates.append(sanitized)
     return any(fnmatch.fnmatchcase(candidate, pattern) for candidate in candidates)
 
 

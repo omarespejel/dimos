@@ -45,18 +45,15 @@ _GLTFPACK_INPUT_SUFFIXES = {".gltf", ".glb", ".obj"}
 _COMMAND_TAIL_LINES = 30
 
 _BLENDER_SCRIPT = r"""
-import fnmatch
-import json
 import pathlib
 import sys
 
 import bpy
 
-source = pathlib.Path(sys.argv[-5])
-target = pathlib.Path(sys.argv[-4])
-simplify_ratio = float(sys.argv[-3])
-max_texture_size = int(sys.argv[-2])
-exclude_patterns = json.loads(sys.argv[-1])
+source = pathlib.Path(sys.argv[-4])
+target = pathlib.Path(sys.argv[-3])
+simplify_ratio = float(sys.argv[-2])
+max_texture_size = int(sys.argv[-1])
 suffix = source.suffix.lower()
 
 bpy.ops.object.select_all(action="SELECT")
@@ -78,19 +75,6 @@ else:
 for obj in list(bpy.context.scene.objects):
     if obj.type != "MESH":
         bpy.data.objects.remove(obj, do_unlink=True)
-
-if exclude_patterns:
-    for obj in list(bpy.context.scene.objects):
-        candidates = {obj.name, obj.name_full}
-        if obj.parent is not None:
-            candidates.add(obj.parent.name)
-            candidates.add(obj.parent.name_full)
-        if any(
-            fnmatch.fnmatchcase(candidate, pattern)
-            for candidate in candidates
-            for pattern in exclude_patterns
-        ):
-            bpy.data.objects.remove(obj, do_unlink=True)
 
 if max_texture_size > 0:
     for image in bpy.data.images:
@@ -149,7 +133,6 @@ def cook_browser_visual(
     output_dir: str | Path,
     *,
     spec: BrowserVisualSpec | None = None,
-    exclude_prim_patterns: list[str] | None = None,
     rebake: bool = False,
 ) -> BrowserVisualCookResult | None:
     """Write the browser visual GLB for a scene package.
@@ -178,7 +161,7 @@ def cook_browser_visual(
     with tempfile.TemporaryDirectory(prefix="dimos-visual-cook-") as temp_dir_raw:
         temp_dir = Path(temp_dir_raw)
         temp_out = temp_dir / out_path.name
-        tool, report = _cook_visual(source, temp_out, visual_spec, exclude_prim_patterns or [])
+        tool, report = _cook_visual(source, temp_out, visual_spec)
         stats = inspect_scene_asset(temp_out).to_json_dict()
         _validate_output(source_stats, stats, visual_spec)
         if report is not None:
@@ -198,12 +181,9 @@ def _cook_visual(
     source: Path,
     target: Path,
     spec: BrowserVisualSpec,
-    exclude_prim_patterns: list[str],
 ) -> tuple[str, dict[str, Any] | None]:
     optimizer = spec.optimizer.lower()
     if optimizer == "copy":
-        if exclude_prim_patterns:
-            raise RuntimeError("copy visual optimizer cannot remove authored interactables")
         if source.suffix.lower() != ".glb":
             raise RuntimeError("copy visual optimizer requires a GLB source")
         shutil.copy2(source, target)
@@ -214,11 +194,10 @@ def _cook_visual(
             target,
             simplify_ratio=spec.simplify_ratio,
             max_texture_size=spec.max_texture_size,
-            exclude_prim_patterns=exclude_prim_patterns,
         )
         return ("blender", None)
     if optimizer == "gltfpack":
-        return _export_with_gltfpack(source, target, spec, exclude_prim_patterns)
+        return _export_with_gltfpack(source, target, spec)
     raise ValueError(f"unknown browser visual optimizer: {spec.optimizer}")
 
 
@@ -228,7 +207,6 @@ def _export_with_blender(
     *,
     simplify_ratio: float = 1.0,
     max_texture_size: int | None = None,
-    exclude_prim_patterns: list[str] | None = None,
 ) -> None:
     blender = shutil.which("blender")
     if blender is None:
@@ -252,7 +230,6 @@ def _export_with_blender(
                 str(target),
                 str(simplify_ratio),
                 str(max_texture_size or 0),
-                json.dumps(exclude_prim_patterns or []),
             ],
             "blender",
         )
@@ -264,20 +241,15 @@ def _export_with_gltfpack(
     source: Path,
     target: Path,
     spec: BrowserVisualSpec,
-    exclude_prim_patterns: list[str],
 ) -> tuple[str, dict[str, Any] | None]:
     command = _gltfpack_command()
     source_for_gltfpack = source
     with tempfile.TemporaryDirectory(prefix="dimos-gltfpack-source-") as temp_dir_raw:
-        if exclude_prim_patterns or source.suffix.lower() not in _GLTFPACK_INPUT_SUFFIXES:
+        if source.suffix.lower() not in _GLTFPACK_INPUT_SUFFIXES:
             if source.suffix.lower() not in _BLENDER_INPUT_SUFFIXES:
                 raise RuntimeError(f"unsupported visual source suffix: {source.suffix}")
             source_for_gltfpack = Path(temp_dir_raw) / "source.glb"
-            _export_with_blender(
-                source,
-                source_for_gltfpack,
-                exclude_prim_patterns=exclude_prim_patterns,
-            )
+            _export_with_blender(source, source_for_gltfpack)
 
         report_path = target.with_suffix(".gltfpack.json")
         args = [
