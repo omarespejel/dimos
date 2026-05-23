@@ -25,7 +25,13 @@ from reactivex.observable import Observable
 import rerun.blueprint as rrb
 
 from dimos.agents.annotation import skill
-from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
+from dimos.constants import (
+    DEFAULT_CAMERA_FRAME,
+    DEFAULT_CAMERA_OPTICAL_FRAME,
+    DEFAULT_CAPACITY_COLOR_IMAGE,
+    DEFAULT_ROBOT_FRAME,
+    DEFAULT_THREAD_JOIN_TIMEOUT,
+)
 from dimos.core.coordination.module_coordinator import ModuleCoordinator
 from dimos.core.core import rpc
 from dimos.core.global_config import GlobalConfig
@@ -67,10 +73,10 @@ class Go2Mode(str, Enum):
 class ConnectionConfig(ModuleConfig):
     ip: str = Field(default_factory=lambda m: m["g"].robot_ip)
     mode: Go2Mode = Go2Mode.DEFAULT
-    frame_id: str | None = "base_link"
-    camera_link_frame: str = "camera_link"
-    camera_optical_frame: str = "camera_optical"
-    static_transform_publish_rate: float = 1.0
+    frame_id: str | None = DEFAULT_ROBOT_FRAME
+    camera_link_frame: str = DEFAULT_CAMERA_FRAME
+    camera_optical_frame: str = DEFAULT_CAMERA_OPTICAL_FRAME
+    static_publish_rate: float = 1.0
 
 
 class Go2ConnectionProtocol(Protocol):
@@ -204,14 +210,14 @@ class GO2Connection(Module, Camera, Pointcloud):
         camera_link=Transform(
             translation=Vector3(0.3, 0.0, 0.0),
             rotation=Quaternion(0.0, 0.0, 0.0, 1.0),
-            frame_id="base_link",
-            child_frame_id="camera_link",
+            frame_id=DEFAULT_ROBOT_FRAME,
+            child_frame_id=DEFAULT_CAMERA_FRAME,
         ),
         camera_optical=Transform(
             translation=Vector3(0.0, 0.0, 0.0),
             rotation=Quaternion(-0.5, 0.5, -0.5, 0.5),
-            frame_id="camera_link",
-            child_frame_id="camera_optical",
+            frame_id=DEFAULT_CAMERA_FRAME,
+            child_frame_id=DEFAULT_CAMERA_OPTICAL_FRAME,
         ),
     )
     _static_publish_thread: Thread | None = None
@@ -284,9 +290,9 @@ class GO2Connection(Module, Camera, Pointcloud):
 
     def _static_publish(self) -> None:
         frame_remap = {
-            "base_link": self.frame_id,
-            "camera_link": self.config.camera_link_frame,
-            "camera_optical": self.config.camera_optical_frame,
+            DEFAULT_ROBOT_FRAME: self.frame_id,
+            DEFAULT_CAMERA_FRAME: self.config.camera_link_frame,
+            DEFAULT_CAMERA_OPTICAL_FRAME: self.config.camera_optical_frame,
         }
         stamped_statics = [
             Transform(
@@ -297,14 +303,15 @@ class GO2Connection(Module, Camera, Pointcloud):
             )
             for t in self.static_transforms.values()
         ]
-        period = 1.0 / self.config.static_transform_publish_rate
-        while True:
-            now = time.time()
-            for st in stamped_statics:
-                st.ts = now
-            self.tf.publish(*stamped_statics)
-            self.camera_info.publish(self.camera_info_static)
-            time.sleep(period)
+        if self.config.static_publish_rate > 0:
+            period = 1.0 / self.config.static_publish_rate
+            while True:
+                now = time.time()
+                for st in stamped_statics:
+                    st.ts = now
+                self.tf.publish(*stamped_statics)
+                self.camera_info.publish(self.camera_info_static)
+                time.sleep(period)
 
     @rpc
     def move(self, twist: Twist, duration: float = 0.0) -> bool:
@@ -359,8 +366,6 @@ class GO2Connection(Module, Camera, Pointcloud):
 
 
 def deploy(dimos: ModuleCoordinator, ip: str, prefix: str = "") -> "ModuleProxy":
-    from dimos.constants import DEFAULT_CAPACITY_COLOR_IMAGE
-
     connection = dimos.deploy(GO2Connection, ip=ip)
 
     connection.pointcloud.transport = pSHMTransport(
