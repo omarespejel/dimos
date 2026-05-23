@@ -82,15 +82,6 @@ def create_nav_stack(
         path_follower_config.setdefault("goal_tolerance", waypoint_threshold)
         simple_planner_config.setdefault("goal_reached_threshold", waypoint_threshold)
 
-    pgo_module: Blueprint = PGO.blueprint(
-        **{
-            "frame_id": map_frame,
-            "child_frame_id": odom_frame,
-            "body_frame": base_link_frame,
-            **(pgo or {}),
-        }
-    )
-
     modules: list[Blueprint] = [
         TerrainAnalysis.blueprint(
             **{
@@ -153,7 +144,13 @@ def create_nav_stack(
                 **path_follower_config,
             }
         ),
-        pgo_module,
+        PGO.blueprint(
+            **{
+                "frame_id": map_frame,
+                "child_frame_id": odom_frame,
+                **(pgo or {}),
+            }
+        ),
     ]
     if planner == "simple":
         merged_simple_planner_config: dict[str, Any] = {
