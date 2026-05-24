@@ -12,358 +12,224 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Internal PGO/ICP machinery (gtsam-backed). Public consumers should use
-# the Stream-shaped API in pgo2.py — pgo_keyframes, keyframes_to_corrections,
-# make_interpolator, apply_corrections. The classes here (_SimplePGO, PGOConfig,
-# _KeyPose) are imported from pgo2 to do the heavy lifting.
+"""PGO drift corrections as composable Stream stages.
+
+Pipeline:
+
+    lidar: Stream[PointCloud2]
+        -> pgo_keyframes(...)            -> Stream[Keyframe]
+        -> keyframes_to_corrections(...) -> Stream[Transform]   (world_corrected <- world_raw)
+        -> apply_corrections(any_stream, corrections) -> Stream[T]   (obs.pose shuffled)
+
+The math: per keyframe, the drift correction is
+    R_corr = R_global @ R_local.T
+    t_corr = t_global - R_corr @ t_local
+and at arbitrary ts we SLERP R between the two bracketing keyframes and linear-lerp t,
+clipping out-of-range to endpoints.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
-import gtsam  # type: ignore[import-not-found,import-untyped]
 import numpy as np
-import open3d as o3d  # type: ignore[import-untyped]
-import open3d.core as o3c  # type: ignore[import-untyped]
-from scipy.spatial import KDTree
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
-from dimos.core.module import ModuleConfig
-from dimos.utils.logging_config import setup_logger
+from dimos.memory2.store.memory import MemoryStore
+from dimos.memory2.stream import Stream
+from dimos.memory2.type.observation import Observation
+from dimos.msgs.geometry_msgs.Quaternion import Quaternion
+from dimos.msgs.geometry_msgs.Transform import Transform
+from dimos.msgs.geometry_msgs.Vector3 import Vector3
+from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 
-FRAME_MAP = "world"
-
-logger = setup_logger()
-
-
-class PGOConfig(ModuleConfig):
-    world_frame: str = FRAME_MAP
-
-    # Keyframe detection
-    key_pose_delta_trans: float = 0.5
-    key_pose_delta_deg: float = 10.0
-
-    # Loop closure
-    loop_search_radius: float = 2.0
-    loop_time_thresh: float = 20.0
-    loop_score_thresh: float = 0.3
-    loop_submap_half_range: int = 10
-    min_icp_inliers: int = 10
-    min_keyframes_for_loop_search: int = 10
-    loop_closure_extra_iterations: int = 4
-    submap_resolution: float = 0.2
-    min_loop_detect_duration: float = 5.0
-
-    # Input mode
-    unregister_input: bool = True  # Transform world-frame scans to body-frame using odom
-
-    # Global map
-    publish_global_map: bool = True
-    global_map_publish_rate: float = 0.5
-    global_map_voxel_size: float = 0.15
-
-    # ICP
-    max_icp_iterations: int = 50
-    max_icp_correspondence_dist: float = 1.0
+T = TypeVar("T")
 
 
-@dataclass
-class _KeyPose:
-    r_local: np.ndarray  # 3x3 rotation in local/odom frame
-    t_local: np.ndarray  # 3-vec translation in local/odom frame
-    r_global: np.ndarray  # 3x3 corrected rotation
-    t_global: np.ndarray  # 3-vec corrected translation
-    timestamp: float
-    body_cloud: np.ndarray  # Nx3 points in body frame
+@dataclass(frozen=True)
+class Keyframe:
+    ts: float
+    r_local: np.ndarray  # 3x3
+    t_local: np.ndarray  # (3,)
+    r_global: np.ndarray  # 3x3
+    t_global: np.ndarray  # (3,)
 
 
-def _icp(
-    source: np.ndarray,
-    target: np.ndarray,
-    max_iter: int = 50,
-    max_dist: float = 1.0,
-    tol: float = 1e-6,
-    min_inliers: int = 10,
-    init: np.ndarray | None = None,
-) -> tuple[np.ndarray, float]:
-    """Point-to-point ICP using Open3D's tensor pipeline.
+def pgo_keyframes(
+    stream: Stream[PointCloud2],
+    *,
+    on_frame: Callable[[Any], None] | None = None,
+    **pgo_cfg: Any,
+) -> Stream[Keyframe]:
+    """Run PGO across a pose-stamped point-cloud stream; return one obs per keyframe."""
+    # Imported here to keep pgo_internals.py the only place that imports gtsam at module scope.
+    from dimos.mapping.relocalization.pgo_internals import PGOConfig, _SimplePGO
 
-    Returns ``(T, fitness)`` where ``fitness`` is mean squared inlier
-    distance (m²) — same semantic as the previous SVD implementation, so
-    the GTSAM noise model in ``smooth_and_update`` keeps working.
-    """
-    if len(source) < min_inliers or len(target) < min_inliers:
-        return np.eye(4), float("inf")
+    cfg = PGOConfig(**pgo_cfg)
+    pgo = _SimplePGO(cfg)
 
-    cpu = o3c.Device("CPU:0")
-    src_pcd = o3d.t.geometry.PointCloud(o3c.Tensor(source.astype(np.float32), device=cpu))
-    tgt_pcd = o3d.t.geometry.PointCloud(o3c.Tensor(target.astype(np.float32), device=cpu))
+    for obs in stream:
+        if on_frame is not None:
+            on_frame(obs)
+        if obs.pose is None:
+            continue
+        x, y, z, qx, qy, qz, qw = obs.pose
+        if x == 0 and y == 0 and z == 0:
+            continue
+        if qx == 0 and qy == 0 and qz == 0 and qw == 0:
+            continue
+        r = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
+        t = np.array([x, y, z])
+        points, _ = obs.data.as_numpy()
+        if len(points) == 0:
+            continue
+        body_pts = (
+            (r.T @ (points[:, :3].T - t[:, None])).T if cfg.unregister_input else points[:, :3]
+        )
+        if pgo.add_key_pose(r, t, obs.ts, body_pts):
+            pgo.search_for_loops()
+            pgo.smooth_and_update()
 
-    # Normals on the target enable point-to-plane ICP, which converges
-    # tighter than point-to-point on indoor scenes (walls give unambiguous
-    # normals that resolve the slide-along-wall ambiguity).
-    tgt_pcd.estimate_normals(max_nn=30, radius=0.3)
+    kps = sorted(pgo._key_poses, key=lambda kp: kp.timestamp)
+    kps = [kp for i, kp in enumerate(kps) if i == 0 or kp.timestamp > kps[i - 1].timestamp]
 
-    init_T = (
-        o3c.Tensor(init.astype(np.float64), dtype=o3c.float64, device=cpu)
-        if init is not None
-        else o3c.Tensor.eye(4, dtype=o3c.float64, device=cpu)
-    )
-
-    # Silence Open3D's "0 correspondence" warning — we deliberately use a
-    # tight max_correspondence_distance and reject loops with poor fitness;
-    # the warning is informational, not an error.
-    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
-        result = o3d.t.pipelines.registration.icp(
-            source=src_pcd,
-            target=tgt_pcd,
-            max_correspondence_distance=max_dist,
-            init_source_to_target=init_T,
-            estimation_method=o3d.t.pipelines.registration.TransformationEstimationPointToPlane(),
-            criteria=o3d.t.pipelines.registration.ICPConvergenceCriteria(
-                relative_fitness=tol,
-                relative_rmse=tol,
-                max_iteration=max_iter,
+    mem = MemoryStore()
+    out: Stream[Keyframe] = mem.stream("keyframes", Keyframe)
+    for kp in kps:
+        out.append(
+            Keyframe(
+                ts=kp.timestamp,
+                r_local=np.ascontiguousarray(kp.r_local),
+                t_local=np.ascontiguousarray(kp.t_local),
+                r_global=np.ascontiguousarray(kp.r_global),
+                t_global=np.ascontiguousarray(kp.t_global),
             ),
+            ts=kp.timestamp,
         )
-
-    fitness_inlier_frac = float(result.fitness)
-    if fitness_inlier_frac == 0.0:
-        return np.eye(4), float("inf")
-
-    rmse = float(result.inlier_rmse)
-    T = result.transformation.numpy()
-    # Return mean squared inlier distance (m²) to match prior _icp contract.
-    return T, rmse * rmse
+    return out
 
 
-def _voxel_downsample(pts: np.ndarray, voxel_size: float) -> np.ndarray:
-    if len(pts) == 0 or voxel_size <= 0:
-        return pts
-    keys = np.floor(pts / voxel_size).astype(np.int32)
-    _, idx = np.unique(keys, axis=0, return_index=True)
-    return pts[idx]
-
-
-class _SimplePGO:
-    def __init__(self, config: PGOConfig) -> None:
-        self._cfg = config
-        self._key_poses: list[_KeyPose] = []
-        self._history_pairs: list[tuple[int, int]] = []
-        self._cache_pairs: list[dict[str, Any]] = []
-        self._r_offset = np.eye(3)
-        self._t_offset = np.zeros(3)
-
-        params = gtsam.ISAM2Params()
-        params.setRelinearizeThreshold(0.01)
-        params.relinearizeSkip = 1
-        self._isam2 = gtsam.ISAM2(params)
-        self._graph = gtsam.NonlinearFactorGraph()
-        self._values = gtsam.Values()
-
-    def is_key_pose(self, r: np.ndarray, t: np.ndarray) -> bool:
-        if not self._key_poses:
-            return True
-        last = self._key_poses[-1]
-        delta_trans = np.linalg.norm(t - last.t_local)
-        # Angular distance via quaternion dot product
-        q_cur = Rotation.from_matrix(r).as_quat()  # [x,y,z,w]
-        q_last = Rotation.from_matrix(last.r_local).as_quat()
-        dot = abs(np.dot(q_cur, q_last))
-        delta_deg = np.degrees(2.0 * np.arccos(min(dot, 1.0)))
-        return bool(
-            delta_trans > self._cfg.key_pose_delta_trans or delta_deg > self._cfg.key_pose_delta_deg
+def keyframes_to_corrections(keyframes: Stream[Keyframe]) -> Stream[Transform]:
+    """Per-keyframe drift correction as Transform(world_corrected <- world_raw)."""
+    mem = MemoryStore()
+    out: Stream[Transform] = mem.stream("corrections", Transform)
+    for obs in keyframes:
+        kp = obs.data
+        R_corr = kp.r_global @ kp.r_local.T
+        t_corr = kp.t_global - R_corr @ kp.t_local
+        tf = Transform(
+            translation=Vector3(float(t_corr[0]), float(t_corr[1]), float(t_corr[2])),
+            rotation=Quaternion.from_rotation_matrix(R_corr),
+            frame_id="world_corrected",
+            child_frame_id="world_raw",
+            ts=kp.ts,
         )
+        out.append(tf, ts=kp.ts)
+    return out
 
-    def add_key_pose(
-        self, r_local: np.ndarray, t_local: np.ndarray, timestamp: float, body_cloud: np.ndarray
-    ) -> bool:
-        if not self.is_key_pose(r_local, t_local):
-            return False
 
-        idx = len(self._key_poses)
-        init_r = self._r_offset @ r_local
-        init_t = self._r_offset @ t_local + self._t_offset
+def make_interpolator(corrections: Stream[Transform]) -> Callable[[float], Transform]:
+    """Materialize corrections once; return a fast ts -> Transform lookup."""
+    ts_list: list[float] = []
+    R_list: list[np.ndarray] = []
+    t_list: list[np.ndarray] = []
+    for obs in corrections:
+        tf = obs.data
+        ts_list.append(tf.ts)
+        q = tf.rotation
+        R_list.append(Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix())
+        t_list.append(np.array([tf.translation.x, tf.translation.y, tf.translation.z]))
 
-        pose = gtsam.Pose3(gtsam.Rot3(init_r), gtsam.Point3(init_t))
-        self._values.insert(idx, pose)
+    if not ts_list:
+        raise ValueError("empty corrections stream")
 
+    if len(ts_list) == 1:
+        only_ts = ts_list[0]
+        only_R = R_list[0]
+        only_t = t_list[0]
+
+        def _const(ts: float) -> Transform:
+            return Transform(
+                translation=Vector3(float(only_t[0]), float(only_t[1]), float(only_t[2])),
+                rotation=Quaternion.from_rotation_matrix(only_R),
+                frame_id="world_corrected",
+                child_frame_id="world_raw",
+                ts=ts if ts is not None else only_ts,
+            )
+
+        return _const
+
+    ts_arr = np.array(ts_list)
+    R_stack = np.stack(R_list)
+    t_stack = np.stack(t_list)
+    slerp = Slerp(ts_arr, Rotation.from_matrix(R_stack))
+
+    def interp(ts: float) -> Transform:
+        ts_clip = float(np.clip(ts, ts_arr[0], ts_arr[-1]))
+        R = slerp([ts_clip])[0].as_matrix()
+        idx = int(np.searchsorted(ts_arr, ts_clip))
         if idx == 0:
-            noise = gtsam.noiseModel.Diagonal.Variances(np.full(6, 1e-12))
-            self._graph.add(gtsam.PriorFactorPose3(idx, pose, noise))
+            t = t_stack[0]
+        elif idx >= len(ts_arr):
+            t = t_stack[-1]
         else:
-            last = self._key_poses[-1]
-            r_between = last.r_local.T @ r_local
-            t_between = last.r_local.T @ (t_local - last.t_local)
-            noise = gtsam.noiseModel.Diagonal.Variances(
-                np.array([1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-6])
+            t_lo, t_hi = ts_arr[idx - 1], ts_arr[idx]
+            alpha = (ts_clip - t_lo) / (t_hi - t_lo) if t_hi > t_lo else 0.0
+            t = (1 - alpha) * t_stack[idx - 1] + alpha * t_stack[idx]
+        return Transform(
+            translation=Vector3(float(t[0]), float(t[1]), float(t[2])),
+            rotation=Quaternion.from_rotation_matrix(R),
+            frame_id="world_corrected",
+            child_frame_id="world_raw",
+            ts=float(ts),
+        )
+
+    return interp
+
+
+def correction_at(corrections: Stream[Transform], ts: float) -> Transform:
+    """One-off lookup. For hot paths build `make_interpolator` once and reuse."""
+    return make_interpolator(corrections)(ts)
+
+
+def apply_corrections(
+    stream: Stream[T],
+    corrections: Stream[Transform],
+) -> Stream[T]:
+    """Shuffle obs.pose on `stream` by the interpolated correction at each obs.ts.
+
+    `obs.data` is untouched. Frames with `obs.pose is None` pass through
+    unchanged. Out-of-range `obs.ts` get the endpoint correction (clipped).
+    """
+    interp = make_interpolator(corrections)
+
+    def xf(upstream: Iterator[Observation[T]]) -> Iterator[Observation[T]]:
+        for obs in upstream:
+            if obs.pose is None:
+                yield obs
+                continue
+            x, y, z, qx, qy, qz, qw = obs.pose
+            tf = interp(obs.ts)
+            R_corr = Rotation.from_quat(
+                [tf.rotation.x, tf.rotation.y, tf.rotation.z, tf.rotation.w]
+            ).as_matrix()
+            t_corr = np.array([tf.translation.x, tf.translation.y, tf.translation.z])
+            R_raw = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
+            t_raw = np.array([x, y, z])
+            R_new = R_corr @ R_raw
+            t_new = R_corr @ t_raw + t_corr
+            q_new = Rotation.from_matrix(R_new).as_quat()  # xyzw
+            new_pose = (
+                float(t_new[0]),
+                float(t_new[1]),
+                float(t_new[2]),
+                float(q_new[0]),
+                float(q_new[1]),
+                float(q_new[2]),
+                float(q_new[3]),
             )
-            self._graph.add(
-                gtsam.BetweenFactorPose3(
-                    idx - 1, idx, gtsam.Pose3(gtsam.Rot3(r_between), gtsam.Point3(t_between)), noise
-                )
-            )
+            yield obs.derive(data=obs.data, pose=new_pose)
 
-        kp = _KeyPose(
-            r_local=r_local.copy(),
-            t_local=t_local.copy(),
-            r_global=init_r.copy(),
-            t_global=init_t.copy(),
-            timestamp=timestamp,
-            body_cloud=_voxel_downsample(body_cloud, self._cfg.submap_resolution),
-        )
-        self._key_poses.append(kp)
-        return True
-
-    def _get_submap(self, idx: int, half_range: int) -> np.ndarray:
-        lo = max(0, idx - half_range)
-        hi = min(len(self._key_poses) - 1, idx + half_range)
-        parts = []
-        for i in range(lo, hi + 1):
-            kp = self._key_poses[i]
-            world = (kp.r_global @ kp.body_cloud.T).T + kp.t_global
-            parts.append(world)
-        if not parts:
-            return np.empty((0, 3))
-        cloud = np.vstack(parts)
-        return _voxel_downsample(cloud, self._cfg.submap_resolution)
-
-    def search_for_loops(self) -> None:
-        if len(self._key_poses) < self._cfg.min_keyframes_for_loop_search:
-            return
-
-        # Rate limit
-        if self._history_pairs:
-            cur_time = self._key_poses[-1].timestamp
-            last_time = self._key_poses[self._history_pairs[-1][1]].timestamp
-            if cur_time - last_time < self._cfg.min_loop_detect_duration:
-                return
-
-        cur_idx = len(self._key_poses) - 1
-        cur_kp = self._key_poses[-1]
-
-        # Build KD-tree of previous keyframe positions
-        positions = np.array([kp.t_global for kp in self._key_poses[:-1]])
-        tree = KDTree(positions)
-
-        idxs = tree.query_ball_point(cur_kp.t_global, self._cfg.loop_search_radius)
-        if not idxs:
-            return
-
-        # Pick the spatially closest keyframe that's also old enough in time.
-        # query_ball_point doesn't sort, so we sort by distance ourselves.
-        candidates = [
-            (float(np.linalg.norm(self._key_poses[i].t_global - cur_kp.t_global)), i)
-            for i in idxs
-            if abs(cur_kp.timestamp - self._key_poses[i].timestamp) > self._cfg.loop_time_thresh
-        ]
-        if not candidates:
-            return
-        candidates.sort()
-        loop_idx = candidates[0][1]
-
-        # ICP verification
-        target = self._get_submap(loop_idx, self._cfg.loop_submap_half_range)
-        source = self._get_submap(cur_idx, 0)
-
-        transform, fitness = _icp(
-            source,
-            target,
-            max_iter=self._cfg.max_icp_iterations,
-            max_dist=self._cfg.max_icp_correspondence_dist,
-            min_inliers=self._cfg.min_icp_inliers,
-        )
-        if fitness > self._cfg.loop_score_thresh:
-            return
-
-        # Compute relative pose
-        R_icp = transform[:3, :3]
-        t_icp = transform[:3, 3]
-        r_refined = R_icp @ cur_kp.r_global
-        t_refined = R_icp @ cur_kp.t_global + t_icp
-        r_offset = self._key_poses[loop_idx].r_global.T @ r_refined
-        t_offset = self._key_poses[loop_idx].r_global.T @ (
-            t_refined - self._key_poses[loop_idx].t_global
-        )
-
-        self._cache_pairs.append(
-            {
-                "source": cur_idx,
-                "target": loop_idx,
-                "r_offset": r_offset,
-                "t_offset": t_offset,
-                "score": fitness,
-            }
-        )
-        self._history_pairs.append((loop_idx, cur_idx))
-        logger.info(
-            "Loop closure detected",
-            source=cur_idx,
-            target=loop_idx,
-            score=round(fitness, 4),
-        )
-
-    def smooth_and_update(self) -> None:
-        has_loop = bool(self._cache_pairs)
-
-        for pair in self._cache_pairs:
-            # Pose3 noise model is [rx, ry, rz, x, y, z]. The two halves
-            # have different units (rad² vs m²), so a uniform variance —
-            # the original behaviour — silently makes one half pathological
-            # (e.g. score=0.07 → σ_rot ≈ 15° AND σ_trans ≈ 26 cm; one of
-            # those is too tight, one is too loose, depending on the loop).
-            # Use ICP fitness as the *translation* variance and a
-            # generous fixed rotation variance — loops shouldn't be
-            # trusted to fix rotation tightly without normals + p2plane.
-            trans_var = max(0.01, float(pair["score"]))  # ≥ σ_trans = 10 cm
-            rot_var = 0.05  # σ_rot ≈ 13°
-            noise = gtsam.noiseModel.Diagonal.Variances(
-                np.array([rot_var, rot_var, rot_var, trans_var, trans_var, trans_var])
-            )
-            self._graph.add(
-                gtsam.BetweenFactorPose3(
-                    pair["target"],
-                    pair["source"],
-                    gtsam.Pose3(gtsam.Rot3(pair["r_offset"]), gtsam.Point3(pair["t_offset"])),
-                    noise,
-                )
-            )
-        self._cache_pairs.clear()
-
-        self._isam2.update(self._graph, self._values)
-        self._isam2.update()
-        if has_loop:
-            for _ in range(self._cfg.loop_closure_extra_iterations):
-                self._isam2.update()
-        self._graph = gtsam.NonlinearFactorGraph()
-        self._values = gtsam.Values()
-
-        estimates = self._isam2.calculateBestEstimate()
-        for i in range(len(self._key_poses)):
-            pose = estimates.atPose3(i)
-            self._key_poses[i].r_global = pose.rotation().matrix()
-            self._key_poses[i].t_global = pose.translation()
-
-        last = self._key_poses[-1]
-        self._r_offset = last.r_global @ last.r_local.T
-        self._t_offset = last.t_global - self._r_offset @ last.t_local
-
-    def get_corrected_pose(
-        self, r_local: np.ndarray, t_local: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        return self._r_offset @ r_local, self._r_offset @ t_local + self._t_offset
-
-    def build_global_map(self, voxel_size: float) -> np.ndarray:
-        if not self._key_poses:
-            return np.empty((0, 3), dtype=np.float32)
-        parts = []
-        for kp in self._key_poses:
-            world = (kp.r_global @ kp.body_cloud.T).T + kp.t_global
-            parts.append(world)
-        cloud = np.vstack(parts).astype(np.float32)
-        return _voxel_downsample(cloud, voxel_size)
-
-    @property
-    def num_key_poses(self) -> int:
-        return len(self._key_poses)
+    return stream.transform(xf)

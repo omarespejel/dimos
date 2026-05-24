@@ -98,7 +98,7 @@ def main(
         import numpy as np
         from scipy.spatial.transform import Rotation
 
-        from dimos.mapping.relocalization.pgo2 import (
+        from dimos.mapping.relocalization.pgo import (
             keyframes_to_corrections,
             make_interpolator,
             pgo_keyframes,
