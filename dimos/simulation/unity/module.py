@@ -205,6 +205,13 @@ class UnityBridgeConfig(ModuleConfig):
     sensor_offset_x: float = 0.0  # m
     sensor_offset_y: float = 0.0
 
+    world_frame: str = "world"
+    map_frame: str = "map"
+    odom_frame: str = "odom"
+    body_frame: str = "base_link"
+    sensor_frame: str = "sensor_link"
+    camera_frame: str = "camera_link"
+
     # Disable image decoding and publishing (color_image, semantic_image,
     # camera_info) to save CPU when only navigation is needed.
     publish_images: bool = True
@@ -337,6 +344,16 @@ class UnityBridgeModule(Module):
         # Launch Unity in a thread to avoid blocking start() for up to
         # unity_connect_timeout seconds (default 30s).
         threading.Thread(target=self._launch_unity, daemon=True).start()
+        # init world->map but let other topics (relocalization) take over after first publish
+        self.tf.publish(
+            Transform(
+                translation=Vector3(0.0, 0.0, 0.0),
+                rotation=Quaternion(0.0, 0.0, 0.0, 1.0),
+                frame_id=self.config.world_frame,
+                child_frame_id=self.config.map_frame,
+                ts=time.time(),
+            )
+        )
 
     @rpc
     def stop(self) -> None:
@@ -681,7 +698,7 @@ class UnityBridgeModule(Module):
                 try:
                     decoded = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
                     if decoded is not None:
-                        img = Image.from_numpy(decoded, frame_id="camera", ts=ts)
+                        img = Image.from_numpy(decoded, frame_id=self.config.camera_frame, ts=ts)
                         if "semantic" in topic:
                             self.semantic_image.publish(img)
                         else:
@@ -702,7 +719,7 @@ class UnityBridgeModule(Module):
                 cy=_CAM_CY,
                 width=width,
                 height=height,
-                frame_id="camera",
+                frame_id=self.config.camera_frame,
             ).with_ts(ts)
         )
 
@@ -736,16 +753,16 @@ class UnityBridgeModule(Module):
                 self._yaw += 2 * PI
 
             cy, sy = math.cos(self._yaw), math.sin(self._yaw)
-            ox = self.config.sensor_offset_x
-            oy = self.config.sensor_offset_y
-            self._x += dt * cy * fwd - dt * sy * left + dt * yaw_rate * (-sy * ox - cy * oy)
-            self._y += dt * sy * fwd + dt * cy * left + dt * yaw_rate * (cy * ox - sy * oy)
+            self._x += dt * cy * fwd - dt * sy * left
+            self._y += dt * sy * fwd + dt * cy * left
             self._z = self._terrain_z + self.config.vehicle_height
 
             x, y, z = self._x, self._y, self._z
             yaw = self._yaw
             roll, pitch = self._roll, self._pitch
 
+        ox = self.config.sensor_offset_x
+        oy = self.config.sensor_offset_y
         now = time.time()
         quat = Quaternion.from_euler(Vector3(roll, pitch, yaw))
 
@@ -761,11 +778,12 @@ class UnityBridgeModule(Module):
             odom_x += np.random.normal(0.0, self.config.odom_noise_std)
             odom_y += np.random.normal(0.0, self.config.odom_noise_std)
 
+        # odom -> body
         self.odometry.publish(
             Odometry(
                 ts=now,
-                frame_id="map",
-                child_frame_id="sensor",
+                frame_id=self.config.odom_frame,
+                child_frame_id=self.config.body_frame,
                 pose=Pose(
                     position=[odom_x, odom_y, z],
                     orientation=[quat.x, quat.y, quat.z, quat.w],
@@ -782,18 +800,20 @@ class UnityBridgeModule(Module):
         )
 
         self.tf.publish(
+            # odom->base_link (e.g. fastlio equiv)
             Transform(
-                translation=Vector3(x, y, z),
+                translation=Vector3(odom_x, odom_y, z),
                 rotation=quat,
-                frame_id="map",
-                child_frame_id="sensor",
+                frame_id=self.config.odom_frame,
+                child_frame_id=self.config.body_frame,
                 ts=now,
             ),
+            # static base_link->sensor
             Transform(
-                translation=Vector3(0.0, 0.0, 0.0),
+                translation=Vector3(ox, oy, 0.0),
                 rotation=Quaternion(0.0, 0.0, 0.0, 1.0),
-                frame_id="map",
-                child_frame_id="world",
+                frame_id=self.config.body_frame,
+                child_frame_id=self.config.sensor_frame,
                 ts=now,
             ),
         )

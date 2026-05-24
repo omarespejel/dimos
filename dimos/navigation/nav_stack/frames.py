@@ -16,5 +16,5 @@
 
 FRAME_MAP = "map"
 FRAME_ODOM = "odom"
-FRAME_BODY = "body"
-FRAME_SENSOR = "sensor"
+FRAME_BODY = "base_link"
+FRAME_SENSOR = "sensor_link"
