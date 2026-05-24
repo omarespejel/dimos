@@ -66,8 +66,16 @@ def main(
     block_count: int = typer.Option(
         2_000_000, "--block-count", help="VoxelBlockGrid capacity (--pgo only)"
     ),
+    export: bool = typer.Option(
+        False,
+        "--export",
+        help="Export PGO twopass map to ./<dataset>.pc2.lcm in cwd (implies --pgo)",
+    ),
+    no_gui: bool = typer.Option(False, "--no-gui", help="Skip rerun visualization"),
 ) -> None:
     db_path = resolve_named_path(dataset, ".db")
+    if export:
+        pgo = True
 
     store = SqliteStore(path=db_path)
     lidar = store.streams.lidar
@@ -109,23 +117,36 @@ def main(
         .data
     )
 
-    rerun_init("coloring", spawn=True)
-    rr.send_blueprint(rrb.Blueprint(rrb.Spatial3DView(origin="world")))
-    rr.log("world/raw_map/pointcloud", global_map.to_rerun(size=voxel), static=True)
-    if path:
-        rr.log(
-            "world/raw_map/path",
-            rr.LineStrips3D(strips=[path], colors=[[231, 76, 60]], radii=[0.08]),
-            static=True,
-        )
-    if pgo_map is not None:
-        rr.log("world/pgo_map/pointcloud", pgo_map.to_rerun(size=voxel), static=True)
-    if pgo_path:
-        rr.log(
-            "world/pgo_map/path",
-            rr.LineStrips3D(strips=[pgo_path], colors=[[255, 255, 255]], radii=[0.08]),
-            static=True,
-        )
+    if not no_gui:
+        rerun_init("coloring", spawn=True)
+        rr.send_blueprint(rrb.Blueprint(rrb.Spatial3DView(origin="world")))
+        rr.log("world/raw_map/pointcloud", global_map.to_rerun(size=voxel), static=True)
+        if path:
+            rr.log(
+                "world/raw_map/path",
+                rr.LineStrips3D(strips=[path], colors=[[231, 76, 60]], radii=[0.05]),
+                static=True,
+            )
+        if pgo_map is not None:
+            rr.log("world/pgo_map/pointcloud", pgo_map.to_rerun(size=voxel), static=True)
+        if pgo_path:
+            rr.log(
+                "world/pgo_map/path",
+                rr.LineStrips3D(strips=[pgo_path], colors=[[255, 255, 255]], radii=[0.05]),
+                static=True,
+            )
+
+    if export and pgo_map is not None:
+        from pathlib import Path
+
+        out_path = Path.cwd() / f"{db_path.stem}.pc2.lcm"
+        print(f"exporting PGO twopass map to {out_path}...")
+        out_path.write_bytes(pgo_map.lcm_encode())
+        print(f"wrote {out_path}")
+        print()
+        print("load back with:")
+        print("    from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2")
+        print(f'    pcd = PointCloud2.lcm_decode(open("{out_path.name}", "rb").read())')
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # NOTE: This lives under mapping/relocalization/ for now because the only
-# consumer is the premap export pipeline (`dimos export-premap`). It is
+# consumer is the premap export pipeline (`dimos map --export`). It is
 # temporary and can be moved/split out later when PGO grows other consumers.
 
 from __future__ import annotations
