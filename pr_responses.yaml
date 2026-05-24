@@ -1,0 +1,73 @@
+- pr: 2236
+  comment_id: 3293654340
+  author: greptile-apps
+  file: dimos/robot/unitree/go2/connection.py
+  line: 276
+  problem: |
+    P1 — Dict merge order silently drops `frame_id` remap.
+    `remap` is built as `{Go2Config.body_frame: self.frame_id, **self.config.frame_mapping}`.
+    Since `frame_mapping` defaults to an identity dict that includes `"base_link"`, the `**`
+    unpack overwrites the `Go2Config.body_frame → self.frame_id` entry with
+    `"base_link" → "base_link"`. Any time `frame_id` is customised (e.g. via `frame_id_prefix`,
+    producing `"robot/base_link"`), the static transforms keep `"base_link"` as their parent,
+    while `_publish_tf` publishes under the new name — leaving the TF tree with a dangling
+    `odom → robot/base_link` edge and no `robot/base_link → camera_link` link. Suggested
+    swap: `remap = {**self.config.frame_mapping, Go2Config.body_frame: self.frame_id}`.
+  solution: |
+    Applied greptile's suggested swap. The frame_mapping is now unpacked first and the
+    `body_frame → self.frame_id` entry is written last, so a custom frame_id (e.g. when
+    frame_id_prefix is set) always wins over the identity-mapping default. Static transforms
+    now publish under the same root name as `_publish_tf`, keeping the TF tree connected.
+
+- pr: 2236
+  comment_id: 3293617061
+  author: greptile-apps
+  file: dimos/robot/unitree/go2/connection.py
+  line: 278
+  problem: |
+    P2 — Typo in comment: "remape" should be "remap".
+  solution: |
+    Naturally resolved: Jeff's commit 6423f7fa2 ("improve") rewrote the surrounding
+    `_static_publish` method and the comment line `# remape the frame_id` no longer exists at
+    the current PR tip. The new code uses an inline `remap.get(...)` lookup with no inline
+    comment. No autofix code change needed for this comment.
+  commit: null
+
+- pr: 2236
+  comment_id: 3293617047
+  author: greptile-apps
+  file: dimos/memory2/vis/space/rerun.py
+  line: 231
+  problem: |
+    P2 — Hardcoded key introduces runtime `KeyError` and couples generic module to Go2.
+    The visualization module now has a hard dependency on `Go2Config` and the literal key
+    `"base_link/camera_link/camera_optical"`. If the Go2 URDF changes (or this path is ever
+    called for a different robot/config), the `dict.__getitem__` raises a `KeyError` with no
+    context. Suggested `.get()` with a `None` fallback and an early-out guard.
+  solution: |
+    skipped — Jeff already acknowledged this in an inline comment on the same file (PR comment
+    3293612147 on rerun.py:43): "NOTE: I'm not fixing this hardcoded problem, just trying to
+    clean up the go2 side". The code already carries a `TODO: fix there should be a
+    standard way to set camera frames` next to the lookup. Replacing the lookup with `.get()`
+    and a silent skip would mask the missing-frame condition rather than fix it; failing fast
+    with KeyError is actually preferable until the proper camera-frame plumbing lands.
+  commit: null
+
+- pr: 2236
+  comment_id: 3293617084
+  author: greptile-apps
+  file: dimos/robot/config.py
+  line: 248
+  problem: |
+    P2 — `path_to` traverses non-fixed joints, so keys may have unexpected root prefixes for
+    other robots. `by_child` is built from ALL joints (fixed and non-fixed). `path_to`
+    therefore walks upward through floating/revolute joints as well, which can produce paths
+    like `"world/base_link/camera_link"` instead of `"base_link/camera_link"` for robots that
+    have a `world → (floating) → base_link` structure. Does not affect Go2 (no floating joint),
+    but would silently break reuse on other robots (e.g. Spot-like configs).
+  solution: |
+    skipped — the comment acknowledges this only affects non-Go2 robots with floating-joint
+    URDFs. This PR is scoped to Go2 static-transform cleanup; correctness for other URDFs is
+    out of scope. A proper fix needs to decide root semantics (base_link vs world) and update
+    `by_child` filtering — that belongs in a follow-up RobotConfig PR, not here.
+  commit: null
