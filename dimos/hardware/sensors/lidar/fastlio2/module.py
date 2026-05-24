@@ -34,11 +34,9 @@ from __future__ import annotations
 import ipaddress
 from pathlib import Path
 import socket
-import time
 from typing import TYPE_CHECKING, Annotated
 
 from pydantic.experimental.pipeline import validate_as
-from reactivex.disposable import Disposable
 
 from dimos.core.core import rpc
 from dimos.core.native_module import NativeModule, NativeModuleConfig
@@ -55,7 +53,6 @@ from dimos.hardware.sensors.lidar.livox.ports import (
     SDK_POINT_DATA_PORT,
     SDK_PUSH_MSG_PORT,
 )
-from dimos.msgs.geometry_msgs.Pose import Pose
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Transform import Transform
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
@@ -78,15 +75,12 @@ class FastLio2Config(NativeModuleConfig):
     lidar_ip: str = "192.168.1.155"
     frequency: float = 10.0
 
-    # Sensor mount pose — position + orientation of the sensor relative to ground.
-    # Converted to init_pose CLI arg [x, y, z, qx, qy, qz, qw] in model_post_init.
-    mount: Pose = Pose()
-
-    # Frame IDs for output messages.  "odom" reflects that FastLio2 provides
-    # locally-smooth, continuous odometry (no loop-closure jumps).  PGO
-    # publishes the map→odom correction via TF.
-    parent_frame_id: str = "odom"
-    frame_id: str = "base_link"
+    # Frame IDs for output messages.
+    # world->map->odom->base_link->sensor_link
+    # point clouds are tagged with sensor_link, but odom->base_link is known/published by fastlio
+    frame_id: str = "mid360_link"
+    odom_frame: str = "odom"
+    body_frame: str = "base_link"
 
     # FAST-LIO internal processing rates
     msr_freq: float = 50.0
@@ -110,7 +104,7 @@ class FastLio2Config(NativeModuleConfig):
     # C++ binary reads YAML directly via yaml-cpp
     config: Annotated[
         Path, validate_as(...).transform(lambda p: p if p.is_absolute() else _CONFIG_DIR / p)
-    ] = Path("mid360.yaml")
+    ] = Path("default.yaml")
 
     debug: bool = False
 
@@ -129,27 +123,15 @@ class FastLio2Config(NativeModuleConfig):
     # Resolved in __post_init__, passed as --config_path to the binary
     config_path: str | None = None
 
-    # init_pose is computed from mount; config is resolved to config_path
-    init_pose: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-    cli_exclude: frozenset[str] = frozenset({"config", "mount"})
+    cli_exclude: frozenset[str] = frozenset({"config"})
 
     def model_post_init(self, __context: object) -> None:
-        """Resolve config_path and compute init_pose from mount."""
+        """Resolve config_path."""
         super().model_post_init(__context)
         cfg = self.config
         if not cfg.is_absolute():
             cfg = _CONFIG_DIR / cfg
         self.config_path = str(cfg.resolve())
-        m = self.mount
-        self.init_pose = [
-            m.x,
-            m.y,
-            m.z,
-            m.orientation.x,
-            m.orientation.y,
-            m.orientation.z,
-            m.orientation.w,
-        ]
 
 
 class FastLio2(NativeModule, perception.Lidar, perception.Odometry, mapping.GlobalPointcloud):
@@ -163,27 +145,13 @@ class FastLio2(NativeModule, perception.Lidar, perception.Odometry, mapping.Glob
     def start(self) -> None:
         self._validate_network()
         super().start()
-        self.register_disposable(
-            Disposable(self.odometry.transport.subscribe(self._on_odom_for_tf, self.odometry))
-        )
-
-    def _on_odom_for_tf(self, msg: Odometry) -> None:
+        # in case nobody else publishes body to sensor link (e.g. static transform of sensor relative to body), publish a no-op here to assume sensor=base_link
         self.tf.publish(
             Transform(
-                frame_id=self.config.parent_frame_id,
+                translation=Vector3(0.0, 0.0, 0.0),
+                rotation=Quaternion(0.0, 0.0, 0.0, 1.0),
+                frame_id=self.config.body_frame,
                 child_frame_id=self.config.frame_id,
-                translation=Vector3(
-                    msg.pose.position.x,
-                    msg.pose.position.y,
-                    msg.pose.position.z,
-                ),
-                rotation=Quaternion(
-                    msg.pose.orientation.x,
-                    msg.pose.orientation.y,
-                    msg.pose.orientation.z,
-                    msg.pose.orientation.w,
-                ),
-                ts=msg.ts or time.time(),
             )
         )
 
