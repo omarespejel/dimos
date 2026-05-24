@@ -65,9 +65,8 @@ static FastLio* g_fastlio = nullptr;
 static std::string g_lidar_topic;
 static std::string g_odometry_topic;
 static std::string g_map_topic;
-static std::string g_frame_id;   // required via --frame_id (point cloud frame; lidar's native sensor frame)
-static std::string g_odom_frame;  // required via --odom_frame (odometry/TF parent frame)
-static std::string g_body_frame;  // required via --body_frame (odometry/TF child frame)
+static std::string g_frame_id;
+static std::string g_child_frame_id;
 static float g_frequency = 10.0f;
 const std::string g_tf_topic = "/tf#tf2_msgs.TFMessage";
 
@@ -151,8 +150,9 @@ static void publish_odometry(const custom_messages::Odometry& odom, double times
     if (!g_lcm) return;
 
     nav_msgs::Odometry msg;
-    msg.header = make_header(g_odom_frame, timestamp);
-    msg.child_frame_id = g_body_frame;
+    // FAST-LIO reports the sensor's pose in its own t=0 frame.
+    msg.header = make_header(g_frame_id, timestamp);
+    msg.child_frame_id = g_child_frame_id;
     msg.pose.pose.position.x = odom.pose.pose.position.x;
     msg.pose.pose.position.y = odom.pose.pose.position.y;
     msg.pose.pose.position.z = odom.pose.pose.position.z;
@@ -179,10 +179,10 @@ static void publish_odometry(const custom_messages::Odometry& odom, double times
         g_lcm->publish(g_odometry_topic, &msg);
     }
 
-    // tf publish — wrap odom -> body in a tf2_msgs/TFMessage on the canonical /tf channel
+    // tf publish — wrap odom -> sensor in a tf2_msgs/TFMessage on the canonical /tf channel
     geometry_msgs::TransformStamped tf_stamped;
-    tf_stamped.header = make_header(g_odom_frame, timestamp);
-    tf_stamped.child_frame_id = g_body_frame;
+    tf_stamped.header = make_header(g_frame_id, timestamp);
+    tf_stamped.child_frame_id = g_child_frame_id;
     tf_stamped.transform.translation.x = odom.pose.pose.position.x;
     tf_stamped.transform.translation.y = odom.pose.pose.position.y;
     tf_stamped.transform.translation.z = odom.pose.pose.position.z;
@@ -338,9 +338,8 @@ int main(int argc, char** argv) {
     std::string host_ip = mod.arg("host_ip", "192.168.1.5");
     std::string lidar_ip = mod.arg("lidar_ip", "192.168.1.155");
     g_frequency = mod.arg_float("frequency", 10.0f);
+    g_child_frame_id = mod.arg_required("frame_id");
     g_frame_id = mod.arg_required("frame_id");
-    g_odom_frame = mod.arg_required("odom_frame");
-    g_body_frame = mod.arg_required("body_frame");
     float pointcloud_freq = mod.arg_float("pointcloud_freq", 5.0f);
     float odom_freq = mod.arg_float("odom_freq", 50.0f);
     CloudFilterConfig filter_cfg;

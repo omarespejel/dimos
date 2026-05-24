@@ -53,9 +53,6 @@ from dimos.hardware.sensors.lidar.livox.ports import (
     SDK_POINT_DATA_PORT,
     SDK_PUSH_MSG_PORT,
 )
-from dimos.msgs.geometry_msgs.Quaternion import Quaternion
-from dimos.msgs.geometry_msgs.Transform import Transform
-from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.spec import mapping, perception
@@ -75,12 +72,8 @@ class FastLio2Config(NativeModuleConfig):
     lidar_ip: str = "192.168.1.155"
     frequency: float = 10.0
 
-    # Frame IDs for output messages.
-    # world->map->odom->base_link->sensor_link
-    # point clouds are tagged with sensor_link, but odom->base_link is known/published by fastlio
-    frame_id: str = "mid360_link"
-    odom_frame: str = "odom"
-    body_frame: str = "base_link"
+    frame_id: str = "odom"
+    child_frame_id: str = "base_link"
 
     # FAST-LIO internal processing rates
     msr_freq: float = 50.0
@@ -123,8 +116,6 @@ class FastLio2Config(NativeModuleConfig):
     # Resolved in __post_init__, passed as --config_path to the binary
     config_path: str | None = None
 
-    cli_exclude: frozenset[str] = frozenset({"config"})
-
     def model_post_init(self, __context: object) -> None:
         """Resolve config_path."""
         super().model_post_init(__context)
@@ -145,15 +136,6 @@ class FastLio2(NativeModule, perception.Lidar, perception.Odometry, mapping.Glob
     def start(self) -> None:
         self._validate_network()
         super().start()
-        # in case nobody else publishes body to sensor link (e.g. static transform of sensor relative to body), publish a no-op here to assume sensor=base_link
-        self.tf.publish(
-            Transform(
-                translation=Vector3(0.0, 0.0, 0.0),
-                rotation=Quaternion(0.0, 0.0, 0.0, 1.0),
-                frame_id=self.config.body_frame,
-                child_frame_id=self.config.frame_id,
-            )
-        )
 
     @rpc
     def stop(self) -> None:
