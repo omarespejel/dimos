@@ -70,6 +70,7 @@ class ConnectionConfig(ModuleConfig):
     ip: str = Field(default_factory=lambda m: m["g"].robot_ip)
     mode: Go2Mode = Go2Mode.DEFAULT
     frame_id: str | None = DEFAULT_ROBOT_FRAME
+    parent_frame_id: str = "world"
     static_publish_rate: float = 1.0
     static_transforms: dict[str, Transform] = Field(
         default_factory=lambda: dict(Go2Config.static_transforms)
@@ -259,7 +260,15 @@ class GO2Connection(Module, Camera, Pointcloud):
         super().stop()
 
     def _publish_tf(self, msg: PoseStamped) -> None:
-        self.tf.publish(Transform.from_pose(self.frame_id, msg))
+        self.tf.publish(
+            Transform(
+                translation=msg.position,
+                rotation=msg.orientation,
+                frame_id=self.config.parent_frame_id,
+                child_frame_id=self.frame_id,
+                ts=msg.ts,
+            )
+        )
         if self.odom.transport:
             self.odom.publish(msg)
 
