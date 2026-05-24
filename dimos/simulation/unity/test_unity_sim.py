@@ -255,7 +255,8 @@ class TestKinematicSim:
         module.stop()
 
         assert len(subscribers["odometry"]._messages) == 10
-        assert subscribers["odometry"]._messages[0].frame_id == "map"
+        assert subscribers["odometry"]._messages[0].frame_id == "odom"
+        assert subscribers["odometry"]._messages[0].child_frame_id == "base_link"
 
     def test_cmd_vel_moves_robot(self):
         module = UnityBridgeModule(unity_binary="", sim_rate=200.0)
@@ -361,8 +362,9 @@ class TestSensorOffset:
         assert module._y == pytest.approx(0.0, abs=0.01)
 
     def test_pure_yaw_with_offset_displaces_position(self):
-        # With sensor_offset_x=0.5 and pure yaw rotation, the sensor origin
-        # traces a circle of radius 0.5 around the vehicle center.
+        # With sensor_offset_x=0.5 and pure yaw rotation, the body stays put
+        # but the sensor (published as body -> sensor static offset) traces a
+        # quarter-circle of radius 0.5.
         module = UnityBridgeModule(
             unity_binary="", sim_rate=200.0, sensor_offset_x=0.5, sensor_offset_y=0.0
         )
@@ -376,8 +378,9 @@ class TestSensorOffset:
         module.stop()
         # Yaw should be ~π/2
         assert module._yaw == pytest.approx(math.pi / 2.0, abs=0.02)
-        # Displacement happened (sensor traversed a quarter-circle of radius 0.5).
-        assert abs(module._x - 0.0) > 0.01 or abs(module._y - 0.0) > 0.01
+        # Body position is unchanged under pure yaw.
+        assert module._x == pytest.approx(0.0, abs=0.01)
+        assert module._y == pytest.approx(0.0, abs=0.01)
 
     def test_yaw_rate_roll_published(self):
         # After enabling terrain fit with zero tilt, angular roll/pitch rates
