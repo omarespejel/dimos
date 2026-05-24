@@ -46,9 +46,42 @@ class _Unloaded:
 _UNLOADED = _Unloaded()
 
 
+def _normalize_pose(p: Any) -> tuple[float, float, float, float, float, float, float] | None:
+    """Coerce common pose shapes to the storage 7-tuple `(x, y, z, qx, qy, qz, qw)`.
+
+    Accepts: `None`, an already-normalized tuple, or any object with
+    `translation`+`rotation` (Transform) or `position`+`orientation`
+    (Pose / PoseStamped) attributes. Duck-typed to avoid importing
+    `dimos.msgs.geometry_msgs` at module load.
+    """
+    if p is None or isinstance(p, tuple):
+        return p
+    trans = getattr(p, "translation", None) or getattr(p, "position", None)
+    rot = getattr(p, "rotation", None) or getattr(p, "orientation", None)
+    if trans is None or rot is None:
+        raise TypeError(
+            f"Cannot coerce {type(p).__name__} to a pose tuple — expected "
+            "tuple, None, Transform, Pose, or PoseStamped."
+        )
+    return (
+        float(trans.x),
+        float(trans.y),
+        float(trans.z),
+        float(rot.x),
+        float(rot.y),
+        float(rot.z),
+        float(rot.w),
+    )
+
+
 @dataclass
 class Observation(Generic[T]):
-    """A single timestamped observation with optional spatial pose and metadata."""
+    """A single timestamped observation with optional spatial pose and metadata.
+
+    `pose` is stored as a 7-tuple `(x, y, z, qx, qy, qz, qw)`. Passing a
+    `Transform`, `Pose`, or `PoseStamped` to the constructor or to `derive`
+    is normalized to the 7-tuple form automatically.
+    """
 
     id: int
     ts: float
@@ -58,6 +91,9 @@ class Observation(Generic[T]):
     _data: T | _Unloaded = field(default=_UNLOADED, repr=False)
     _loader: Callable[[], T] | None = field(default=None, repr=False)
     _data_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        self.pose = _normalize_pose(self.pose)
 
     @property
     def pose_stamped(self) -> PoseStamped:

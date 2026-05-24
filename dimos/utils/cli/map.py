@@ -112,9 +112,9 @@ def main(
         corrections = keyframes_to_corrections(keyframes)
         interp = make_interpolator(corrections)
 
-        for obs in keyframes:
-            kp = obs.data
-            pgo_path.append((float(kp.t_global[0]), float(kp.t_global[1]), float(kp.t_global[2])))
+        for kf_obs in keyframes:
+            kf_t = kf_obs.data.optimized.translation
+            pgo_path.append((kf_t.x, kf_t.y, kf_t.z))
 
         pass2_pb = progress(total, "pgo pass 2 (rebuilding)")
         grid = VoxelGrid(voxel_size=voxel, block_count=block_count, device=device)
