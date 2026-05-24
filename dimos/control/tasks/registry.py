@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 import importlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from dimos.control.coordinator import TaskConfig
@@ -85,7 +85,7 @@ class ControlTaskRegistry:
             raise ValueError(f"Unknown task type: {key!r}. Available: {self.available()}")
         module_name, attr = self._factory_paths[key].split(":", maxsplit=1)
         module = importlib.import_module(module_name)
-        factory = getattr(module, attr)
+        factory = cast("TaskFactory", getattr(module, attr))
         if not callable(factory):
             raise TypeError(f"Task factory {self._factory_paths[key]!r} is not callable")
         self._factories[key] = factory
