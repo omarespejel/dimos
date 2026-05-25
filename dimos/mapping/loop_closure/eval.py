@@ -39,7 +39,9 @@ import os
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
+import multiprocessing as mp
 import signal
 import sys
 import time
@@ -162,6 +164,12 @@ def main(
         False, "--verbose", "-v", help="Show per-event PGO logs (loop closures, etc.)"
     ),
     timeout: int = typer.Option(420, "--timeout", help="Hard wall-clock cap (s); 0 disables"),
+    workers: int = typer.Option(
+        0,
+        "--workers",
+        "-j",
+        help="Parallel workers (0 = one per dataset, capped at cpu_count)",
+    ),
 ) -> None:
     names = datasets or DEFAULT_DATASETS
 
@@ -188,21 +196,52 @@ def main(
         # the eval table. The aggregate count + score is in the table.
         logging.getLogger("dimos/mapping/loop_closure/pgo.py").setLevel(logging.WARNING)
 
-    # Sequential: PGO (Open3D) and marker detection (cv2/numpy) already
-    # saturate available cores internally via OpenMP — process-level
-    # parallelism only adds contention.
+    # Each worker runs one recording with single-threaded numerical libs
+    # (pinned at module top — re-applied per spawned child since they
+    # re-import this module). No thread contention, deterministic per
+    # recording.
+    n_workers = workers or min(len(names), os.cpu_count() or 1)
     wall_start = time.perf_counter()
     results: dict[str, tuple[float, float, int, float, int]] = {}
-    for name in names:
-        print(f"eval {name}...")
-        results[name] = _eval_recording(
-            name,
-            marker_size=marker_size,
-            marker_max_speed=marker_max_speed,
-            marker_max_rot_rate=marker_max_rot_rate,
-            marker_quality_window=marker_quality_window,
-            marker_smoothing=marker_smoothing,
-        )
+
+    if n_workers <= 1 or len(names) <= 1:
+        for name in names:
+            print(f"eval {name}...")
+            results[name] = _eval_recording(
+                name,
+                marker_size=marker_size,
+                marker_max_speed=marker_max_speed,
+                marker_max_rot_rate=marker_max_rot_rate,
+                marker_quality_window=marker_quality_window,
+                marker_smoothing=marker_smoothing,
+            )
+    else:
+        print(f"running {len(names)} recordings on {n_workers} workers")
+        # spawn: fresh interpreter per worker; avoids fork-after-cv2/openmp
+        # deadlocks (parent's library threads don't survive fork).
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=mp.get_context("spawn")) as ex:
+            futures = {
+                ex.submit(
+                    _eval_recording,
+                    name,
+                    marker_size=marker_size,
+                    marker_max_speed=marker_max_speed,
+                    marker_max_rot_rate=marker_max_rot_rate,
+                    marker_quality_window=marker_quality_window,
+                    marker_smoothing=marker_smoothing,
+                ): name
+                for name in names
+            }
+            for f in as_completed(futures):
+                name = futures[f]
+                results[name] = f.result()
+                pgo_time, spread, n_loops, score_sum, n_kf = results[name]
+                mean_score = score_sum / n_loops if n_loops else 0.0
+                print(
+                    f"  done {name:>14}  pgo={pgo_time:5.2f}s  spread={spread:7.3f}m  "
+                    f"loops={n_loops:>3d}  mean_score={mean_score:.4f}  kf={n_kf:>4d}"
+                )
+
     if timeout > 0:
         signal.alarm(0)
     wall = time.perf_counter() - wall_start
