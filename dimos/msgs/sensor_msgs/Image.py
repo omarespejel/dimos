@@ -48,6 +48,7 @@ class ImageFormat(Enum):
     GRAY16 = "GRAY16"
     DEPTH = "DEPTH"
     DEPTH16 = "DEPTH16"
+    JPEG = "JPEG"
 
 
 def _format_to_rerun(data: np.ndarray, fmt: ImageFormat) -> Any:
@@ -69,6 +70,8 @@ def _format_to_rerun(data: np.ndarray, fmt: ImageFormat) -> Any:
             return rr.DepthImage(data)
         case ImageFormat.DEPTH16:
             return rr.DepthImage(data)
+        case ImageFormat.JPEG:
+            return rr.EncodedImage(contents=bytes(data.tobytes()), media_type="image/jpeg")
         case _:
             raise ValueError(f"Unsupported format for Rerun: {fmt}")
 
@@ -98,6 +101,8 @@ class Image(Timestamped):
     def __post_init__(self) -> None:
         if not isinstance(self.data, np.ndarray):
             self.data = np.asarray(self.data)
+        if self.format == ImageFormat.JPEG:
+            return
         if self.data.ndim < 2:
             raise ValueError("Image requires a 2D/3D NumPy array")
 

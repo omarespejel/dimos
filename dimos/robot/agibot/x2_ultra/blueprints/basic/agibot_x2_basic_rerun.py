@@ -24,6 +24,7 @@ from dimos.robot.agibot.x2_ultra.connection import X2Connection
 from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
 from dimos.web.websocket_vis.websocket_vis_module import WebsocketVisModule
 from dimos.mapping.voxels import VoxelGridMapper
+# from dimos.mapping.ray_tracing.module import RayTracingVoxelMap
 
 agibot_x2_basic_rerun = (
     autoconnect(
@@ -32,6 +33,7 @@ agibot_x2_basic_rerun = (
         X2Connection.blueprint(
             clear_rmw_env=True,
             enable_lidar=True,
+            enable_rear_camera=True,
             force_cyclonedds=False,
         ),
     )

@@ -51,6 +51,7 @@ logger = setup_logger()
 # UDP fragments were being dropped by DDS on the laptop, so callbacks never
 # fired. The robot publishes both; the compressed one delivers reliably.
 _TOPIC_RGB_IMAGE = "/aima/hal/sensor/rgbd_head_front/rgb_image/compressed"
+_TOPIC_RGB_REAR = "/aima/hal/sensor/rgb_head_rear/rgb_image/compressed"
 _TOPIC_DEPTH_IMAGE = "/aima/hal/sensor/rgbd_head_front/depth_image"
 _TOPIC_DEPTH_CLOUD = "/aima/hal/sensor/rgbd_head_front/depth_pointcloud"
 _TOPIC_RGB_CAM_INFO = "/aima/hal/sensor/rgbd_head_front/rgb_camera_info"
@@ -66,6 +67,14 @@ _SVC_INPUT_SOURCE = "/aimdk_5Fmsgs/srv/SetMcInputSource"
 
 # Path to the URDF bundled in this package — used for IK.
 _X2_URDF_PATH = Path(__file__).resolve().parent / "x2_ultra.urdf"
+
+# Lidar origin in base_link frame, from the URDF chain:
+#   base_link -> torso_link (z=0.1551) -> lidar_chest_front (x=0.1026, z=0.1816).
+_LIDAR_IN_BASE_LINK: tuple[float, float, float] = (
+    0.102632855873251,
+    0.0,
+    0.1550706468356796 + 0.181586916322065,
+)
 
 # Joint name ordering per the AgiBot X2 SDK docs (Interface > Control > Joint Control).
 # Names match the X2 URDF/MJCF (sans the "_joint" suffix, which the viewer adds).
@@ -203,6 +212,10 @@ class ConnectionConfig(ModuleConfig):
     enable_depth_cloud: bool = Field(
         default=False,
         description="Subscribe to the head depth pointcloud and publish it to DimOS.",
+    )
+    enable_rear_camera: bool = Field(
+        default=False,
+        description="Spawn a sidecar subprocess for the rear RGB camera and publish to rear_image.",
     )
 
 
@@ -377,6 +390,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
     cartesian_left: In[PoseStamped]
     cartesian_right: In[PoseStamped]
     color_image: Out[Image]
+    rear_image: Out[Image]
     camera_info: Out[CameraInfo]
     depth_image: Out[Image]
     depth_camera_info: Out[CameraInfo]
@@ -393,6 +407,8 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
     _input_source_registered: bool = False
     _cam_proc: subprocess.Popen | None = None  # type: ignore[type-arg]
     _cam_thread: Thread | None = None
+    _rear_cam_proc: subprocess.Popen | None = None  # type: ignore[type-arg]
+    _rear_cam_thread: Thread | None = None
     _arm_ik: X2ArmIK | None = None
     _arm_ctrl_thread: Thread | None = None
 
@@ -407,6 +423,9 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         self._cam_proc = None
         self._cam_thread = None
         self._cam_stop = False
+        self._rear_cam_proc = None
+        self._rear_cam_thread = None
+        self._rear_cam_stop = False
         # Arm controller (built once we have the first joint_state snapshot so
         # we can seed Ruckig with the real current pose, not zeros).
         self._arm_ik = None
@@ -489,6 +508,8 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         # this by running the subscription in a clean subprocess (see
         # `_camera_bridge.py`) and piping JPEG frames back here.
         self._start_camera_bridge()
+        if self.config.enable_rear_camera:
+            self._start_rear_camera_bridge()
 
         # NOTE: depth_image is also large (1280x720 float32 ~3.7 MB/frame); not
         # subscribed here because nothing downstream consumes it yet, and the
@@ -614,6 +635,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         # Tear down the camera bridge first so its rclpy shutdown isn't racing
         # ours.
         self._stop_camera_bridge()
+        self._stop_rear_camera_bridge()
 
         # Stop the arm controller loop before rclpy shuts down.
         self._arm_ctrl_stop = True
@@ -1069,6 +1091,114 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
             self._cam_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
         self._cam_thread = None
 
+    # --- Rear camera bridge (same pattern, distinct subprocess) ---
+
+    def _start_rear_camera_bridge(self) -> None:
+        """Spawn a second `_camera_bridge.py` subprocess for the rear RGB topic.
+
+        Reuses the front camera's bridge script with the rear topic passed as
+        argv[1]; same DDS/CycloneDDS gating as the front bridge.
+        """
+        import os as _os
+
+        bridge = Path(__file__).parent / "_camera_bridge.py"
+        env = _os.environ.copy()
+        if self.config.clear_rmw_env:
+            env.pop("RMW_IMPLEMENTATION", None)
+            env.pop("CYCLONEDDS_URI", None)
+        if self.config.force_cyclonedds:
+            env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+            env["CYCLONEDDS_URI"] = _cyclonedds_uri(
+                self.config.cyclone_interface,
+                self.config.cyclone_peer,
+            )
+        self._rear_cam_stop = False
+        self._rear_cam_proc = subprocess.Popen(
+            [sys.executable, str(bridge), _TOPIC_RGB_REAR],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+            env=env,
+        )
+        self._rear_cam_thread = Thread(target=self._read_rear_camera_bridge, daemon=True)
+        self._rear_cam_thread.start()
+
+    def _read_rear_camera_bridge(self) -> None:
+        """Consume JPEG frames from the rear bridge. Same wire format as front.
+
+        The rear sensor is mounted right-side up, so we skip the 180° flip
+        that the front bridge applies.
+        """
+        import cv2
+
+        proc = self._rear_cam_proc
+        if proc is None or proc.stdout is None:
+            return
+        out = proc.stdout
+        logger.info("X2Connection: rear-camera-bridge reader thread started (pid=%s)", proc.pid)
+
+        def _read_exact(n: int) -> bytes | None:
+            buf = bytearray()
+            while len(buf) < n:
+                if self._rear_cam_stop:
+                    return None
+                chunk = out.read(n - len(buf))
+                if not chunk:
+                    return None
+                buf.extend(chunk)
+            return bytes(buf)
+
+        recv = 0
+        try:
+            while not self._rear_cam_stop:
+                header = _read_exact(4)
+                if header is None:
+                    logger.info(
+                        "X2Connection: rear-camera-bridge stdout EOF (after %d frames)", recv
+                    )
+                    break
+                (length,) = struct.unpack("<I", header)
+                data = _read_exact(length)
+                if data is None:
+                    break
+
+                jpeg = np.frombuffer(data, dtype=np.uint8)
+                arr = cv2.imdecode(jpeg, cv2.IMREAD_COLOR)  # BGR
+                if arr is None:
+                    continue
+
+                image = Image(
+                    data=arr,
+                    format=ImageFormat.BGR,
+                    frame_id="rgb_head_rear",
+                    ts=time.time(),
+                )
+                self.rear_image.publish(image)
+                recv += 1
+                if recv == 1 or recv % 60 == 0:
+                    logger.info(
+                        "X2Connection: rear-camera-bridge frame %d (%d KB)", recv, length // 1024
+                    )
+        except Exception as exc:
+            logger.exception("X2Connection: rear-camera-bridge reader crashed: %s", exc)
+
+    def _stop_rear_camera_bridge(self) -> None:
+        self._rear_cam_stop = True
+        proc = self._rear_cam_proc
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self._rear_cam_proc = None
+        if self._rear_cam_thread and self._rear_cam_thread.is_alive():
+            self._rear_cam_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        self._rear_cam_thread = None
+
     def _on_depth_image(self, msg: Any) -> None:
         image = _ros_image_to_dimos(msg)
         image.data = np.ascontiguousarray(image.data[::-1, ::-1])
@@ -1078,7 +1208,18 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         self.pointcloud.publish(_ros_pointcloud2_to_dimos(msg))
 
     def _on_lidar(self, msg: Any) -> None:
-        self.lidar.publish(_ros_pointcloud2_to_dimos(msg))
+        cloud = _ros_pointcloud2_to_dimos(msg)
+        # Lidar mount: -π/2 about X relative to torso, offset above base_link.
+        # Apply both here so the published cloud is already in base_link frame
+        # — consumers that voxelize directly (VoxelGridMapper) need world-frame
+        # points, and the rerun viz then attaches to tf#/base_link with no
+        # additional transform.
+        R = o3d.geometry.get_rotation_matrix_from_axis_angle(
+            np.array([-np.pi / 2.0, 0.0, 0.0])
+        )
+        cloud.pointcloud.rotate(R, center=(0.0, 0.0, 0.0))
+        cloud.pointcloud.translate(np.array(_LIDAR_IN_BASE_LINK))
+        self.lidar.publish(cloud)
 
     def _on_imu(self, msg: Any) -> None:
         self.imu.publish(_ros_imu_to_dimos(msg))
