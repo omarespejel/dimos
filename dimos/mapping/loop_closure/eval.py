@@ -148,7 +148,19 @@ def _eval_recording(
 
         spread = sum(_pairwise_sum(v) for v in by_marker.values())
         loop_score_sum = sum(lc.score for lc in loops_out)
-        return pgo_time, spread, len(loops_out), loop_score_sum, len(keyframes)
+        n_loops = len(loops_out)
+        n_kf = len(keyframes)
+        mean_score = loop_score_sum / n_loops if n_loops else 0.0
+        # Print from inside the worker so the line appears the moment this
+        # recording finishes, not when the parent's as_completed loop
+        # picks it up. flush=True so terminal/pipe buffering doesn't make
+        # parallel workers look sequential.
+        print(
+            f"  done {name:>14}  pgo={pgo_time:5.2f}s  spread={spread:7.3f}m  "
+            f"loops={n_loops:>3d}  mean_score={mean_score:.4f}  kf={n_kf:>4d}",
+            flush=True,
+        )
+        return pgo_time, spread, n_loops, loop_score_sum, n_kf
 
 
 def main(
@@ -233,14 +245,10 @@ def main(
                 for name in names
             }
             for f in as_completed(futures):
+                # Workers print their own "done" line on completion (see
+                # _eval_recording) — just collect results here.
                 name = futures[f]
                 results[name] = f.result()
-                pgo_time, spread, n_loops, score_sum, n_kf = results[name]
-                mean_score = score_sum / n_loops if n_loops else 0.0
-                print(
-                    f"  done {name:>14}  pgo={pgo_time:5.2f}s  spread={spread:7.3f}m  "
-                    f"loops={n_loops:>3d}  mean_score={mean_score:.4f}  kf={n_kf:>4d}"
-                )
 
     if timeout > 0:
         signal.alarm(0)
