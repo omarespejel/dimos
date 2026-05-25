@@ -25,16 +25,14 @@ from dimos.memory2.store.sqlite import SqliteStore
 from dimos.memory2.transform import QualityWindow
 from dimos.memory2.type.observation import Observation
 from dimos.memory2.vis.color import Color
-from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Transform import Transform
-from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.perception.fiducial.marker_transformer import DetectMarkers
-from dimos.robot.unitree.go2.connection import BASE_TO_OPTICAL, _camera_info_static
+from dimos.robot.unitree.go2.connection import _camera_info_static
 from dimos.utils.data import resolve_named_path
 from dimos.visualization.rerun.init import rerun_init
 
-PATH_THICKNESS = 0.01
+PATH_THICKNESS = 0.005
 
 
 def progress(total: int, label: str = "") -> Callable[[Observation[Any]], None]:
@@ -212,31 +210,19 @@ def main(
 
     marker_dets: list[Observation[Any]] = []
     if markers:
+        # Image observations in dimos recordings are stamped with
+        # frame_id="camera_optical", so obs.pose is already optical-in-world
+        # (verified: matches lidar_base_pose + BASE_TO_OPTICAL to ~1mm).
+        # No mount composition needed.
         color_image = store.stream("color_image", Image)
-
-        def _lift_pose_to_optical(obs: Observation[Image]) -> Observation[Image]:
-            # obs.pose is base_link-in-world; DetectMarkers wants optical-in-world.
-            if obs.pose is None:
-                return obs.derive(data=obs.data)
-            x, y, z, qx, qy, qz, qw = obs.pose
-            t_world_base = Transform(
-                translation=Vector3(x, y, z),
-                rotation=Quaternion(qx, qy, qz, qw),
-                frame_id="world",
-                child_frame_id="base_link",
-                ts=obs.ts,
-            )
-            return obs.derive(data=obs.data, pose=t_world_base + BASE_TO_OPTICAL)
-
         xf = DetectMarkers(
             camera_info=_camera_info_static(),
             marker_length_m=marker_size,
         )
         # 2Hz quality-gated: keep only the sharpest frame per 0.5s window.
         marker_dets = (
-            color_image.tap(progress(color_image.count(), "filtering frames"))
+            color_image.tap(progress(color_image.count(), "detecting markers"))
             .transform(QualityWindow(lambda img: img.sharpness, window=0.5))
-            .map(_lift_pose_to_optical)
             .transform(xf)
             .to_list()
         )
@@ -272,7 +258,7 @@ def main(
             )
             hovered = [(x, y, z + STEM_HEIGHT) for (x, y, z) in pgo_path]
             rr.log(
-                "world/pgo_map/keyframes",
+                "world/pgo_map/pgo/keyframes",
                 rr.Points3D(positions=hovered, colors=[[255, 255, 255]], radii=[0.025]),
                 static=True,
             )
@@ -293,8 +279,8 @@ def main(
                 for lc in loops
             ]
             rr.log(
-                "world/pgo_map/loop_closures",
-                rr.LineStrips3D(strips=loop_strips, colors=[[231, 76, 60]], radii=[0.05]),
+                "world/pgo_map/pgo/loop_closures",
+                rr.LineStrips3D(strips=loop_strips, colors=[[231, 76, 60]], radii=[0.025]),
                 static=True,
             )
         if marker_dets:
@@ -322,7 +308,7 @@ def main(
             colors = [id_to_color[d.data.marker_id] for d in marker_dets]
             labels = [f"id={d.data.marker_id}" for d in marker_dets]
             rr.log(
-                "world/markers/fill",
+                "world/raw_map/markers/fill",
                 rr.Boxes3D(
                     centers=centers,
                     half_sizes=fill_half,
@@ -334,7 +320,7 @@ def main(
                 static=True,
             )
             rr.log(
-                "world/markers/outline",
+                "world/raw_map/markers/outline",
                 rr.Boxes3D(
                     centers=centers,
                     half_sizes=outline_half,
@@ -345,6 +331,61 @@ def main(
                 ),
                 static=True,
             )
+
+            if interp is not None:
+                # PGO-corrected marker poses. interp(ts) maps raw_world →
+                # pgo_world; composing with each raw marker transform lifts
+                # it into the corrected frame so it lines up with pgo_map.
+                pgo_centers: list[tuple[float, float, float]] = []
+                pgo_quaternions: list[tuple[float, float, float, float]] = []
+                for d in marker_dets:
+                    raw_tf = Transform(
+                        translation=d.data.center,
+                        rotation=d.data.orientation,
+                        frame_id="world",
+                        child_frame_id=f"marker_{d.data.marker_id}",
+                        ts=d.ts,
+                    )
+                    corrected = interp(d.ts) + raw_tf
+                    pgo_centers.append(
+                        (
+                            corrected.translation.x,
+                            corrected.translation.y,
+                            corrected.translation.z,
+                        )
+                    )
+                    pgo_quaternions.append(
+                        (
+                            corrected.rotation.x,
+                            corrected.rotation.y,
+                            corrected.rotation.z,
+                            corrected.rotation.w,
+                        )
+                    )
+                rr.log(
+                    "world/pgo_map/markers/fill",
+                    rr.Boxes3D(
+                        centers=pgo_centers,
+                        half_sizes=fill_half,
+                        quaternions=pgo_quaternions,
+                        colors=colors,
+                        fill_mode=rr.components.FillMode.Solid,
+                        labels=labels,
+                    ),
+                    static=True,
+                )
+                rr.log(
+                    "world/pgo_map/markers/outline",
+                    rr.Boxes3D(
+                        centers=pgo_centers,
+                        half_sizes=outline_half,
+                        quaternions=pgo_quaternions,
+                        colors=[(255, 255, 255)] * n,
+                        fill_mode=rr.components.FillMode.MajorWireframe,
+                        radii=0.002,
+                    ),
+                    static=True,
+                )
 
     if export and pgo_map is not None:
         from pathlib import Path
