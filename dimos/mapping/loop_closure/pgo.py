@@ -460,8 +460,16 @@ class _PGO:
         else:
             last_local = self._key_poses[-1].local
             between = last_local.inverse().compose(local_pose)
+            # When the prior keyframe is already in a drifted region,
+            # loosen the chain variance for this step so loop closures
+            # can pull harder across the disturbance.
+            prev = self._key_poses[-1]
+            prev_drift = float(np.linalg.norm(
+                np.asarray(prev.optimized.translation()) - np.asarray(prev.local.translation())
+            ))
+            trans_var = 5e-4 if prev_drift > 1.5 else 1e-4
             noise = gtsam.noiseModel.Diagonal.Variances(
-                np.array([1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-6])
+                np.array([1e-6, 1e-6, 1e-6, trans_var, trans_var, 1e-6])
             )
             self._graph.add(gtsam.BetweenFactorPose3(idx - 1, idx, between, noise))
 
