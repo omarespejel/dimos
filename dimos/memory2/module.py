@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import enum
 import inspect
 import os
 from pathlib import Path
@@ -37,6 +38,7 @@ from dimos.models.embedding.base import EmbeddingModel
 from dimos.models.embedding.clip import CLIPModel
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.sensor_msgs.Image import Image
+from dimos.utils.data import backup_file
 from dimos.utils.logging_config import setup_logger
 
 if TYPE_CHECKING:
@@ -237,8 +239,15 @@ class SemanticSearch(MemoryModule):
         return results.transform(peaks(key=_similarity, distance=1.0)).last().pose_stamped
 
 
+class OnExisting(str, enum.Enum):
+    OVERWRITE = "overwrite"
+    ERROR = "error"
+    BACKUP = "backup"
+
+
 class RecorderConfig(MemoryModuleConfig):
-    overwrite: bool = True
+    on_existing: OnExisting = OnExisting.BACKUP
+    backup_keep_last: int = 10
     default_frame_id: str = "base_link"
     tf_tolerance: float = 0.5
     db_path: str | Path = "recording.db"
@@ -274,9 +283,12 @@ class Recorder(MemoryModule):
         # this module in a deployed blueprint.
         db_path = Path(self.config.db_path)
         if db_path.exists():
-            if self.config.overwrite:
+            if self.config.on_existing is OnExisting.OVERWRITE:
                 db_path.unlink()
                 logger.info("Deleted existing recording %s", db_path)
+            elif self.config.on_existing is OnExisting.BACKUP:
+                backup = backup_file(db_path, keep_last=self.config.backup_keep_last)
+                logger.info("Backed up existing recording %s -> %s", db_path, backup)
             else:
                 raise FileExistsError(f"Recording already exists: {db_path}")
 
