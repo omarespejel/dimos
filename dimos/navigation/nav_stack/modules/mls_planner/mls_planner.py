@@ -12,17 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-Level Surface (MLS) path planner.
-
-Extracts walkable surfaces from a voxelized global map, builds a sparse
-node graph over those surfaces, and plans paths via local A* plus
-shortest-path search on the graph. Skeleton — algorithm is filled in
-piecewise.
-"""
+"""Multi-level surface path planner."""
 
 from __future__ import annotations
 
-import math
 import time
 from typing import Any
 
@@ -38,7 +31,7 @@ import networkx as nx
 import numpy as np
 from scipy import ndimage
 from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import connected_components, dijkstra
+from scipy.sparse.csgraph import dijkstra
 
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
@@ -54,10 +47,8 @@ SURFACE_DILATION_PASSES = 3
 SURFACE_EROSION_PASSES = 3
 
 NODE_SPACING_M = 2.0
-NODE_Z_TOLERANCE_M = 1.0
+NODE_WALL_BUFFER_M = 0.3
 NODE_STEP_THRESHOLD_M = 0.25
-NODE_MAX_EDGE_COST_M = 2.5
-NODE_SUB_SAMPLE_STRIDE = 20
 
 
 class MLSPlannerConfig(ModuleConfig):
@@ -67,12 +58,7 @@ class MLSPlannerConfig(ModuleConfig):
 
 
 def _extract_surfaces(points: np.ndarray, voxel_size: float, robot_height: float) -> np.ndarray:
-    """Find walkable surface tops in a voxelized point cloud.
-
-    Iterate through all the columns, find continuous areas of
-    free space. If the free space column is at least robot height,
-    add the bottom of this range as a surface.
-    """
+    """For each XY column, mark cells with at least robot_height of free space above as surfaces."""
     if len(points) == 0:
         return np.zeros((0, 3), dtype=np.float32)
 
@@ -151,35 +137,10 @@ def _close_surface_holes(
     )
 
 
-class _GridHash:
-    """Sparse 2D bucket index over integer cell coordinates."""
-
-    def __init__(self, bucket_size_cells: int) -> None:
-        self._bucket_size = max(1, bucket_size_cells)
-        self._buckets: dict[tuple[int, int], list[int]] = {}
-
-    def _key(self, ix: int, iy: int) -> tuple[int, int]:
-        return (ix // self._bucket_size, iy // self._bucket_size)
-
-    def add(self, node_id: int, ix: int, iy: int) -> None:
-        self._buckets.setdefault(self._key(ix, iy), []).append(node_id)
-
-    def nearby(self, ix: int, iy: int, radius_cells: int) -> list[int]:
-        bucket_radius = radius_cells // self._bucket_size + 1
-        bx, by = self._key(ix, iy)
-        result: list[int] = []
-        for dbx in range(-bucket_radius, bucket_radius + 1):
-            for dby in range(-bucket_radius, bucket_radius + 1):
-                ids = self._buckets.get((bx + dbx, by + dby))
-                if ids:
-                    result.extend(ids)
-        return result
-
-
 def _build_surface_lookup(
     sx: np.ndarray, sy: np.ndarray, sz: np.ndarray
 ) -> dict[tuple[int, int], np.ndarray]:
-    """Group surface cells by XY column for fast neighbor lookup in inner A*."""
+    """Group surface cells by XY column."""
     by_column: dict[tuple[int, int], list[int]] = {}
     for ix_, iy_, iz_ in zip(sx.tolist(), sy.tolist(), sz.tolist(), strict=True):
         by_column.setdefault((ix_, iy_), []).append(iz_)
@@ -191,18 +152,7 @@ def _build_surface_adjacency(
     voxel_size: float,
     step_threshold_cells: int,
 ) -> tuple[csr_matrix, dict[tuple[int, int, int], int], list[tuple[int, int, int]]]:
-    """Build a sparse CSR adjacency over surface cells for ``scipy.csgraph.dijkstra``.
-
-    Each surface cell becomes a row index. Edges connect 8-XY-adjacent cells
-    whose ``iz`` differs by at most ``step_threshold_cells``, with weight
-    equal to the 3D step distance in metres. Returns ``(adj, cell_to_idx,
-    idx_to_cell)``.
-
-    Fully vectorized over surface cells: for each of the eight ``(dx, dy)``
-    offsets, ``np.searchsorted`` finds the range of cells in each source's
-    neighbor column at once, and the ``|dz|`` cap is applied as a numpy
-    mask.
-    """
+    """Sparse 8-connected adjacency over surface cells, with a per-step dz cap."""
     n = sum(len(zs) for zs in surface_lookup.values())
     if n == 0:
         return csr_matrix((0, 0), dtype=np.float64), {}, []
@@ -223,8 +173,7 @@ def _build_surface_adjacency(
     )
     cell_to_idx: dict[tuple[int, int, int], int] = {cell: i for i, cell in enumerate(idx_to_cell)}
 
-    # Encode (ix, iy) → int64 column key. Padding keeps neighbor keys
-    # (with dx, dy ∈ {-1, 0, +1}) in non-colliding slots from each other.
+    # Pack (ix, iy) into one int64 key; padding so dx, dy ∈ {-1, 0, +1} don't collide.
     ix_pos = ix - ix.min() + 1
     iy_pos = iy - iy.min() + 1
     y_range = int(iy_pos.max()) + 2
@@ -270,21 +219,19 @@ def _build_surface_adjacency(
     return csr_matrix((data, (rows, cols)), shape=(n, n)), cell_to_idx, idx_to_cell
 
 
-def _reconstruct_path_from_predecessors(
-    predecessors: np.ndarray,
-    src_idx: int,
-    tgt_idx: int,
-    idx_to_cell: list[tuple[int, int, int]],
-) -> np.ndarray:
-    path_indices = [tgt_idx]
-    cur = tgt_idx
-    while cur != src_idx:
-        cur = int(predecessors[cur])
-        if cur < 0:
+def _walk_predecessors(
+    predecessors: np.ndarray, end_idx: int, idx_to_cell: list[tuple[int, int, int]]
+) -> list[tuple[int, int, int]]:
+    """Walk predecessors from end_idx back to its scipy Dijkstra source (neg predecessor)."""
+    cells: list[tuple[int, int, int]] = [idx_to_cell[end_idx]]
+    cur = end_idx
+    while True:
+        nxt = int(predecessors[cur])
+        if nxt < 0:
             break
-        path_indices.append(cur)
-    path_indices.reverse()
-    return np.array([idx_to_cell[i] for i in path_indices], dtype=np.int64)
+        cells.append(idx_to_cell[nxt])
+        cur = nxt
+    return cells
 
 
 def place_nodes(
@@ -292,60 +239,60 @@ def place_nodes(
     voxel_size: float,
     *,
     node_spacing: float,
-    node_z_tolerance: float,
-    sub_sample_stride: int,
-) -> tuple[nx.Graph, dict[tuple[int, int], np.ndarray]]:
-    """Place sparse nodes over the surface map; returns ``(graph, surface_lookup)``.
+    wall_buffer: float,
+    step_threshold: float,
+) -> tuple[nx.Graph, csr_matrix, dict[tuple[int, int, int], int], list[tuple[int, int, int]]]:
+    """Place nodes by greedy NMS on the dist-to-wall field from one Dijkstra.
 
-    Strides through surface cells in lex order and adds a node whenever no
-    existing node sits within a cylinder of XY radius ``node_spacing`` and
-    half-height ``node_z_tolerance``. Edges are added separately by
-    ``add_node_edges`` so callers can publish the node cloud as soon as
-    placement returns.
-    """
+    Run multisource Dijkstra with the surface edges as sources to find distance from wall.
+    Then place nodes spaced throughout based on that distance."""
     graph = nx.Graph()
     if len(surface_points) == 0:
-        return graph, {}
+        empty_adj = csr_matrix((0, 0), dtype=np.float64)
+        return graph, empty_adj, {}, []
 
     sx = np.floor(surface_points[:, 0] / voxel_size).astype(np.int64)
     sy = np.floor(surface_points[:, 1] / voxel_size).astype(np.int64)
     sz = np.floor(surface_points[:, 2] / voxel_size).astype(np.int64)
-
     surface_lookup = _build_surface_lookup(sx, sy, sz)
 
-    spacing_cells = max(1, int(node_spacing / voxel_size))
-    z_tol_cells = max(0, int(node_z_tolerance / voxel_size))
+    step_cells = max(0, int(step_threshold / voxel_size))
+    adj, cell_to_idx, idx_to_cell = _build_surface_adjacency(surface_lookup, voxel_size, step_cells)
 
-    grid = _GridHash(spacing_cells)
-    node_ix: list[int] = []
-    node_iy: list[int] = []
-    node_iz: list[int] = []
+    n_cells = adj.shape[0]
+    if n_cells == 0:
+        return graph, adj, cell_to_idx, idx_to_cell
 
-    order = np.lexsort((sz, sy, sx))
-    spacing_sq = spacing_cells * spacing_cells
-    stride = max(1, sub_sample_stride)
+    neighbor_counts = np.diff(adj.indptr)
+    boundary_indices = np.where(neighbor_counts < 8)[0]
+    if len(boundary_indices) == 0:
+        boundary_indices = np.array([0], dtype=np.int64)
 
-    for idx in order[::stride]:
-        cix, ciy, ciz = int(sx[idx]), int(sy[idx]), int(sz[idx])
+    dist = dijkstra(adj, indices=boundary_indices, min_only=True)
 
-        in_cylinder = False
-        for nid in grid.nearby(cix, ciy, spacing_cells):
-            dx = node_ix[nid] - cix
-            dy = node_iy[nid] - ciy
-            dz = node_iz[nid] - ciz
-            if dx * dx + dy * dy < spacing_sq and abs(dz) < z_tol_cells:
-                in_cylinder = True
-                break
-        if in_cylinder:
-            continue
+    cells_arr = np.array(idx_to_cell, dtype=np.float64)
+    cell_positions = cells_arr * voxel_size + np.array([0.5 * voxel_size, 0.5 * voxel_size, 0.0])
 
-        new_id = len(node_ix)
-        node_ix.append(cix)
-        node_iy.append(ciy)
-        node_iz.append(ciz)
-        grid.add(new_id, cix, ciy)
+    candidate_mask = np.isfinite(dist) & (dist >= wall_buffer)
+    candidate_indices = np.where(candidate_mask)[0]
+    if len(candidate_indices) == 0:
+        return graph, adj, cell_to_idx, idx_to_cell
+    order = candidate_indices[np.argsort(-dist[candidate_indices])]
+
+    placed_positions = np.empty((0, 3), dtype=np.float64)
+    spacing_sq = node_spacing * node_spacing
+
+    for cell_idx in order:
+        pos = cell_positions[cell_idx]
+        if placed_positions.shape[0] > 0:
+            diff = placed_positions - pos
+            if (diff * diff).sum(-1).min() < spacing_sq:
+                continue
+        placed_positions = np.vstack([placed_positions, pos[None, :]])
+        cix, ciy, ciz = idx_to_cell[int(cell_idx)]
+        nid = graph.number_of_nodes()
         graph.add_node(
-            new_id,
+            nid,
             pos=(
                 (cix + 0.5) * voxel_size,
                 (ciy + 0.5) * voxel_size,
@@ -354,7 +301,7 @@ def place_nodes(
             cell=(cix, ciy, ciz),
         )
 
-    return graph, surface_lookup
+    return graph, adj, cell_to_idx, idx_to_cell
 
 
 def add_node_edges(
@@ -362,147 +309,72 @@ def add_node_edges(
     adj: csr_matrix,
     cell_to_idx: dict[tuple[int, int, int], int],
     idx_to_cell: list[tuple[int, int, int]],
-    voxel_size: float,
-    *,
-    max_edge_cost: float,
 ) -> None:
-    """Connect each node to nearby nodes the surface Dijkstra can reach.
+    """Add Voronoi-adjacency edges between placed nodes.
 
-    For each source node, runs scipy's bounded Dijkstra over the surface
-    adjacency and reads the cost to every higher-id candidate within
-    ``max_edge_cost`` (euclidean). Edges get the reconstructed cell path
-    stored under ``data["path"]``.
+    One multi-source Dijkstra labels each cell with its closest node. Pairs
+    of adjacent cells with different labels mark Voronoi boundaries between
+    their owners. The cheapest crossing per node-pair becomes an edge with
+    the cell path stored on data["path"].
     """
     if graph.number_of_nodes() == 0:
         return
 
-    edge_radius_cells = max(1, int(max_edge_cost / voxel_size))
+    node_ids = list(graph.nodes())
+    source_cell_indices = np.empty(len(node_ids), dtype=np.int64)
+    cell_idx_to_nid: dict[int, int] = {}
+    for nid in node_ids:
+        cell_idx = cell_to_idx[graph.nodes[nid]["cell"]]
+        source_cell_indices[nid] = cell_idx
+        cell_idx_to_nid[cell_idx] = nid
 
-    grid = _GridHash(edge_radius_cells)
-    cells: dict[int, tuple[int, int, int]] = {}
-    for node_id, data in graph.nodes(data=True):
-        cix, ciy, ciz = data["cell"]
-        cells[node_id] = (cix, ciy, ciz)
-        grid.add(node_id, cix, ciy)
+    dist, predecessors, source_cells = dijkstra(
+        adj,
+        indices=source_cell_indices,
+        min_only=True,
+        return_predecessors=True,
+    )
 
-    for node_id in sorted(graph.nodes()):
-        cix, ciy, ciz = cells[node_id]
-        candidate_cells: dict[tuple[int, int, int], int] = {}
-        for other_id in grid.nearby(cix, ciy, edge_radius_cells):
-            if other_id <= node_id:
-                continue
-            ox, oy, oz = cells[other_id]
-            dx, dy, dz = ox - cix, oy - ciy, oz - ciz
-            if math.sqrt(dx * dx + dy * dy + dz * dz) * voxel_size > max_edge_cost:
-                continue
-            candidate_cells[(ox, oy, oz)] = other_id
-        if not candidate_cells:
-            continue
+    rows = np.repeat(np.arange(adj.shape[0]), np.diff(adj.indptr))
+    cols = adj.indices
+    weights = adj.data
+    src_u = source_cells[rows]
+    src_v = source_cells[cols]
+    boundary = (src_u != src_v) & (src_u >= 0) & (src_v >= 0)
+    if not boundary.any():
+        return
 
-        src_idx = cell_to_idx.get((cix, ciy, ciz))
-        if src_idx is None:
-            continue
+    b_rows = rows[boundary]
+    b_cols = cols[boundary]
+    b_costs = dist[b_rows] + weights[boundary] + dist[b_cols]
+    b_src_u = src_u[boundary]
+    b_src_v = src_v[boundary]
 
-        dist, predecessors = dijkstra(
-            adj,
-            indices=src_idx,
-            limit=max_edge_cost,
-            return_predecessors=True,
-        )
+    # Keep the min-cost boundary crossing per (node_a, node_b) pair.
+    best: dict[tuple[int, int], tuple[float, int, int]] = {}
+    for i in range(len(b_costs)):
+        nid_a = cell_idx_to_nid[int(b_src_u[i])]
+        nid_b = cell_idx_to_nid[int(b_src_v[i])]
+        u_a = int(b_rows[i])
+        u_b = int(b_cols[i])
+        if nid_a > nid_b:
+            nid_a, nid_b = nid_b, nid_a
+            u_a, u_b = u_b, u_a
+        cost = float(b_costs[i])
+        existing = best.get((nid_a, nid_b))
+        if existing is None or existing[0] > cost:
+            best[(nid_a, nid_b)] = (cost, u_a, u_b)
 
-        for cell, other_id in candidate_cells.items():
-            tgt_idx = cell_to_idx.get(cell)
-            if tgt_idx is None or not math.isfinite(dist[tgt_idx]):
-                continue
-            graph.add_edge(
-                node_id,
-                other_id,
-                weight=float(dist[tgt_idx]),
-                path=_reconstruct_path_from_predecessors(
-                    predecessors, src_idx, tgt_idx, idx_to_cell
-                ),
-            )
-
-
-def add_connectivity_bridges(
-    graph: nx.Graph,
-    adj: csr_matrix,
-    cell_to_idx: dict[tuple[int, int, int], int],
-    idx_to_cell: list[tuple[int, int, int]],
-) -> int:
-    """Bridge graph components that share a surface component but aren't connected.
-
-    Flood-fills the surface adjacency to label every cell with its connected
-    component, then for each surface component containing more than one
-    graph component, iteratively connects the closest cell-distance pair of
-    nodes across two unmerged components with an uncapped surface Dijkstra
-    edge. Returns the number of bridges added.
-    """
-    if graph.number_of_nodes() == 0:
-        return 0
-
-    _, surf_labels = connected_components(adj, directed=False)
-
-    nodes_by_surf_cc: dict[int, list[int]] = {}
-    for node_id in graph.nodes():
-        cell = graph.nodes[node_id]["cell"]
-        cell_idx = cell_to_idx.get(cell)
-        if cell_idx is None:
-            continue
-        nodes_by_surf_cc.setdefault(int(surf_labels[cell_idx]), []).append(node_id)
-
-    bridges_added = 0
-    for node_ids in nodes_by_surf_cc.values():
-        components = [list(c) for c in nx.connected_components(graph.subgraph(node_ids))]
-        while len(components) > 1:
-            best_cost_sq = math.inf
-            best_i = best_j = best_ai = best_bi = -1
-            for i in range(len(components)):
-                cells_i = np.array([graph.nodes[n]["cell"] for n in components[i]], dtype=np.int64)
-                for j in range(i + 1, len(components)):
-                    cells_j = np.array(
-                        [graph.nodes[n]["cell"] for n in components[j]], dtype=np.int64
-                    )
-                    diff = cells_i[:, None, :] - cells_j[None, :, :]
-                    dist_sq = (diff * diff).sum(-1)
-                    flat = int(dist_sq.argmin())
-                    ai, bi = divmod(flat, len(components[j]))
-                    c = int(dist_sq[ai, bi])
-                    if c < best_cost_sq:
-                        best_cost_sq = c
-                        best_i, best_j, best_ai, best_bi = i, j, ai, bi
-            node_a = components[best_i][best_ai]
-            node_b = components[best_j][best_bi]
-            src_idx = cell_to_idx[graph.nodes[node_a]["cell"]]
-            tgt_idx = cell_to_idx[graph.nodes[node_b]["cell"]]
-            dist, predecessors = dijkstra(adj, indices=src_idx, return_predecessors=True)
-            if math.isfinite(dist[tgt_idx]):
-                graph.add_edge(
-                    node_a,
-                    node_b,
-                    weight=float(dist[tgt_idx]),
-                    path=_reconstruct_path_from_predecessors(
-                        predecessors, src_idx, tgt_idx, idx_to_cell
-                    ),
-                )
-                bridges_added += 1
-            merged = components[best_i] + components[best_j]
-            components = [
-                components[k] for k in range(len(components)) if k not in (best_i, best_j)
-            ]
-            components.append(merged)
-
-    return bridges_added
+    for (nid_a, nid_b), (cost, u_a, u_b) in best.items():
+        path_a = _walk_predecessors(predecessors, u_a, idx_to_cell)
+        path_b = _walk_predecessors(predecessors, u_b, idx_to_cell)
+        path_a.reverse()
+        full_path = np.array(path_a + path_b, dtype=np.int64)
+        graph.add_edge(nid_a, nid_b, weight=cost, path=full_path)
 
 
 class _PublishableLineSegments3D(LineSegments3D):
-    """LineSegments3D with a Python lcm_encode that matches the C++ wire format.
-
-    Upstream only implements decode (encode raises NotImplementedError); this
-    subclass produces the same nav_msgs/Path wire layout, where consecutive
-    pose pairs are interpreted as segments and pose.orientation.w carries
-    traversability.
-    """
+    """LineSegments3D with a Python lcm_encode; upstream only implements decode."""
 
     def lcm_encode(self) -> bytes:
         lcm_msg = LCMPath()
@@ -541,7 +413,7 @@ def _nodes_to_cloud(graph: nx.Graph) -> np.ndarray:
 def _edges_to_segments(
     graph: nx.Graph, voxel_size: float
 ) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
-    """Walk each edge's cached A* path and emit consecutive cell pairs as segments."""
+    """Emit one segment per consecutive cell pair along each edge's cached path."""
     segments: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
     for _, _, data in graph.edges(data=True):
         path_cells: np.ndarray = data["path"]
@@ -593,18 +465,14 @@ class MLSPlanner(Module):
             surface_ms=round(surfaces_ms, 1),
         )
 
-        logger.info(
-            "Placing nodes",
-            spacing_m=NODE_SPACING_M,
-            stride=NODE_SUB_SAMPLE_STRIDE,
-        )
+        logger.info("Placing nodes", spacing_m=NODE_SPACING_M)
         t1 = time.perf_counter()
-        graph, surface_lookup = place_nodes(
+        graph, adj, cell_to_idx, idx_to_cell = place_nodes(
             surface_points,
             self.config.voxel_size,
             node_spacing=NODE_SPACING_M,
-            node_z_tolerance=NODE_Z_TOLERANCE_M,
-            sub_sample_stride=NODE_SUB_SAMPLE_STRIDE,
+            wall_buffer=NODE_WALL_BUFFER_M,
+            step_threshold=NODE_STEP_THRESHOLD_M,
         )
         place_ms = (time.perf_counter() - t1) * 1000
         self.nodes.publish(
@@ -620,35 +488,14 @@ class MLSPlanner(Module):
             place_ms=round(place_ms, 1),
         )
 
-        step_cells = max(0, int(NODE_STEP_THRESHOLD_M / self.config.voxel_size))
-        adj, cell_to_idx, idx_to_cell = _build_surface_adjacency(
-            surface_lookup, self.config.voxel_size, step_cells
-        )
-
-        logger.info("Building edges", max_edge_cost_m=NODE_MAX_EDGE_COST_M)
+        logger.info("Building edges")
         t2 = time.perf_counter()
-        add_node_edges(
-            graph,
-            adj,
-            cell_to_idx,
-            idx_to_cell,
-            self.config.voxel_size,
-            max_edge_cost=NODE_MAX_EDGE_COST_M,
-        )
+        add_node_edges(graph, adj, cell_to_idx, idx_to_cell)
         edges_ms = (time.perf_counter() - t2) * 1000
         logger.info(
             "Edges built",
             edges=graph.number_of_edges(),
             edges_ms=round(edges_ms, 1),
-        )
-
-        t3 = time.perf_counter()
-        n_bridges = add_connectivity_bridges(graph, adj, cell_to_idx, idx_to_cell)
-        bridges_ms = (time.perf_counter() - t3) * 1000
-        logger.info(
-            "Bridges added",
-            bridges=n_bridges,
-            bridges_ms=round(bridges_ms, 1),
         )
 
         self._graph = graph
