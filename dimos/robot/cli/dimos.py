@@ -722,6 +722,16 @@ def map_cmd(
     marker_size: float = typer.Option(
         0.1, "--marker-size", help="Physical marker edge length in meters (--markers only)"
     ),
+    marker_max_speed: float = typer.Option(
+        0.05,
+        "--marker-max-speed",
+        help="Skip frames where robot is moving faster than this (m/s); 0 disables",
+    ),
+    marker_max_rot_rate: float = typer.Option(
+        15.0,
+        "--marker-max-rot-rate",
+        help="Skip frames where robot is rotating faster than this (deg/s); 0 disables",
+    ),
 ) -> None:
     """Rebuild a voxel map from a recorded SQLite dataset and view it in rerun."""
     from dimos.utils.cli.map import main as map_main
@@ -738,6 +748,8 @@ def map_cmd(
         no_gui=no_gui,
         markers=markers,
         marker_size=marker_size,
+        marker_max_speed=marker_max_speed,
+        marker_max_rot_rate=marker_max_rot_rate,
     )
 
 

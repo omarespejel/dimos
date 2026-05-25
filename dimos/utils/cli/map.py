@@ -22,7 +22,8 @@ import typer
 
 from dimos.mapping.voxels import VoxelGrid
 from dimos.memory2.store.sqlite import SqliteStore
-from dimos.memory2.transform import QualityWindow
+from dimos.memory2.stream import Stream
+from dimos.memory2.transform import QualityWindow, SpeedLimit
 from dimos.memory2.type.observation import Observation
 from dimos.memory2.vis.color import Color
 from dimos.msgs.geometry_msgs.Transform import Transform
@@ -32,7 +33,7 @@ from dimos.robot.unitree.go2.connection import _camera_info_static
 from dimos.utils.data import resolve_named_path
 from dimos.visualization.rerun.init import rerun_init
 
-PATH_THICKNESS = 0.005
+PATH_THICKNESS = 0.01
 
 
 def progress(total: int, label: str = "") -> Callable[[Observation[Any]], None]:
@@ -101,6 +102,16 @@ def main(
     ),
     marker_size: float = typer.Option(
         0.1, "--marker-size", help="Physical marker edge length in meters (--markers only)"
+    ),
+    marker_max_speed: float = typer.Option(
+        0.3,
+        "--marker-max-speed",
+        help="Skip frames where robot is moving faster than this (m/s); 0 disables",
+    ),
+    marker_max_rot_rate: float = typer.Option(
+        30.0,
+        "--marker-max-rot-rate",
+        help="Skip frames where robot is rotating faster than this (deg/s); 0 disables",
     ),
 ) -> None:
     db_path = resolve_named_path(dataset, ".db")
@@ -219,13 +230,20 @@ def main(
             camera_info=_camera_info_static(),
             marker_length_m=marker_size,
         )
-        # 2Hz quality-gated: keep only the sharpest frame per 0.5s window.
-        marker_dets = (
-            color_image.tap(progress(color_image.count(), "detecting markers"))
-            .transform(QualityWindow(lambda img: img.sharpness, window=0.5))
-            .transform(xf)
-            .to_list()
-        )
+        # 2Hz quality-gated: keep only the sharpest frame per 0.5s window,
+        # then drop frames where the robot was moving (linear + rotational)
+        # faster than the limits — speed/rate are averaged across the window.
+        pipeline: Stream[Image] = color_image.tap(
+            progress(color_image.count(), "detecting markers")
+        ).transform(QualityWindow(lambda img: img.sharpness, window=0.5))
+        if marker_max_speed > 0:
+            pipeline = pipeline.transform(
+                SpeedLimit(
+                    max_mps=marker_max_speed,
+                    max_dps=marker_max_rot_rate if marker_max_rot_rate > 0 else None,
+                )
+            )
+        marker_dets = pipeline.transform(xf).to_list()
         unique = sorted({obs.data.marker_id for obs in marker_dets})
         print(f"markers: {len(marker_dets)} detections across {len(unique)} unique ids {unique}")
 

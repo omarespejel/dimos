@@ -191,6 +191,67 @@ def speed() -> FnIterTransformer[Any, float]:
     return FnIterTransformer(_speed)
 
 
+class SpeedLimit(Transformer[T, T]):
+    """Pass through observations whose linear (and optionally angular) speed is low.
+
+    Linear: ``||Δtranslation|| / Δt`` in m/s, must be ≤ ``max_mps``.
+    Angular: rotation-angle-between-quaternions / Δt in deg/s, must be
+    ≤ ``max_dps`` when set.
+
+    Both metrics are computed between consecutive observations in stream
+    order. Use to drop motion-blurry frames from fiducial / OCR /
+    SLAM-frontend pipelines.
+
+    First observation is dropped (no reference). Observations with no
+    ``.pose`` are skipped. ``Δt ≤ 0`` (duplicate / non-monotonic
+    timestamps) is treated as unknown and dropped.
+
+    Note: the effective sampling interval is whatever upstream provides.
+    Chain after ``QualityWindow(window=Δt)`` to measure motion over a
+    fixed time window instead of per-frame.
+    """
+
+    def __init__(self, max_mps: float, max_dps: float | None = None) -> None:
+        if max_mps <= 0:
+            raise ValueError(f"max_mps must be > 0, got {max_mps}")
+        if max_dps is not None and max_dps <= 0:
+            raise ValueError(f"max_dps must be > 0 when set, got {max_dps}")
+        self.max_mps = max_mps
+        self.max_dps = max_dps
+
+    def __call__(self, upstream: Iterator[Observation[T]]) -> Iterator[Observation[T]]:
+        prev: Observation[T] | None = None
+        max_mps = self.max_mps
+        max_dps = self.max_dps
+        max_rps = math.radians(max_dps) if max_dps is not None else None
+        for obs in upstream:
+            if obs.pose is None:
+                continue
+            if prev is not None and prev.pose is not None:
+                dt = obs.ts - prev.ts
+                if dt > 0:
+                    dx = obs.pose[0] - prev.pose[0]
+                    dy = obs.pose[1] - prev.pose[1]
+                    dz = obs.pose[2] - prev.pose[2]
+                    v = math.sqrt(dx * dx + dy * dy + dz * dz) / dt
+                    ok = v <= max_mps
+                    if ok and max_rps is not None:
+                        # rotation angle between two unit quaternions.
+                        # |q · q'| collapses the double-cover sign ambiguity;
+                        # clamp guards against numerical drift past 1.
+                        dot = (
+                            obs.pose[3] * prev.pose[3]
+                            + obs.pose[4] * prev.pose[4]
+                            + obs.pose[5] * prev.pose[5]
+                            + obs.pose[6] * prev.pose[6]
+                        )
+                        angle = 2.0 * math.acos(min(1.0, abs(dot)))
+                        ok = (angle / dt) <= max_rps
+                    if ok:
+                        yield obs
+            prev = obs
+
+
 def smooth(window: int) -> FnIterTransformer[float, float]:
     """Sliding window average over obs.data (must be numeric)."""
 
