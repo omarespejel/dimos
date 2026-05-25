@@ -66,6 +66,43 @@ outcome.
 
 **The first run**: establish the baseline with `pgo.py` unmodified.
 
+## Investigation is part of the loop
+
+Twiddling knobs blindly is the slow way. Between experiments, **look at
+the actual data** — this is encouraged, not a detour from "real" work.
+A single discard doesn't mean a direction is dead; it means *this
+specific implementation* didn't help. Before abandoning an idea,
+investigate *why* the metric moved (or didn't):
+
+- **Run per-recording with `--verbose`** to see live loop-closure events
+  with scores and source/target keyframe indices:
+  `uv run python -m dimos.mapping.loop_closure.eval hk_village2 -v`.
+  A param change that, say, *adds* loop closures but worsens spread
+  tells a very different story than one that *removes* them.
+- **Use `dimos/utils/cli/map.py`** as the visualization companion. It
+  runs the same PGO + marker pipeline as the eval and renders the
+  result in rerun. Use `--no-gui` for headless inspection or run with
+  GUI locally to scrub the timeline and see where markers cluster, where
+  the path drifts, when loop closures fire:
+  `uv run dimos map hk_village2 --pgo --markers --no-gui`
+- **Write small throwaway scripts** in `/tmp` to interrogate state that
+  the eval doesn't surface — per-marker spread breakdown, loop closure
+  score distribution, keyframe density over time, etc. The eval is
+  intentionally one number for tuning; the script lets you SEE.
+- **Read `pgo.py`** end-to-end before changing a knob whose effect you
+  can't predict. The docstrings and inline comments explain the
+  invariants. Same for `marker_transformer.py` if you're not sure what
+  `track_id` / `marker_id` mean.
+- **Form a theory, then test it.** "If I raise `min_icp_inliers`, I
+  expect fewer accepted closures but tighter mean_score and possibly
+  worse spread because the graph has fewer constraints." Then run, and
+  *check whether the observed change matches your prediction.* When it
+  doesn't, that's a learning, not a failure.
+
+Investigation runs don't count toward the experiment log unless you
+also commit a `pgo.py` change. They cost a few minutes; the
+understanding compounds across the rest of the night.
+
 ## Running the eval
 
 ```bash
@@ -155,11 +192,28 @@ re-run. Fundamentally broken idea → log `crash` and move on.
 **NEVER STOP**: Once the loop has begun, do NOT pause to ask the human
 if you should continue. Don't ask "should I keep going?" or "is this a
 good stopping point?". The human might be asleep or away. You are
-autonomous; the loop runs until you are manually stopped. If you run
-out of ideas: re-read `pgo.py` for new angles, look at the papers/code
-links in its docstring, try combining previous near-misses, try more
-radical changes (different loop-detection radius scaling, different
-ICP estimator, swapping GTSAM optimizer, etc.).
+autonomous; the loop runs until you are manually stopped.
+
+**Don't give up on a direction after one bad result.** A single
+`discard` is one data point about *one specific implementation*, not a
+verdict on the underlying idea. If you tried "stricter ICP gating" and
+it worsened spread, that doesn't mean ICP gating is the wrong knob —
+maybe your value was wrong, maybe it interacted with another setting,
+maybe the effect was on a recording you didn't expect. **Investigate
+before you abandon** (see the Investigation section above): inspect the
+per-recording numbers, run `dimos map ... --markers --no-gui` to see
+where the spread actually comes from, write a 20-line script to print
+loop-closure scores per recording. Often the next experiment in a
+"failed" direction is the one that pays off, once you understand the
+mechanism.
+
+**If you run out of ideas**: re-read `pgo.py` for angles you haven't
+touched, look at the papers/code links in its docstrings, try
+combining previous near-misses, try more radical changes (different
+loop-detection radius scaling, different ICP estimator, swapping GTSAM
+optimizer, etc.). Look at the recordings themselves — `dimos map
+hk_villageN --pgo --markers` gives you ground truth for what the data
+looks like.
 
 A typical use case: human leaves you running while they sleep. At
 ~2 min/eval you can run ~30/hour, or roughly 240 experiments over an
