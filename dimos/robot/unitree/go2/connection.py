@@ -70,7 +70,7 @@ class Go2Mode(str, Enum):
 class ConnectionConfig(ModuleConfig):
     ip: str = Field(default_factory=lambda m: m["g"].robot_ip)
     mode: Go2Mode = Go2Mode.DEFAULT
-    frame_id: str | None = DEFAULT_ROBOT_FRAME
+    frame_id: str = DEFAULT_ROBOT_FRAME
     parent_frame_id: str = DEFAULT_WORLD_FRAME
     static_publish_rate: float = 1.0
     static_transforms: dict[str, Transform] = Field(
