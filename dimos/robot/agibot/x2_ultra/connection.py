@@ -30,10 +30,12 @@ from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
+from dimos.msgs.geometry_msgs.Pose import Pose
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
+from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.Imu import Imu
@@ -333,6 +335,24 @@ def _ros_camera_info_to_dimos(msg: Any) -> CameraInfo:
     )
 
 
+_GRAVITY_WORLD = np.array([0.0, 0.0, 9.80665], dtype=np.float64)
+
+
+def _quat_xyzw_to_rotmat(x: float, y: float, z: float, w: float) -> np.ndarray:
+    """Body→world rotation matrix from an XYZW quaternion (unit quaternion assumed)."""
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return np.array(
+        [
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+        ],
+        dtype=np.float64,
+    )
+
+
 def _ros_imu_to_dimos(msg: Any) -> Imu:
     """Convert a ROS2 sensor_msgs/Imu to a dimos Imu."""
     ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -372,6 +392,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
       pointcloud   — depth point cloud from head RGBD camera
       lidar        — chest LiDAR point cloud
       imu          — chest IMU
+      odometry     — SLAM-localized base pose + twist (nav_msgs/Odometry)
       joint_state  — combined arm/leg/waist/head joint positions (names match URDF/MJCF
                      without the "_joint" suffix)
 
@@ -397,6 +418,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
     pointcloud: Out[PointCloud2]
     lidar: Out[PointCloud2]
     imu: Out[Imu]
+    odometry: Out[Odometry]
     joint_state: Out[JointState]
 
     _ros_node: Any = None
@@ -434,6 +456,18 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         self._arm_ctrl_thread = None
         self._arm_ctrl_stop = False
         self._arm_state_seen = False  # set once joint_state slice arrives
+        # IMU-integrated odometry state. Pure strapdown integration of
+        # specific-force drifts fast (metres within a few seconds at rest);
+        # this is dead-reckoning only — wire in a corrective source if you
+        # need position over longer horizons.
+        self._odom_pos = np.zeros(3, dtype=np.float64)
+        self._odom_vel = np.zeros(3, dtype=np.float64)
+        self._odom_last_ts: float | None = None
+        # Latest base_link → odom transform, latched from the IMU callback so
+        # the lidar callback can lift the cloud into the odom frame.
+        self._odom_tf_lock = Lock()
+        self._odom_tf_R: np.ndarray | None = None  # 3×3 body→odom
+        self._odom_tf_t: np.ndarray = np.zeros(3, dtype=np.float64)
 
     @rpc
     def start(self) -> None:
@@ -1219,10 +1253,77 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         )
         cloud.pointcloud.rotate(R, center=(0.0, 0.0, 0.0))
         cloud.pointcloud.translate(np.array(_LIDAR_IN_BASE_LINK))
+
+        # Lift base_link → odom using the latest IMU-integrated pose so the
+        # cloud accumulates in the world frame as the robot moves.
+        with self._odom_tf_lock:
+            R_odom = self._odom_tf_R
+            t_odom = self._odom_tf_t
+        if R_odom is not None:
+            cloud.pointcloud.rotate(R_odom, center=(0.0, 0.0, 0.0))
+            cloud.pointcloud.translate(t_odom)
+
         self.lidar.publish(cloud)
 
     def _on_imu(self, msg: Any) -> None:
-        self.imu.publish(_ros_imu_to_dimos(msg))
+        imu = _ros_imu_to_dimos(msg)
+        self.imu.publish(imu)
+
+        # Strapdown dead-reckoning: rotate the IMU specific force into the world
+        # frame using the IMU's own orientation estimate, subtract gravity, then
+        # Euler-integrate to velocity and position. Drifts quickly without any
+        # corrective update — useful as a relative-motion signal, not an
+        # absolute pose. Replace with a real odom source when available.
+        R = _quat_xyzw_to_rotmat(
+            imu.orientation.x,
+            imu.orientation.y,
+            imu.orientation.z,
+            imu.orientation.w,
+        )
+        last_ts = self._odom_last_ts
+        self._odom_last_ts = imu.ts
+        if last_ts is not None:
+            dt = imu.ts - last_ts
+            # Guard against stale/out-of-order samples (NTP step, missed packet).
+            if 0.0 < dt < 0.5:
+                a_body = np.array(
+                    [
+                        imu.linear_acceleration.x,
+                        imu.linear_acceleration.y,
+                        imu.linear_acceleration.z,
+                    ],
+                    dtype=np.float64,
+                )
+                a_world = R @ a_body - _GRAVITY_WORLD
+                # Trapezoidal-ish: p uses v before the velocity update.
+                self._odom_pos += self._odom_vel * dt + 0.5 * a_world * dt * dt
+                self._odom_vel += a_world * dt
+
+        # Latch the latest base_link → odom transform for the lidar callback.
+        with self._odom_tf_lock:
+            self._odom_tf_R = R
+            self._odom_tf_t = self._odom_pos.copy()
+
+        self.odometry.publish(
+            Odometry(
+                ts=imu.ts,
+                frame_id="odom",
+                child_frame_id=imu.frame_id,
+                pose=Pose(
+                    position=self._odom_pos.tolist(),
+                    orientation=[
+                        imu.orientation.x,
+                        imu.orientation.y,
+                        imu.orientation.z,
+                        imu.orientation.w,
+                    ],
+                ),
+                twist=Twist(
+                    linear=Vector3(*self._odom_vel.tolist()),
+                    angular=imu.angular_velocity,
+                ),
+            )
+        )
 
     def _on_camera_info(self, msg: Any) -> None:
         self.camera_info.publish(_ros_camera_info_to_dimos(msg))
