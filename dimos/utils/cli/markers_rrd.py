@@ -62,7 +62,7 @@ def main(
         0.1, "--quality-window", help="Sharpest-frame window for detection (s)"
     ),
     smoothing_window: float = typer.Option(
-        5.0, "--smoothing-window", help="Buffer window for averaged-track pass (s); 0 disables"
+        7.5, "--smoothing-window", help="Buffer window for averaged-track pass (s); 0 disables"
     ),
 ) -> None:
     db_path = resolve_named_path(dataset, ".db")
