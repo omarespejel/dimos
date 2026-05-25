@@ -65,6 +65,17 @@
           postInstall = pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
             ${pkgs.darwin.cctools}/bin/install_name_tool -add_rpath ${gtsam}/lib $out/bin/pgo
           '';
+
+          # On Linux, promote DT_RUNPATH → DT_RPATH so the nix-store libs are
+          # resolved before anything on LD_LIBRARY_PATH. Without this,
+          # `source /opt/ros/humble/setup.bash` pulls in ROS's own
+          # libgtsam.so.4 (linked against Ubuntu boost 1.74), which then
+          # fails to load libboost_serialization.so.1.74.0 on hosts without
+          # the Ubuntu boost dev package installed.
+          postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+            patchelf --force-rpath --set-rpath \
+              "$(patchelf --print-rpath $out/bin/pgo)" $out/bin/pgo
+          '';
         };
       });
 }
