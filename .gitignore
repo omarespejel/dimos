@@ -86,3 +86,6 @@ htmlcov/
 
 # Memory2 autorecord
 recording*.db
+
+# Memory2 markers rrd tests
+*.rrd
