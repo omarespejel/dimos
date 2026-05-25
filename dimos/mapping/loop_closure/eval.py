@@ -22,15 +22,12 @@ hk_village recordings and reports two totals to minimize:
   loop closures.
 
 Usage:
-    uv run python -m dimos.mapping.loop_closure.marker_eval
-    uv run python -m dimos.mapping.loop_closure.marker_eval hk_village1
+    uv run python -m dimos.mapping.loop_closure.eval
+    uv run python -m dimos.mapping.loop_closure.eval hk_village1
 """
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing as mp
-import os
 import time
 from typing import Any
 
@@ -146,51 +143,24 @@ def main(
     marker_max_rot_rate: float = typer.Option(50.0, "--marker-max-rot-rate"),
     marker_quality_window: float = typer.Option(0.1, "--marker-quality-window"),
     marker_smoothing: float = typer.Option(7.5, "--marker-smoothing"),
-    workers: int = typer.Option(
-        0, "--workers", "-j", help="Parallel workers (0 = min(len(datasets), cpu_count))"
-    ),
 ) -> None:
     names = datasets or DEFAULT_DATASETS
 
-    n_workers = workers or min(len(names), os.cpu_count() or 1)
+    # Sequential: PGO (Open3D) and marker detection (cv2/numpy) already
+    # saturate available cores internally via OpenMP — process-level
+    # parallelism only adds contention.
     wall_start = time.perf_counter()
     results: dict[str, tuple[float, float]] = {}
-
-    if n_workers <= 1 or len(names) <= 1:
-        for name in names:
-            print(f"eval {name}...")
-            results[name] = _eval_recording(
-                name,
-                marker_size=marker_size,
-                marker_max_speed=marker_max_speed,
-                marker_max_rot_rate=marker_max_rot_rate,
-                marker_quality_window=marker_quality_window,
-                marker_smoothing=marker_smoothing,
-            )
-    else:
-        print(f"running {len(names)} recordings on {n_workers} workers")
-        # "spawn" — workers are fresh interpreters. Forking after cv2/openmp
-        # have spun threads in the parent deadlocks because the threads
-        # don't survive fork; spawn sidesteps it entirely.
-        with ProcessPoolExecutor(max_workers=n_workers, mp_context=mp.get_context("spawn")) as ex:
-            futures = {
-                ex.submit(
-                    _eval_recording,
-                    name,
-                    marker_size=marker_size,
-                    marker_max_speed=marker_max_speed,
-                    marker_max_rot_rate=marker_max_rot_rate,
-                    marker_quality_window=marker_quality_window,
-                    marker_smoothing=marker_smoothing,
-                ): name
-                for name in names
-            }
-            for f in as_completed(futures):
-                name = futures[f]
-                results[name] = f.result()
-                pgo_time, spread = results[name]
-                print(f"  done {name:>14}  pgo={pgo_time:5.2f}s  spread={spread:7.3f}m")
-
+    for name in names:
+        print(f"eval {name}...")
+        results[name] = _eval_recording(
+            name,
+            marker_size=marker_size,
+            marker_max_speed=marker_max_speed,
+            marker_max_rot_rate=marker_max_rot_rate,
+            marker_quality_window=marker_quality_window,
+            marker_smoothing=marker_smoothing,
+        )
     wall = time.perf_counter() - wall_start
 
     total_pgo = 0.0
