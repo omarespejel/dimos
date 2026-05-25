@@ -2271,7 +2271,7 @@ project-deps = [
 ]
 tests = [
     { name = "coverage" },
-    { name = "dimos", extra = ["apriltag", "cpu", "drone", "psql", "visualization", "web"] },
+    { name = "dimos", extra = ["apriltag", "cpu", "drone", "mapping", "psql", "visualization", "web"] },
     { name = "gdown" },
     { name = "googlemaps" },
     { name = "hydra-core" },
@@ -2312,7 +2312,7 @@ tests = [
 ]
 tests-self-hosted = [
     { name = "coverage" },
-    { name = "dimos", extra = ["agents", "apriltag", "cpu", "drone", "manipulation", "misc", "perception", "psql", "sim", "unitree", "visualization", "web"] },
+    { name = "dimos", extra = ["agents", "apriltag", "cpu", "drone", "manipulation", "mapping", "misc", "perception", "psql", "sim", "unitree", "visualization", "web"] },
     { name = "gdown" },
     { name = "googlemaps" },
     { name = "hydra-core" },
@@ -2558,7 +2558,7 @@ project-deps = [
 ]
 tests = [
     { name = "coverage", specifier = ">=7.0" },
-    { name = "dimos", extras = ["apriltag", "psql", "drone", "cpu"] },
+    { name = "dimos", extras = ["apriltag", "mapping", "psql", "drone", "cpu"] },
     { name = "dimos", extras = ["web", "visualization"] },
     { name = "gdown", specifier = "==6.0.0" },
     { name = "googlemaps", specifier = ">=4.10.0" },
@@ -2601,7 +2601,7 @@ tests = [
 tests-self-hosted = [
     { name = "coverage", specifier = ">=7.0" },
     { name = "dimos", extras = ["agents", "perception", "manipulation", "sim", "unitree", "misc"] },
-    { name = "dimos", extras = ["apriltag", "psql", "drone", "cpu"] },
+    { name = "dimos", extras = ["apriltag", "mapping", "psql", "drone", "cpu"] },
     { name = "dimos", extras = ["web", "visualization"] },
     { name = "gdown", specifier = "==6.0.0" },
     { name = "googlemaps", specifier = ">=4.10.0" },
