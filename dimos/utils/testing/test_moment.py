@@ -22,8 +22,7 @@ from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.protocol.tf.tf import TF
-from dimos.robot.unitree.go2 import connection
-from dimos.robot.unitree.go2.config import camera_info_static
+from dimos.robot.unitree.go2.config import camera_info_static, odom_to_tf
 from dimos.utils.data import get_data
 from dimos.utils.testing.moment import Moment, SensorMoment
 
@@ -52,7 +51,7 @@ class Go2Moment(Moment):
         # back and forth through time and the viewer doesn't get confused
         odom = self.odom.value
         odom.ts = time.time()
-        return connection.GO2Connection._odom_to_tf(odom)
+        return odom_to_tf(odom)
 
     def publish(self) -> None:
         t = TF()
