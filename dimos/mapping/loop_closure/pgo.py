@@ -92,8 +92,10 @@ class PGOConfig(BaseConfig):
 
     # Loop closure
     loop_search_radius: float = 2.0
-    loop_search_radius_local: float = 5.0
+    loop_search_radius_local: float = 15.0
+    loop_fallback_drift_thresh: float = 0.5  # min drift to trigger local fallback
     loop_time_thresh: float = 20.0
+    loop_time_thresh_local: float = 40.0  # stricter time gap for local fallback
     loop_score_thresh: float = 0.3
     loop_score_thresh_tight: float = 0.05  # early-exit threshold: ICP rmse ~22cm
     loop_submap_half_range: int = 40
@@ -116,7 +118,9 @@ class PGOKwargs(TypedDict, total=False):
     key_pose_delta_deg: float
     loop_search_radius: float
     loop_search_radius_local: float
+    loop_fallback_drift_thresh: float
     loop_time_thresh: float
+    loop_time_thresh_local: float
     loop_score_thresh: float
     loop_score_thresh_tight: float
     loop_submap_half_range: int
@@ -511,30 +515,29 @@ class _PGO:
         loc_positions = np.array(
             [np.asarray(kp.local.translation()) for kp in self._key_poses[:-1]]
         )
-        # Tight radius in optimized frame (precise revisits). Only fall
-        # back to wider local-frame search when the optimized-frame search
-        # returns nothing — drift has pushed neighbors out of range and
-        # we need relocalization. For easy datasets, this keeps the
-        # candidate set tight (no extra noise from far neighbors).
-        opt_idxs = KDTree(opt_positions).query_ball_point(cur_opt_t, self._cfg.loop_search_radius)
-        if opt_idxs:
-            idxs = set(opt_idxs)
-        else:
-            idxs = set(KDTree(loc_positions).query_ball_point(cur_loc_t, self._cfg.loop_search_radius_local))
-        if not idxs:
-            return
+        def _collect(idxs: set[int], time_thresh: float) -> list[tuple[float, int]]:
+            cands = []
+            for i in idxs:
+                if abs(cur_ts - self._key_poses[i].timestamp) <= time_thresh:
+                    continue
+                d_opt = float(np.linalg.norm(np.asarray(self._key_poses[i].optimized.translation()) - cur_opt_t))
+                d_loc = float(np.linalg.norm(np.asarray(self._key_poses[i].local.translation()) - cur_loc_t))
+                cands.append((min(d_opt, d_loc), i))
+            cands.sort()
+            return cands
 
-        # Sort by min(opt_dist, loc_dist) and filter out recent keyframes.
-        candidates = []
-        for i in idxs:
-            if abs(cur_ts - self._key_poses[i].timestamp) <= self._cfg.loop_time_thresh:
-                continue
-            d_opt = float(np.linalg.norm(np.asarray(self._key_poses[i].optimized.translation()) - cur_opt_t))
-            d_loc = float(np.linalg.norm(np.asarray(self._key_poses[i].local.translation()) - cur_loc_t))
-            candidates.append((min(d_opt, d_loc), i))
+        # Tight optimized-frame search first; if none survive the
+        # time-gap filter AND accumulated drift is large enough that we
+        # likely need a relocalization, fall back to wider local-frame
+        # search with a stricter time gap.
+        opt_idxs = set(KDTree(opt_positions).query_ball_point(cur_opt_t, self._cfg.loop_search_radius))
+        candidates = _collect(opt_idxs, self._cfg.loop_time_thresh)
+        drift = float(np.linalg.norm(cur_opt_t - cur_loc_t))
+        if not candidates and drift > self._cfg.loop_fallback_drift_thresh:
+            loc_idxs = set(KDTree(loc_positions).query_ball_point(cur_loc_t, self._cfg.loop_search_radius_local))
+            candidates = _collect(loc_idxs - opt_idxs, self._cfg.loop_time_thresh_local)
         if not candidates:
             return
-        candidates.sort()
 
         # Try top-K candidates; keep the best (lowest-score) one that
         # passes the threshold. Early-exit when ICP is very tight (the
