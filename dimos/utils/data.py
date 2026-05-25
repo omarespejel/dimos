@@ -118,10 +118,14 @@ def resolve_named_path(name: str | Path, suffix: str = "") -> Path:
     p = Path(s)
     if p.is_absolute() or p.exists():
         return p
+    if (DIMOS_PROJECT_ROOT / p).exists():
+        return DIMOS_PROJECT_ROOT / p
     if suffix and not s.endswith(suffix):
         p = Path(s + suffix)
         if p.is_absolute() or p.exists():
             return p
+        if (DIMOS_PROJECT_ROOT / p).exists():
+            return DIMOS_PROJECT_ROOT / p
     return get_data(p.name)
 
 
