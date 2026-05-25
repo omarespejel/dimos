@@ -22,8 +22,8 @@ from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.protocol.tf.tf import TF
+from dimos.robot.unitree.go2 import connection
 from dimos.robot.unitree.go2.config import camera_info_static
-from dimos.robot.unitree.go2.connection import connection
 from dimos.utils.data import get_data
 from dimos.utils.testing.moment import Moment, SensorMoment
 
