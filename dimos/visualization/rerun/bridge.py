@@ -308,12 +308,15 @@ class RerunBridgeModule(Module):
             self._subscribed_visual_transport_topics.add(topic)
             if hasattr(transport, "start"):
                 transport.start()
+            transport_topic = getattr(transport, "topic", topic)
+
+            def on_visual_message(msg: Any, transport_topic: Any = transport_topic) -> None:
+                self._on_message(msg, transport_topic)
+
             unsub = transport.subscribe(
                 # Capture the current topic so callbacks keep the correct
                 # entity path even as this loop advances to the next transport.
-                lambda msg, transport_topic=getattr(transport, "topic", topic): self._on_message(
-                    msg, transport_topic
-                )
+                on_visual_message
             )
             if unsub is not None:
                 self.register_disposable(Disposable(unsub))
