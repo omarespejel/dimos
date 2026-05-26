@@ -327,11 +327,9 @@ class TeleopBenchmarkModule(Module):
                 # prefix. Omitted entirely when there's no ts (e.g. buttons).
                 e2e = s["e2e_ms"]
                 e2e_str = f" | ~e2e p50 {e2e['p50']:.1f}ms" if e2e else ""
-                print(
-                    f"[benchmark] {name}: {s['rate_hz']:.1f}Hz | "
-                    f"jitter p95 {jitter['p95']:.1f}ms | loss {loss_str}{e2e_str} | "
-                    f"n={s['count']}",
-                    flush=True,
+                logger.info(
+                    "[benchmark] %s: %.1fHz | jitter p95 %.1fms | loss %s%s | n=%d",
+                    name, s["rate_hz"], jitter["p95"], loss_str, e2e_str, s["count"],
                 )
             self._stop_event.wait(interval)
 

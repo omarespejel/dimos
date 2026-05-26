@@ -640,6 +640,18 @@ class HostedTeleopModule(Module):
                 float(rtt) if rtt is not None else float("nan"),
                 float(off) if off is not None else float("nan"),
             )
+        elif kind == "video_stats":
+            # Inbound-video health from the operator's pc.getStats() (the robot's
+            # send side can't see what the operator actually received). Logged
+            # for live visibility + per-netem-profile comparison via journalctl.
+            logger.info(
+                "video: %sx%s %.1ffps %.0fkbps loss=%.2f%% jbuf=%.0fms "
+                "decode=%.1fms dropped=%s freezes=%s",
+                msg.get("width"), msg.get("height"), msg.get("fps", 0.0),
+                msg.get("kbps", 0.0), msg.get("loss_pct", 0.0),
+                msg.get("jitter_buffer_ms", 0.0), msg.get("decode_ms", 0.0),
+                msg.get("frames_dropped"), msg.get("freezes"),
+            )
         else:
             logger.debug(f"state_reliable: unknown message type {kind!r}")
 
