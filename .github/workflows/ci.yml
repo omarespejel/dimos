@@ -194,13 +194,13 @@ jobs:
       - name: Install dependencies
         run: uv sync --group tests --frozen
       - name: Run tests
-        run: uv run pytest --numprocesses=3 --cov=dimos/ --junitxml=junit.xml -m 'not (tool or self_hosted or mujoco or dimsim)'
+        run: uv run pytest --numprocesses=3 --cov=dimos/ --junitxml=junit.xml -m 'not (tool or self_hosted or mujoco or self_hosted_large)'
       - name: Re-run the failing tests with maximum verbosity
         if: failure()
         env:
           COLOR: yes
         run: >-  # `exit 1` makes sure that the job remains red with flaky runs
-          uv run pytest --no-cov -vvvvv --lf  -m 'not (tool or self_hosted or mujoco or dimsim)' && exit 1
+          uv run pytest --no-cov -vvvvv --lf  -m 'not (tool or self_hosted or mujoco or self_hosted_large)' && exit 1
         shell: bash
       - name: Turn coverage into xml
         run: uv run python -m coverage xml
@@ -317,6 +317,70 @@ jobs:
         run: |
           df -h
 
+  self-hosted-large-tests:
+    # Skip on PRs from forks which would expose the self-hosted runner to untrusted code from external contributors.
+    if: |
+      github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ALIBABA_API_KEY: ${{ secrets.ALIBABA_API_KEY }}
+    timeout-minutes: 30
+    runs-on: [self-hosted, Linux, 32gb]
+    permissions:
+      contents: read  # For checkout
+      packages: read  # For pulling the ros-dev container from ghcr.io
+      id-token: write  # For codecov-action's OIDC upload
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          clean: false
+          # If we ever allow external PRs on custom runner, persisting credentials
+          # could be abused by attackers.
+          persist-credentials: false
+      - name: Fix permissions
+        run: |
+          git config --global --add safe.directory '*'
+          git clean -ffdx
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --group tests-self-hosted --frozen
+      - name: Build C++ extensions in-place
+        run: uv run python setup.py build_ext --inplace
+      - name: Run tests
+        run: uv run pytest --cov=dimos/ --junitxml=junit.xml -m self_hosted_large
+      - name: Re-run the failing tests with maximum verbosity
+        if: failure()
+        env:
+          COLOR: yes
+        run: >-  # `exit 1` makes sure that the job remains red with flaky runs
+          uv run pytest --no-cov -vvvvv --lf -m self_hosted_large && exit 1
+        shell: bash
+      - name: Turn coverage into xml
+        run: uv run python -m coverage xml
+      - name: Upload coverage
+        uses: codecov/codecov-action@v6
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: ./coverage.xml
+          flags: SelfHosted-Large
+          use_oidc: true
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          report_type: test_results
+          use_oidc: true
+      - name: Check disk space
+        if: failure()
+        run: |
+          df -h
+
   # Cross-job fail-fast: GitHub Actions only fail-fasts within a matrix,
   # not across sibling jobs. This watcher fires the moment `tests` fails
   # and cancels the whole workflow run.
@@ -342,6 +406,7 @@ jobs:
     - docs-validate
     - tests
     - self-hosted-tests
+    - self-hosted-large-tests
 
     runs-on: ubuntu-latest
     permissions:
@@ -351,7 +416,9 @@ jobs:
     - name: Decide whether the needed jobs succeeded or failed
       uses: re-actors/alls-green@release/v1
       with:
-        allowed-skips: self-hosted-tests
+        allowed-skips: |
+          self-hosted-tests
+          self-hosted-large-tests
         jobs: ${{ toJSON(needs) }}
     - name: Trigger Codecov notifications
       uses: codecov/codecov-action@v6
