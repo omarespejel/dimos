@@ -33,6 +33,7 @@ from dimos.core.stream import In, Out
 from dimos.msgs.geometry_msgs.Pose import Pose
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
+from dimos.msgs.geometry_msgs.Transform import Transform
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.nav_msgs.Odometry import Odometry
@@ -54,6 +55,7 @@ logger = setup_logger()
 # fired. The robot publishes both; the compressed one delivers reliably.
 _TOPIC_RGB_IMAGE = "/aima/hal/sensor/rgbd_head_front/rgb_image/compressed"
 _TOPIC_RGB_REAR = "/aima/hal/sensor/rgb_head_rear/rgb_image/compressed"
+_TOPIC_RGB_FRONT_CENTER = "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed"
 _TOPIC_DEPTH_IMAGE = "/aima/hal/sensor/rgbd_head_front/depth_image"
 _TOPIC_DEPTH_CLOUD = "/aima/hal/sensor/rgbd_head_front/depth_pointcloud"
 _TOPIC_RGB_CAM_INFO = "/aima/hal/sensor/rgbd_head_front/rgb_camera_info"
@@ -66,6 +68,14 @@ _TOPIC_JOINT_WAIST = "/aima/hal/joint/waist/state"
 _TOPIC_JOINT_HEAD = "/aima/hal/joint/head/state"
 _TOPIC_ARM_COMMAND = "/aima/hal/joint/arm/command"
 _SVC_INPUT_SOURCE = "/aimdk_5Fmsgs/srv/SetMcInputSource"
+
+# Source-side publish-rate caps for high-bandwidth streams. Throttling here
+# (instead of in the viz layer) skips JPEG decode → BGR ndarray → LCM round
+# trips for frames that would be dropped downstream anyway.
+_CAM_FRONT_TARGET_HZ: float = 3.0
+_CAM_REAR_TARGET_HZ: float = 2.0
+_CAM_FRONT_CENTER_TARGET_HZ: float = 3.0
+_LIDAR_TARGET_HZ: float = 3.0
 
 # Path to the URDF bundled in this package — used for IK.
 _X2_URDF_PATH = Path(__file__).resolve().parent / "x2_ultra.urdf"
@@ -211,6 +221,13 @@ class ConnectionConfig(ModuleConfig):
         default=False,
         description="Subscribe to the chest lidar pointcloud and publish it to DimOS.",
     )
+    lidar_max_range: float = Field(
+        default=10.0,
+        description=(
+            "Truncate lidar returns farther than this many metres from the sensor. "
+            "Set to 0 or a negative value to disable."
+        ),
+    )
     enable_depth_cloud: bool = Field(
         default=False,
         description="Subscribe to the head depth pointcloud and publish it to DimOS.",
@@ -218,6 +235,14 @@ class ConnectionConfig(ModuleConfig):
     enable_rear_camera: bool = Field(
         default=False,
         description="Spawn a sidecar subprocess for the rear RGB camera and publish to rear_image.",
+    )
+    enable_front_center_camera: bool = Field(
+        default=False,
+        description="Spawn a sidecar subprocess for the front-center RGB camera (2688×1944) and publish to front_center_image.",
+    )
+    enable_front_camera: bool = Field(
+        default=True,
+        description="Spawn the head-RGBD sidecar subprocess and publish to color_image. Disable to save CPU/DDS bandwidth when the front view isn't needed.",
     )
 
 
@@ -412,6 +437,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
     cartesian_right: In[PoseStamped]
     color_image: Out[Image]
     rear_image: Out[Image]
+    front_center_image: Out[Image]
     camera_info: Out[CameraInfo]
     depth_image: Out[Image]
     depth_camera_info: Out[CameraInfo]
@@ -431,6 +457,9 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
     _cam_thread: Thread | None = None
     _rear_cam_proc: subprocess.Popen | None = None  # type: ignore[type-arg]
     _rear_cam_thread: Thread | None = None
+    _front_center_cam_proc: subprocess.Popen | None = None  # type: ignore[type-arg]
+    _front_center_cam_thread: Thread | None = None
+    _lidar_last_pub: float = 0.0
     _arm_ik: X2ArmIK | None = None
     _arm_ctrl_thread: Thread | None = None
 
@@ -448,6 +477,9 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         self._rear_cam_proc = None
         self._rear_cam_thread = None
         self._rear_cam_stop = False
+        self._front_center_cam_proc = None
+        self._front_center_cam_thread = None
+        self._front_center_cam_stop = False
         # Arm controller (built once we have the first joint_state snapshot so
         # we can seed Ruckig with the real current pose, not zeros).
         self._arm_ik = None
@@ -541,9 +573,12 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         # QoS receives the same topic at 10 Hz with no issue. We sidestep
         # this by running the subscription in a clean subprocess (see
         # `_camera_bridge.py`) and piping JPEG frames back here.
-        self._start_camera_bridge()
+        if self.config.enable_front_camera:
+            self._start_camera_bridge()
         if self.config.enable_rear_camera:
             self._start_rear_camera_bridge()
+        if self.config.enable_front_center_camera:
+            self._start_front_center_camera_bridge()
 
         # NOTE: depth_image is also large (1280x720 float32 ~3.7 MB/frame); not
         # subscribed here because nothing downstream consumes it yet, and the
@@ -670,6 +705,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         # ours.
         self._stop_camera_bridge()
         self._stop_rear_camera_bridge()
+        self._stop_front_center_camera_bridge()
 
         # Stop the arm controller loop before rclpy shuts down.
         self._arm_ctrl_stop = True
@@ -1072,6 +1108,8 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
                 buf.extend(chunk)
             return bytes(buf)
 
+        min_interval = 1.0 / _CAM_FRONT_TARGET_HZ
+        last_pub = 0.0
         recv = 0
         try:
             while not self._cam_stop:
@@ -1083,6 +1121,13 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
                 data = _read_exact(length)
                 if data is None:
                     break
+
+                # Source-side throttle: drop the JPEG chunk without decoding if
+                # we're inside the per-frame interval. recv counts *published*
+                # frames so the log line below reflects the real downstream rate.
+                now = time.time()
+                if now - last_pub < min_interval:
+                    continue
 
                 jpeg = np.frombuffer(data, dtype=np.uint8)
                 arr = cv2.imdecode(jpeg, cv2.IMREAD_COLOR)  # BGR
@@ -1100,6 +1145,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
                 )
                 self.color_image.publish(image)
                 self._latest_video_frame = image
+                last_pub = now
                 recv += 1
                 if recv == 1 or recv % 60 == 0:
                     logger.info(
@@ -1182,6 +1228,8 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
                 buf.extend(chunk)
             return bytes(buf)
 
+        min_interval = 1.0 / _CAM_REAR_TARGET_HZ
+        last_pub = 0.0
         recv = 0
         try:
             while not self._rear_cam_stop:
@@ -1196,6 +1244,13 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
                 if data is None:
                     break
 
+                # Throttle before decode: skip the cv2.imdecode (rear frames are
+                # 2064×1552, decoding is the expensive part) for frames we'd
+                # drop. recv counts published frames.
+                now = time.time()
+                if now - last_pub < min_interval:
+                    continue
+
                 jpeg = np.frombuffer(data, dtype=np.uint8)
                 arr = cv2.imdecode(jpeg, cv2.IMREAD_COLOR)  # BGR
                 if arr is None:
@@ -1208,6 +1263,7 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
                     ts=time.time(),
                 )
                 self.rear_image.publish(image)
+                last_pub = now
                 recv += 1
                 if recv == 1 or recv % 60 == 0:
                     logger.info(
@@ -1233,6 +1289,132 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
             self._rear_cam_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
         self._rear_cam_thread = None
 
+    # --- Front-center camera bridge (high-res 2688×1944, source-throttled) ---
+
+    def _start_front_center_camera_bridge(self) -> None:
+        """Spawn a `_camera_bridge.py` subprocess for the front-center RGB topic.
+
+        Highest-resolution head camera on the X2 (2688×1944 @ 30 Hz). Source-side
+        throttle in _read_front_center_camera_bridge keeps decoded BGR traffic
+        comparable to the rear cam.
+        """
+        import os as _os
+
+        bridge = Path(__file__).parent / "_camera_bridge.py"
+        env = _os.environ.copy()
+        if self.config.clear_rmw_env:
+            env.pop("RMW_IMPLEMENTATION", None)
+            env.pop("CYCLONEDDS_URI", None)
+        if self.config.force_cyclonedds:
+            env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+            env["CYCLONEDDS_URI"] = _cyclonedds_uri(
+                self.config.cyclone_interface,
+                self.config.cyclone_peer,
+            )
+        self._front_center_cam_stop = False
+        self._front_center_cam_proc = subprocess.Popen(
+            [sys.executable, str(bridge), _TOPIC_RGB_FRONT_CENTER],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+            env=env,
+        )
+        self._front_center_cam_thread = Thread(
+            target=self._read_front_center_camera_bridge, daemon=True
+        )
+        self._front_center_cam_thread.start()
+
+    def _read_front_center_camera_bridge(self) -> None:
+        """Consume JPEG frames from the front-center bridge.
+
+        Same wire format as the other bridges. Sensor is mounted right-side up
+        based on the URDF rpy similarity to the rear, so no 180° flip — if the
+        first frame looks upside-down, add ``arr = np.ascontiguousarray(arr[::-1, ::-1])``.
+        """
+        import cv2
+
+        proc = self._front_center_cam_proc
+        if proc is None or proc.stdout is None:
+            return
+        out = proc.stdout
+        logger.info(
+            "X2Connection: front-center-camera-bridge reader thread started (pid=%s)", proc.pid
+        )
+
+        def _read_exact(n: int) -> bytes | None:
+            buf = bytearray()
+            while len(buf) < n:
+                if self._front_center_cam_stop:
+                    return None
+                chunk = out.read(n - len(buf))
+                if not chunk:
+                    return None
+                buf.extend(chunk)
+            return bytes(buf)
+
+        min_interval = 1.0 / _CAM_FRONT_CENTER_TARGET_HZ
+        last_pub = 0.0
+        recv = 0
+        try:
+            while not self._front_center_cam_stop:
+                header = _read_exact(4)
+                if header is None:
+                    logger.info(
+                        "X2Connection: front-center-camera-bridge stdout EOF (after %d frames)",
+                        recv,
+                    )
+                    break
+                (length,) = struct.unpack("<I", header)
+                data = _read_exact(length)
+                if data is None:
+                    break
+
+                # Throttle before decode — front-center frames are 2688×1944,
+                # decode is the dominant cost. recv counts published frames.
+                now = time.time()
+                if now - last_pub < min_interval:
+                    continue
+
+                jpeg = np.frombuffer(data, dtype=np.uint8)
+                arr = cv2.imdecode(jpeg, cv2.IMREAD_COLOR)  # BGR
+                if arr is None:
+                    continue
+
+                image = Image(
+                    data=arr,
+                    format=ImageFormat.BGR,
+                    frame_id="rgb_head_center",
+                    ts=time.time(),
+                )
+                self.front_center_image.publish(image)
+                last_pub = now
+                recv += 1
+                if recv == 1 or recv % 60 == 0:
+                    logger.info(
+                        "X2Connection: front-center-camera-bridge frame %d (%d KB)",
+                        recv,
+                        length // 1024,
+                    )
+        except Exception as exc:
+            logger.exception("X2Connection: front-center-camera-bridge reader crashed: %s", exc)
+
+    def _stop_front_center_camera_bridge(self) -> None:
+        self._front_center_cam_stop = True
+        proc = self._front_center_cam_proc
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self._front_center_cam_proc = None
+        if self._front_center_cam_thread and self._front_center_cam_thread.is_alive():
+            self._front_center_cam_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        self._front_center_cam_thread = None
+
     def _on_depth_image(self, msg: Any) -> None:
         image = _ros_image_to_dimos(msg)
         image.data = np.ascontiguousarray(image.data[::-1, ::-1])
@@ -1242,7 +1424,23 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
         self.pointcloud.publish(_ros_pointcloud2_to_dimos(msg))
 
     def _on_lidar(self, msg: Any) -> None:
+        # Source-side throttle: skip the pointcloud conversion + rotate +
+        # translate entirely if we're inside the per-frame interval. Lidar
+        # publishes at ~10 Hz; we only want _LIDAR_TARGET_HZ downstream.
+        now = time.time()
+        if now - self._lidar_last_pub < 1.0 / _LIDAR_TARGET_HZ:
+            return
+        self._lidar_last_pub = now
         cloud = _ros_pointcloud2_to_dimos(msg)
+        # Range filter (sensor frame, before transforms — fewer points to rotate
+        # and a natural lidar semantic). Distance from origin in lidar frame is
+        # distance from the sensor itself.
+        max_range = self.config.lidar_max_range
+        if max_range > 0.0:
+            pts = np.asarray(cloud.pointcloud.points)
+            if pts.size:
+                mask = np.einsum("ij,ij->i", pts, pts) <= max_range * max_range
+                cloud.pointcloud.points = o3d.utility.Vector3dVector(pts[mask])
         # Lidar mount: -π/2 about X relative to torso, offset above base_link.
         # Apply both here so the published cloud is already in base_link frame
         # — consumers that voxelize directly (VoxelGridMapper) need world-frame
@@ -1295,9 +1493,15 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
                     dtype=np.float64,
                 )
                 a_world = R @ a_body - _GRAVITY_WORLD
+                # Lock Z: vertical accel is dominated by gravity-subtraction
+                # error and integrates into runaway height drift. The robot
+                # walks on a flat floor — clamp Z velocity/position to zero.
+                a_world[2] = 0.0
                 # Trapezoidal-ish: p uses v before the velocity update.
                 self._odom_pos += self._odom_vel * dt + 0.5 * a_world * dt * dt
                 self._odom_vel += a_world * dt
+                self._odom_pos[2] = 0.0
+                self._odom_vel[2] = 0.0
 
         # Latch the latest base_link → odom transform for the lidar callback.
         with self._odom_tf_lock:
@@ -1322,6 +1526,16 @@ class X2Connection(X2ConnectionBase, Camera, Pointcloud, IMU, Lidar):
                     linear=Vector3(*self._odom_vel.tolist()),
                     angular=imu.angular_velocity,
                 ),
+            )
+        )
+
+        self.tf.publish(
+            Transform(
+                translation=Vector3(*self._odom_pos.tolist()),
+                rotation=imu.orientation,
+                frame_id="odom",
+                child_frame_id=imu.frame_id,
+                ts=imu.ts,
             )
         )
 

@@ -52,6 +52,17 @@ def _convert_rear_image(image: Any) -> list[tuple[str, Any]]:
     ]
 
 
+def _convert_front_center_image(image: Any) -> list[tuple[str, Any]]:
+    import cv2
+    import rerun as rr
+
+    _, buf = cv2.imencode(".jpg", image.data, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return [
+        ("world/front_center_image", rr.EncodedImage(contents=bytes(buf.tobytes()), media_type="image/jpeg")),
+        ("world/front_center_image", rr.Transform3D(parent_frame="tf#/rgb_head_center")),
+    ]
+
+
 def _convert_depth_pointcloud(pointcloud: Any) -> list[tuple[str, Any]]:
     import rerun as rr
 
@@ -145,6 +156,15 @@ def _static_rgb_head_rear(rr: Any) -> Any:
     )
 
 
+def _static_rgb_head_center(rr: Any) -> Any:
+    return rr.Transform3D(
+        translation=[0.0684, -0.00021713, 0.05],
+        rotation=rr.Quaternion(xyzw=_quat_xyzw_from_rpy(-1.5708, 0.0, -1.574)),
+        parent_frame="tf#/head_pitch_link",
+        child_frame="tf#/rgb_head_center",
+    )
+
+
 def _x2_rerun_blueprint() -> Any:
     """Split layout: stacked front+rear cameras on left, 3D world view on right."""
     import rerun as rr
@@ -153,7 +173,7 @@ def _x2_rerun_blueprint() -> Any:
     return rrb.Blueprint(
         rrb.Horizontal(
             rrb.Vertical(
-                rrb.Spatial2DView(origin="world/color_image", name="Front"),
+                rrb.Spatial2DView(origin="world/front_center_image", name="Front-Center"),
                 rrb.Spatial2DView(origin="world/rear_image", name="Rear"),
             ),
             rrb.Spatial3DView(
@@ -174,12 +194,14 @@ rerun_config = {
     "max_hz": {
         "world/color_image": 3.0,
         "world/rear_image": 2.0,
+        "world/front_center_image": 3.0,
         "world/lidar": 3.0,
         "world/pointcloud": 3.0,
     },
     "visual_override": {
         "world/color_image": _convert_color_image,
         "world/rear_image": _convert_rear_image,
+        "world/front_center_image": _convert_front_center_image,
         "world/camera_info": _convert_camera_info,
         "world/pointcloud": _convert_depth_pointcloud,
         "world/lidar": _convert_lidar,
@@ -192,6 +214,7 @@ rerun_config = {
         "world/tf/head_pitch_link": _static_head_pitch_link,
         "world/tf/rgbd_head_front": _static_rgbd_head_front,
         "world/tf/rgb_head_rear": _static_rgb_head_rear,
+        "world/tf/rgb_head_center": _static_rgb_head_center,
     },
 }
 

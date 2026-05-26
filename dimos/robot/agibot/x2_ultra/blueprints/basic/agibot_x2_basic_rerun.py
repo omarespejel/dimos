@@ -25,15 +25,23 @@ from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
 from dimos.web.websocket_vis.websocket_vis_module import WebsocketVisModule
 # from dimos.mapping.voxels import VoxelGridMapper
 from dimos.mapping.ray_tracing.module import RayTracingVoxelMap
+from dimos.navigation.nav_stack.modules.pgo.pgo import PGO
 
 agibot_x2_basic_rerun = (
     autoconnect(
         agibot_x2_primitive,
-        RayTracingVoxelMap.blueprint(),
+        RayTracingVoxelMap.blueprint().remappings([
+            (RayTracingVoxelMap, "odometry", "corrected_odometry")
+        ]),
+        PGO.blueprint().remappings([
+            (PGO, "registered_scan", "lidar")
+        ]),
         X2Connection.blueprint(
             clear_rmw_env=True,
             enable_lidar=True,
+            enable_front_camera=False,
             enable_rear_camera=True,
+            enable_front_center_camera=True,
             force_cyclonedds=False,
         ),
     )
