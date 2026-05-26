@@ -37,6 +37,7 @@ from scipy.spatial import cKDTree
 
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
+from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.nav_msgs.LineSegments3D import LineSegments3D
 from dimos.msgs.nav_msgs.Odometry import Odometry
@@ -49,7 +50,7 @@ logger = setup_logger()
 SURFACE_DILATION_PASSES = 2
 SURFACE_EROSION_PASSES = 2
 
-NODE_SPACING_M = 2.0
+NODE_SPACING_M = 1.0
 NODE_WALL_BUFFER_M = 0.3
 NODE_STEP_THRESHOLD_M = 0.25
 
@@ -563,6 +564,7 @@ class MLSPlanner(Module):
     global_map: In[PointCloud2]
     start_pose: In[Odometry]
     goal_pose: In[Odometry]
+    clicked_point: In[PointStamped]
     path: Out[Path]
     surface_map: Out[PointCloud2]
     nodes: Out[PointCloud2]
@@ -570,8 +572,10 @@ class MLSPlanner(Module):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._latest_start: Odometry | None = None
+        self._latest_start: tuple[float, float, float] | None = None
         self._surface_graph: SurfaceGraph | None = None
+        # Clicks alternate between setting the start and setting the goal+planning.
+        self._next_click_sets_start: bool = True
 
     async def handle_global_map(self, msg: PointCloud2) -> None:
         points, _ = msg.as_numpy()
@@ -638,13 +642,28 @@ class MLSPlanner(Module):
         )
 
     async def handle_start_pose(self, msg: Odometry) -> None:
-        self._latest_start = msg
+        self._latest_start = (msg.x, msg.y, msg.z)
 
     def _publish_empty_path(self) -> None:
         """Clear any previously published path so the visualizer drops the stale plan."""
         self.path.publish(Path(ts=time.time(), frame_id=self.config.world_frame, poses=[]))
 
     async def handle_goal_pose(self, msg: Odometry) -> None:
+        self._plan_to((msg.x, msg.y, msg.z))
+
+    async def handle_clicked_point(self, msg: PointStamped) -> None:
+        pt = (msg.x, msg.y, msg.z)
+        if self._next_click_sets_start:
+            self._latest_start = pt
+            self._next_click_sets_start = False
+            self._publish_empty_path()
+            logger.info("Click set start; next click will set goal", start=pt)
+            return
+        self._next_click_sets_start = True
+        logger.info("Click set goal", goal=pt)
+        self._plan_to(pt)
+
+    def _plan_to(self, goal: tuple[float, float, float]) -> None:
         if self._latest_start is None:
             logger.warning("MLSPlanner received goal before start; skipping")
             return
@@ -654,8 +673,7 @@ class MLSPlanner(Module):
             return
 
         t0 = time.perf_counter()
-        start = (self._latest_start.x, self._latest_start.y, self._latest_start.z)
-        goal = (msg.x, msg.y, msg.z)
+        start = self._latest_start
 
         start_node = self._snap_pose_to_node(sg, start)
         goal_node = self._snap_pose_to_node(sg, goal)

@@ -39,6 +39,7 @@ from dimos.navigation.nav_stack.modules.mls_planner.mls_planner import (
     build_surface_lookup,
 )
 from dimos.visualization.rerun.bridge import RerunBridgeModule
+from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
 
 _POSE_MARKER_RADIUS = 0.4
 # Small lift so graph artifacts render visibly above the surface points instead of z-fighting.
@@ -128,6 +129,7 @@ def create_evaluator_blueprint() -> Blueprint:
     return autoconnect(
         Evaluator.blueprint(),
         MLSPlanner.blueprint(),
+        RerunWebSocketServer.blueprint(),
         RerunBridgeModule.blueprint(
             visual_override={
                 "world/start_pose": _render_start_pose,

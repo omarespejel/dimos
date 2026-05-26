@@ -35,7 +35,7 @@ WORLD_FRAME = "map"
 # Walls must reach above the planner's robot_height (default 1.5m) to block surface above.
 _WALL_HEIGHT_M = 2.0
 
-MESH_PATH = "/home/andrew/Downloads/model.glb"
+MESH_PATH = "/home/andrew/Downloads/19_fairdale_ave_papakura.glb"
 
 
 @dataclass
