@@ -115,7 +115,15 @@ def _extract_surfaces(points: np.ndarray, voxel_size: float, robot_height: float
     surface_iz = iz_sorted[is_surface]
 
     surface_ix, surface_iy, surface_iz = _close_surface_holes(
-        surface_ix, surface_iy, surface_iz, SURFACE_DILATION_PASSES, SURFACE_EROSION_PASSES
+        surface_ix,
+        surface_iy,
+        surface_iz,
+        SURFACE_DILATION_PASSES,
+        SURFACE_EROSION_PASSES,
+        ix,
+        iy,
+        iz,
+        height_cells,
     )
 
     cells = np.column_stack([surface_ix, surface_iy, surface_iz])
@@ -128,10 +136,17 @@ def _close_surface_holes(
     surface_iz: np.ndarray,
     dilation_passes: int,
     erosion_passes: int,
+    obstacle_ix: np.ndarray,
+    obstacle_iy: np.ndarray,
+    obstacle_iz: np.ndarray,
+    height_cells: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Dilate then erode the surface map at each z level.
+    """Dilate then erode the surface map at each z level, without bridging walls.
 
-    Closes small holes from missing lidar points.
+    Fills small holes from missing lidar points, then rejects dilated cells whose
+    column has an obstacle point at z' in (level_iz, level_iz + height_cells].
+    That's the same clearance check the surface extractor uses, applied to the
+    dilated cells so morphology can't bridge across a wall column.
     """
     if len(surface_ix) == 0 or (dilation_passes <= 0 and erosion_passes <= 0):
         return surface_ix, surface_iy, surface_iz
@@ -155,6 +170,23 @@ def _close_surface_holes(
             mask = ndimage.binary_dilation(mask, iterations=dilation_passes)
         if erosion_passes > 0:
             mask = ndimage.binary_erosion(mask, iterations=erosion_passes)
+
+        blocking = (
+            (obstacle_iz > level_iz)
+            & (obstacle_iz <= level_iz + height_cells)
+            & (obstacle_ix >= x0 - pad)
+            & (obstacle_ix <= x1 + pad)
+            & (obstacle_iy >= y0 - pad)
+            & (obstacle_iy <= y1 + pad)
+        )
+        if blocking.any():
+            blocked = np.zeros((h, w), dtype=bool)
+            blocked[
+                obstacle_iy[blocking] - y0 + pad,
+                obstacle_ix[blocking] - x0 + pad,
+            ] = True
+            mask = mask & ~blocked
+
         ys, xs = np.where(mask)
         new_ix.append(xs.astype(np.int64) + x0 - pad)
         new_iy.append(ys.astype(np.int64) + y0 - pad)
