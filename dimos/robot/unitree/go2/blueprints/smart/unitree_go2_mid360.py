@@ -59,7 +59,7 @@ _FASTLIO_PORTS = frozenset({"lidar", "odometry"})
 
 class Go2Mid360MemoryConfig(RecorderConfig):
     db_path: str | Path = "recording_go2_mid360.db"
-    default_frame_id: str = "body"
+    default_frame_id: str = "base_link"
 
 
 class Go2Mid360Memory(Recorder):
