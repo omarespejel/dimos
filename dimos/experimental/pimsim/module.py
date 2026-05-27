@@ -98,20 +98,8 @@ _NO_CACHE_HEADERS = {
 
 
 def _asset_token(path: Path) -> str:
-    # Mtime+size token for big cacheable assets (scene/collision GLBs).
-    # Don't put time here — would force re-download of 100s of MB on
-    # every page load.
     stat = path.stat()
     return f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
-
-
-def _bundle_token(path: Path) -> str:
-    # Per-request token for the small JS/CSS bundles. Browsers were
-    # serving stale app.js even after Ctrl+Shift+R; forcing a never-
-    # before-seen URL each page load eliminates the cache entirely
-    # for these. Cost: re-download ~80 KB of JS per refresh.
-    stat = path.stat()
-    return f"{time.time_ns():x}-{stat.st_mtime_ns:x}-{stat.st_size:x}"
 
 
 def _versioned_asset_name(prefix: str, path: Path) -> str:
@@ -370,7 +358,7 @@ class BabylonSceneViewerModule(Module):
             asset_path = STATIC_DIR / asset_name
             if not asset_path.exists():
                 continue
-            token = _bundle_token(asset_path)
+            token = _asset_token(asset_path)
             html = html.replace(
                 f'"/static/{asset_name}"',
                 f'"/static/{asset_name}?v={token}"',
