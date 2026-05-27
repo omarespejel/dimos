@@ -182,12 +182,12 @@ jobs:
           allow-prereleases: true
           python-version: ${{ matrix.pyver }}
       - name: Install dependency for pyaudio (Ubuntu)
-        if: matrix.os == 'ubuntu'
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y portaudio19-dev
       - name: Install dependency for pyaudio (macOS)
-        if: matrix.os == 'macos'
+        if: startsWith(matrix.os, 'macos')
         run: brew install portaudio
       - name: Remove git LFS to avoid accidental large downloads
         run: sudo rm -f /usr/bin/git-lfs
