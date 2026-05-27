@@ -248,7 +248,7 @@ manipulation = [
 
     # Hardware SDKs
     "piper-sdk",
-    "pyrealsense2; sys_platform != 'darwin'",
+    "pyrealsense2; sys_platform != 'darwin' and platform_machine != 'aarch64'",
     "xarm-python-sdk>=1.17.0",
     "a750-control; sys_platform == 'linux' and platform_machine == 'x86_64'",
 
@@ -288,7 +288,7 @@ psql = [
 sim = [
     # Simulation
     "mujoco>=3.3.4",
-    "playground>=0.0.5",
+    "playground>=0.0.5; platform_system != 'Linux' or platform_machine != 'aarch64'",
     "pygame>=2.6.1",
 ]
 
@@ -454,6 +454,9 @@ required-version = ">=0.9.17"
 default-groups = ["tests"]
 exclude-newer = "7 days"
 exclude-newer-package = { dimos-viewer = false }
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
 override-dependencies = [
     # moondream pins pillow<11 but we need >=12.2.0 for security fixes
     # (CVE-2026-25990, CVE-2026-40192, CVE-2026-42311).
