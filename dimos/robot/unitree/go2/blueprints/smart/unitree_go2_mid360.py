@@ -35,15 +35,18 @@ from typing import Any
 
 from reactivex.disposable import Disposable
 
+from dimos.constants import DEFAULT_WORLD_FRAME
 from dimos.core.coordination.blueprints import autoconnect
 from dimos.core.stream import In
 from dimos.hardware.sensors.lidar.fastlio2.module import FastLio2
 from dimos.memory2.module import Recorder, RecorderConfig
 from dimos.memory2.stream import Stream
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+from dimos.msgs.geometry_msgs.Transform import Transform
 from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
+from dimos.navigation.nav_stack.frames import FRAME_ODOM
 from dimos.robot.unitree.go2.blueprints.basic.unitree_go2_basic import unitree_go2_basic
 from dimos.robot.unitree.go2.connection import GO2Connection
 from dimos.utils.logging_config import setup_logger
@@ -113,6 +116,12 @@ unitree_go2_mid360_memory = (
             voxel_size=_voxel_size,
             map_voxel_size=_voxel_size,
             map_freq=-1,
+            static_transforms={
+                FRAME_ODOM: Transform(
+                    frame_id=DEFAULT_WORLD_FRAME,
+                    child_frame_id=FRAME_ODOM,
+                ),
+            },
         ),
         Go2Mid360Memory.blueprint(),
     )
