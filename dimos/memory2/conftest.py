@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import platform
 import sqlite3
 import tempfile
 from typing import TYPE_CHECKING, cast
@@ -27,6 +28,10 @@ from dimos.memory2.blobstore.sqlite import SqliteBlobStore
 from dimos.memory2.store.memory import MemoryStore
 from dimos.memory2.store.sqlite import SqliteStore
 from dimos.models.embedding.clip import CLIPModel
+
+# The sqlite-vec aarch64 wheel ships a 32-bit binary, so loading the
+# extension fails with "wrong ELF class: ELFCLASS32" on Linux ARM.
+_SKIP_SQLITE_VEC = platform.machine() == "aarch64"
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -55,6 +60,8 @@ def memory_session(memory_store: MemoryStore) -> Iterator[MemoryStore]:
 
 @pytest.fixture
 def sqlite_store() -> Iterator[SqliteStore]:
+    if _SKIP_SQLITE_VEC:
+        pytest.skip("sqlite-vec aarch64 wheel ships a 32-bit binary")
     with tempfile.NamedTemporaryFile(suffix=".db") as f:
         store = SqliteStore(path=f.name)
         with store:

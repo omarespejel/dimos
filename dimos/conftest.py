@@ -92,6 +92,9 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "skipif_no_ros: skip when ROS dependencies are not present")
     config.addinivalue_line("markers", "skipif_macos_bug: skip known-buggy tests on macOS")
     config.addinivalue_line("markers", "skipif_macos: skip tests not intended to run on macOS")
+    config.addinivalue_line(
+        "markers", "skipif_arm: skip tests not intended to run on ARM (aarch64)"
+    )
 
     if config.pluginmanager.hasplugin("_cov"):
         os.environ["COVERAGE_PROCESS_START"] = str(config.rootpath / "pyproject.toml")
@@ -124,6 +127,7 @@ def pytest_collection_modifyitems(config, items):
         "skipif_no_ros": (not _has_ros(), "ROS dependencies are not present"),
         "skipif_macos_bug": (_is_macos(), "Some tests are buggy on Mac OS"),
         "skipif_macos": (_is_macos(), "Not intended to run on macOS"),
+        "skipif_arm": (platform.machine() == "aarch64", "Not intended to run on ARM (aarch64)"),
     }
     for marker_name, (condition, reason) in _skipif_markers.items():
         if condition:
