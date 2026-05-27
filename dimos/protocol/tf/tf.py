@@ -125,9 +125,31 @@ class MultiTBuffer:
                 if key not in self.buffers:
                     self.buffers[key] = TBuffer(self.buffer_size)
                 self.buffers[key].add(transform)
-                if transform.static:
-                    self._statics[key] = transform
+            # pruning happens in self.buffers[key].add(), but we don't want static ones to get pruned
+            # would be better to fix pruning somehow but the that class does the pruning
+            # is more generic than TF-speficic pruning, so I'm going to backfill instead for now
+            # plz improve when the latching-topic change is made
+            self._backfill_statics()
             self._cv.notify_all()
+
+    def receive_static_transform(self, *args: Transform) -> None:
+        with self._cv:
+            for transform in args:
+                key = (transform.frame_id, transform.child_frame_id)
+                if key not in self.buffers:
+                    self.buffers[key] = TBuffer(self.buffer_size)
+                self.buffers[key].save(transform)
+                self._statics[key] = transform
+            self._cv.notify_all()
+
+    def _backfill_statics(self) -> None:
+        """Re-add static transforms to buffers if pruning removed them."""
+        for key, transform in self._statics.items():
+            buffer = self.buffers.get(key)
+            if buffer is None or len(buffer) == 0:
+                if buffer is None:
+                    self.buffers[key] = TBuffer(self.buffer_size)
+                self.buffers[key].save(transform)
 
     def get_frames(self) -> set[str]:
         frames = set()
@@ -357,6 +379,7 @@ class MultiTBuffer:
 
 class PubSubTFConfig(TFConfig):
     topic: Topic | None = None  # Required field but needs default for dataclass inheritance
+    static_topic: Topic | None = None
     pubsub: type[PubSub] | PubSub | None = None  # type: ignore[type-arg]
     autostart: bool = True
 
@@ -386,6 +409,9 @@ class PubSubTF(MultiTBuffer, TFSpec):
             topic = getattr(self.config, "topic", None)
             if topic:
                 self.pubsub.subscribe(topic, self.receive_msg)
+            static_topic = getattr(self.config, "static_topic", None)
+            if static_topic:
+                self.pubsub.subscribe(static_topic, self._receive_static_msg)
 
     def stop(self) -> None:
         self.pubsub.stop()
@@ -401,34 +427,28 @@ class PubSubTF(MultiTBuffer, TFSpec):
             self.pubsub.publish(topic, TFMessage(*args))
 
     def publish_static(self, *args: Transform) -> None:
-        # TODO: note this is a stop-gap, we'd rather this be a latched publish but thats not supported at the moment
-        static_transforms = tuple(
-            Transform(
-                translation=transform.translation,
-                rotation=transform.rotation,
-                frame_id=transform.frame_id,
-                child_frame_id=transform.child_frame_id,
-                ts=transform.ts,
-                static=True,
-            )
-            for transform in args
-        )
-        self.receive_transform(*static_transforms)
-        topic = getattr(self.config, "topic", None)
-        if topic:
-            self.pubsub.publish(topic, TFMessage(*static_transforms))
+        self.receive_static_transform(*args)
+        static_topic = getattr(self.config, "static_topic", None)
+        if static_topic:
+            self.pubsub.publish(static_topic, TFMessage(*args))
 
     def publish_all(self) -> None:
         """Publish all transforms currently stored in all buffers."""
-        all_transforms = []
+        dynamic = []
+        static = []
         with self._cv:
-            for buffer in self.buffers.values():
+            for key, buffer in self.buffers.items():
                 latest = buffer.get()  # get() with no args returns latest
                 if latest:
-                    all_transforms.append(latest)
+                    if key in self._statics:
+                        static.append(latest)
+                    else:
+                        dynamic.append(latest)
 
-        if all_transforms:
-            self.publish(*all_transforms)
+        if dynamic:
+            self.publish(*dynamic)
+        if static:
+            self.publish_static(*static)
 
     def get(
         self,
@@ -470,9 +490,13 @@ class PubSubTF(MultiTBuffer, TFSpec):
     def receive_msg(self, msg: TFMessage, topic: Topic) -> None:
         self.receive_tfmessage(msg)
 
+    def _receive_static_msg(self, msg: TFMessage, topic: Topic) -> None:
+        self.receive_static_transform(*msg.transforms)
+
 
 class LCMPubsubConfig(PubSubTFConfig):
     topic: Topic = field(default_factory=lambda: Topic("/tf", TFMessage))
+    static_topic: Topic = field(default_factory=lambda: Topic("/tf_static", TFMessage))
     pubsub: type[PubSub] | PubSub | None = LCM  # type: ignore[type-arg]
     autostart: bool = True
 
