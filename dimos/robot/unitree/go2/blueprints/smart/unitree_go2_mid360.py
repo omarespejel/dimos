@@ -37,7 +37,6 @@ from reactivex.disposable import Disposable
 
 from dimos.constants import DEFAULT_WORLD_FRAME
 from dimos.core.coordination.blueprints import autoconnect
-from dimos.utils.logging_config import setup_logger
 from dimos.core.stream import In, Out
 from dimos.hardware.sensors.lidar.fastlio2.module import FastLio2
 from dimos.memory2.module import MemoryModule, MemoryModuleConfig, Recorder, RecorderConfig
@@ -51,6 +50,7 @@ from dimos.navigation.nav_stack.frames import FRAME_ODOM
 from dimos.robot.unitree.go2.blueprints.basic.unitree_go2_basic import unitree_go2_basic
 from dimos.robot.unitree.go2.connection import GO2Connection
 from dimos.teleop.phone.phone_extensions import SimplePhoneTeleop
+from dimos.utils.logging_config import setup_logger
 from dimos.utils.testing.replay import timed_playback
 from dimos.visualization.rerun.bridge import RerunBridgeModule
 from dimos.visualization.vis_module import vis_module
