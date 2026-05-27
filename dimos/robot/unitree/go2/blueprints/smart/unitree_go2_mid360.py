@@ -37,9 +37,10 @@ from reactivex.disposable import Disposable
 
 from dimos.constants import DEFAULT_WORLD_FRAME
 from dimos.core.coordination.blueprints import autoconnect
-from dimos.core.stream import In
+from dimos.utils.logging_config import setup_logger
+from dimos.core.stream import In, Out
 from dimos.hardware.sensors.lidar.fastlio2.module import FastLio2
-from dimos.memory2.module import Recorder, RecorderConfig
+from dimos.memory2.module import MemoryModule, MemoryModuleConfig, Recorder, RecorderConfig
 from dimos.memory2.stream import Stream
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Transform import Transform
@@ -50,16 +51,13 @@ from dimos.navigation.nav_stack.frames import FRAME_ODOM
 from dimos.robot.unitree.go2.blueprints.basic.unitree_go2_basic import unitree_go2_basic
 from dimos.robot.unitree.go2.connection import GO2Connection
 from dimos.teleop.phone.phone_extensions import SimplePhoneTeleop
-from dimos.utils.logging_config import setup_logger
+from dimos.utils.testing.replay import timed_playback
 from dimos.visualization.rerun.bridge import RerunBridgeModule
+from dimos.visualization.vis_module import vis_module
 
 logger = setup_logger()
 
 _voxel_size = 0.05
-
-# FastLIO ports stamped by the C++ binary with hardware clock; must be
-# overridden to time.time() so they align with color_image (also time.time()).
-_FASTLIO_PORTS = frozenset({"lidar", "odometry"})
 
 
 class Go2Mid360MemoryConfig(RecorderConfig):
@@ -78,7 +76,7 @@ class Go2Mid360Memory(Recorder):
     config: Go2Mid360MemoryConfig
 
     def _port_to_stream(self, name: str, input_topic: In[Any], stream: Stream[Any]) -> None:
-        # Force time.time() so FastLIO hardware timestamps match image timestamps.
+        # Force time.time() so all timestamps align with color_image (also time.time()).
         default_frame_id = self.config.default_frame_id
         tf_tolerance = self.config.tf_tolerance
 
@@ -116,6 +114,7 @@ unitree_go2_mid360_memory = (
             voxel_size=_voxel_size,
             map_voxel_size=_voxel_size,
             map_freq=-1,
+            lidar_ip="192.168.1.157",
             static_transforms={
                 FRAME_ODOM: Transform(
                     frame_id=DEFAULT_WORLD_FRAME,
@@ -137,4 +136,44 @@ unitree_go2_mid360_memory = (
     .global_config(n_workers=6, robot_model="unitree_go2")
 )
 
-__all__ = ["unitree_go2_mid360_memory"]
+
+class Go2Mid360ReplayConfig(MemoryModuleConfig):
+    db_path: str | Path = "recording_go2_mid360.db"
+    speed: float = 1.0
+
+
+class Go2Mid360Replay(MemoryModule):
+    """Replays a Go2+Mid360 recording — drop-in for live hardware during offline validation."""
+
+    config: Go2Mid360ReplayConfig
+    color_image: Out[Image]
+    go2_lidar: Out[PointCloud2]
+    lidar: Out[PointCloud2]
+    odometry: Out[Odometry]
+    odom: Out[PoseStamped]
+
+    def start(self) -> None:
+        super().start()
+        speed = self.config.speed
+        streams = {
+            "color_image": (self.store.stream("color_image", Image), self.color_image.publish),
+            "go2_lidar": (self.store.stream("go2_lidar", PointCloud2), self.go2_lidar.publish),
+            "lidar": (self.store.stream("lidar", PointCloud2), self.lidar.publish),
+            "odometry": (self.store.stream("odometry", Odometry), self.odometry.publish),
+            "odom": (self.store.stream("odom", PoseStamped), self.odom.publish),
+        }
+        for stream, publish in streams.values():
+            self.register_disposable(
+                timed_playback(
+                    lambda s=stream: ((obs.ts, obs.data) for obs in s),
+                    speed=speed,
+                ).subscribe(publish)
+            )
+
+
+unitree_go2_mid360_replay = autoconnect(
+    Go2Mid360Replay.blueprint(),
+    vis_module("rerun"),
+).global_config(n_workers=3, robot_model="unitree_go2")
+
+__all__ = ["unitree_go2_mid360_memory", "unitree_go2_mid360_replay"]
