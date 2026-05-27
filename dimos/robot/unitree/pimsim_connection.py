@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import functools
+import time
 from typing import Any
 
 from reactivex import Observable, Subject
@@ -72,7 +73,28 @@ class PimSimConnection:
     def start(self) -> None:
         self._odom_transport.start()
         self._unsubscribe_odom = self._odom_transport.subscribe(self._handle_odom)
-        self._tf.start()
+        # ModuleCoordinator starts every module in parallel via
+        # safe_thread_map. With BabylonSceneViewerModule + uvicorn +
+        # SceneLidarModule (native subprocess) + VoxelGridMapper (CUDA)
+        # all racing for the GIL, the TF service's LCM handler thread
+        # can take longer than its 5 s "did it start" sanity check
+        # allows. Retry a few times before giving up — total wait stays
+        # bounded.
+        last_err: Exception | None = None
+        for attempt in range(6):
+            try:
+                self._tf.start()
+                return
+            except RuntimeError as exc:
+                if "LCM handler thread failed to start" not in str(exc):
+                    raise
+                last_err = exc
+                logger.warning(
+                    "PimSimConnection: LCM tf start race (attempt %d/6), retrying", attempt + 1
+                )
+                time.sleep(0.5)
+        assert last_err is not None
+        raise last_err
 
     def stop(self) -> None:
         self._tf.stop()
