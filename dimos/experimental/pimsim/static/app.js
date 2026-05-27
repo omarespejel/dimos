@@ -1822,6 +1822,22 @@ physicsReady.then((ok) => {
   if (ok) scene.onAfterPhysicsObservable.add(() => broadcastEntityStates(false));
 });
 
+// `window.__pimsimReady` becomes true once physics has loaded, the WS to
+// the Python module is up, and (if requested) the scene assets have
+// settled. Headless test harnesses (Playwright) poll this to know when
+// it's safe to send respawn/cmd_vel/spawn_entity messages.
+let __pimsimSceneReady = false;
+async function evaluatePimsimReady() {
+  if (!(await physicsReady)) return;
+  if (!streamRef.ready) return;
+  if (!__pimsimSceneReady) return;
+  window.__pimsimReady = true;
+}
+function markPimsimSceneReady() {
+  __pimsimSceneReady = true;
+  evaluatePimsimReady();
+}
+
 function connectStreamWorker() {
   const worker = new Worker("/static/stream_worker.js");
   streamRef.worker = worker;
@@ -1833,6 +1849,7 @@ function connectStreamWorker() {
         streamRef.ready = Boolean(message.ready);
         setStatus(message.status);
         if (streamRef.ready && browserPhysicsEnabled) publishBrowserSimOdom(true);
+        if (streamRef.ready) evaluatePimsimReady();
         break;
       case "state":
         if (message.payload.type === "state") {
@@ -2214,11 +2231,15 @@ function _updateSlidersFromState(joints) {
         try {
           await loadSceneAsset(config);
           await loadCollisionAsset(config);
+          markPimsimSceneReady();
         } catch (error) {
           console.error(error);
           setStatus("scene load failed");
         }
       }, 0);
+    } else {
+      // No scene to load (manual / empty) — ready as soon as WS + physics are up.
+      markPimsimSceneReady();
     }
   } catch (error) {
     console.error(error);

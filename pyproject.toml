@@ -353,6 +353,7 @@ navigation = [
 pimsim = [
     "dimos[sim,web]",
     "websockets>=13",
+    "playwright>=1.45",
 ]
 
 # NOTE: jetson-jp6-cuda126 extra is disabled due to 404 errors from wheel URLs
@@ -585,6 +586,8 @@ module = [
     "open_clip",
     "pinocchio",
     "piper_sdk.*",
+    "playwright",
+    "playwright.*",
     "plotext",
     "plum.*",
     "portal",
