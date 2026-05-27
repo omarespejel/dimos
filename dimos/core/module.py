@@ -19,6 +19,7 @@ import inspect
 import json
 import sys
 import threading
+import time
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -40,6 +41,7 @@ from dimos.core.introspection.module.render import render_module_io
 from dimos.core.resource import CompositeResource
 from dimos.core.rpc_client import RpcCall
 from dimos.core.stream import In, Out, RemoteOut, Transport
+from dimos.msgs.geometry_msgs.Transform import Transform
 from dimos.protocol.rpc.pubsubrpc import LCMRPC
 from dimos.protocol.rpc.spec import DEFAULT_RPC_TIMEOUT, DEFAULT_RPC_TIMEOUTS, RPCSpec
 from dimos.protocol.service.spec import BaseConfig, Configurable
@@ -71,6 +73,18 @@ class SkillInfo:
     args_schema: str
 
 
+class PeekNotFound:
+    """Sentinel returned by `Module.peek_stream` when the named stream is
+    not present on a module. A class instance survives pickle round-trips so
+    `Dimos.peek_stream` can `isinstance(result, PeekNotFound)`-test the reply.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<PeekNotFound>"
+
+
 def get_loop() -> tuple[asyncio.AbstractEventLoop, threading.Thread | None]:
     try:
         running_loop = asyncio.get_running_loop()
@@ -95,6 +109,11 @@ class ModuleConfig(BaseConfig):
     tf_transport: type[TFSpec] = LCMTF  # type: ignore[type-arg]
     frame_id_prefix: str | None = None
     frame_id: str | None = None
+    static_transforms: dict[str, Transform] = Field(default_factory=dict)
+    # TODO: in the future we should make self.tf.publish error if it tried to publish a transform that references a frame that is not mentioned in this dict (same with self.tf.get)
+    # TODO: later expose frame remappings, somehow, at the blueprint level
+    frame_mapping: dict[str, str] = Field(default_factory=dict)
+    static_publish_rate: float = 1.0
     g: GlobalConfig = global_config
 
 
@@ -111,6 +130,11 @@ class ModuleBase(Configurable, CompositeResource):
     # Deployment target. Worker managers declare which deployment type they
     # handle; the coordinator routes modules accordingly.
     deployment: ClassVar[Deployment] = "python"
+
+    # When True, this module must be the only one running on its worker
+    # process. Used for heavy modules that would otherwise contend with
+    # each other for CPU and the GIL.
+    dedicated_worker: ClassVar[bool] = False
 
     _rpc: RPCSpec | None = None
     _tf: TFSpec | None = None
@@ -129,7 +153,10 @@ class ModuleBase(Configurable, CompositeResource):
         self._module_closed_lock = threading.Lock()
         self._tools = {}
         self._tools_lock = threading.Lock()
+        self._static_publish_thread: threading.Thread | None = None
+        self._static_publish_stop = threading.Event()
         self._loop, self._loop_thread = get_loop()
+        self.frame_mapping, self.static_transforms = self._setup_frames()
         try:
             self.rpc = self.config.rpc_transport(  # type: ignore[call-arg]
                 rpc_timeouts=self.config.rpc_timeouts,
@@ -165,6 +192,7 @@ class ModuleBase(Configurable, CompositeResource):
     def start(self) -> None:
         self._start_main()
         self._auto_bind_handlers()
+        self._start_static_publish()
 
     @rpc
     def stop(self) -> None:
@@ -172,11 +200,120 @@ class ModuleBase(Configurable, CompositeResource):
         super().stop()
         self._close_module()
 
+    def _setup_frames(self) -> dict[str, str]:
+        frame_mapping_field = type(self.config).model_fields["frame_mapping"]
+        if not hasattr(frame_mapping_field, "default_factory") or not callable(
+            frame_mapping_field.default_factory
+        ):
+            raise Exception(
+                f"""In the {self.name!r} module config definition, the frame_remapping needs to be a pydantic field, not a dict"""
+            )
+        existing_frames = frame_mapping_field.default_factory()
+
+        # given something like:
+        # class MyConfig:
+        #     frame_mapping: dict[str, str] = Field(default_factory=lambda: dict(
+        #         body="base_link",
+        #         parent="world",
+        #     ))
+        # the "body" is what I call a common_name with "base_link" being the remapped name (the REAL frame id that other modules can query/use)
+
+        # step1 (for static_transforms only) translate urdf_name=>common_name
+        reverse_mapping = {value: key for key, value in existing_frames.items()}
+        static_transforms_common_names = {
+            reverse_mapping.get(urdf_frame_id, urdf_frame_id): Transform(
+                translation=transform.translation,
+                rotation=transform.rotation,
+                frame_id=reverse_mapping.get(transform.frame_id, transform.frame_id),
+                child_frame_id=reverse_mapping.get(
+                    transform.child_frame_id, transform.child_frame_id
+                ),
+            )
+            for urdf_frame_id, transform in self.config.static_transforms.items()
+        }
+        # step2 map common_name=>real_frame_id
+        valid_frame_ids = set(existing_frames.keys()) | set(static_transforms_common_names.keys())
+        final_frame_mapping = {
+            **existing_frames,
+            **self.config.frame_mapping,
+        }
+        for existing_frame, remapped_frame in final_frame_mapping.items():
+            if existing_frame not in valid_frame_ids:
+                raise Exception(
+                    f"""On module {self.name}, tried to map {existing_frame!r} to {remapped_frame!r} but that first frame doesn't exist. The existing ones are: {list(existing_frames.keys())!r} """
+                )
+        static_transforms_final = {
+            final_frame_mapping.get(common_frame_id, common_frame_id): Transform(
+                translation=transform.translation,
+                rotation=transform.rotation,
+                frame_id=final_frame_mapping.get(transform.frame_id, transform.frame_id),
+                child_frame_id=final_frame_mapping.get(
+                    transform.child_frame_id, transform.child_frame_id
+                ),
+            )
+            for common_frame_id, transform in static_transforms_common_names.items()
+        }
+        return final_frame_mapping, static_transforms_final
+
+    def _start_static_publish(self) -> None:
+        if not self.config.static_transforms or self.config.static_publish_rate <= 0:
+            return
+        self._static_publish_stop.clear()
+        self._static_publish_thread = threading.Thread(
+            target=self._static_publish,
+            daemon=True,
+        )
+        self._static_publish_thread.start()
+
+    # TODO: we're only using this until self.tf.publish_static is implemented
+    def _static_publish(self) -> None:
+        period = 1.0 / self.config.static_publish_rate
+        while not self._static_publish_stop.wait(period):
+            now = time.time()
+            self.tf.publish(
+                *(
+                    Transform(
+                        translation=transform.translation,
+                        rotation=transform.rotation,
+                        frame_id=transform.frame_id,
+                        child_frame_id=transform.child_frame_id,
+                        ts=now,
+                    )
+                    for transform in self.static_transforms.values()
+                )
+            )
+            tfs = list(
+                Transform(
+                    translation=transform.translation,
+                    rotation=transform.rotation,
+                    frame_id=transform.frame_id,
+                    child_frame_id=transform.child_frame_id,
+                    ts=now,
+                )
+                for transform in self.static_transforms.values()
+            )
+            for each in tfs:
+                print(f"""each.frame_id = {each.frame_id}""")
+                print(f"""each.child_frame_id = {each.child_frame_id}""")
+            print(f"""tfs = {tfs}""")
+            self._on_static_publish()
+
+    def _on_static_publish(self) -> None:
+        """
+        This is a callback for modules to publish other data (ex: camera info) in the static loop
+        This should rarely used, but exists for the few cases where it is needed
+        """
+
     def _close_module(self) -> None:
         with self._module_closed_lock:
             if self._module_closed:
                 return
             self._module_closed = True
+
+        self._static_publish_stop.set()
+        if self._static_publish_thread and self._static_publish_thread.is_alive():
+            self._static_publish_thread.join(timeout=self._loop_thread_timeout)
+        self._static_publish_thread = None
 
         self._close_all_tools()
         self._close_rpc()
@@ -232,6 +369,8 @@ class ModuleBase(Configurable, CompositeResource):
         state.pop("_main_gen", None)
         state.pop("_tools", None)
         state.pop("_tools_lock", None)
+        state.pop("_static_publish_thread", None)
+        state.pop("_static_publish_stop", None)
         return state
 
     def __setstate__(self, state) -> None:  # type: ignore[no-untyped-def]
@@ -246,6 +385,8 @@ class ModuleBase(Configurable, CompositeResource):
         self._main_gen = None
         self._tools = {}
         self._tools_lock = threading.Lock()
+        self._static_publish_thread = None
+        self._static_publish_stop = threading.Event()
 
     @property
     def tf(self):  # type: ignore[no-untyped-def]
@@ -766,6 +907,21 @@ class Module(ModuleBase):
 
         stream._transport = transport
         return True
+
+    @rpc
+    def peek_stream(self, stream_name: str, timeout: float) -> Any:
+        """Return the next emission on a named stream, a `PeekNotFound`
+        sentinel if no such stream exists, or `None` on timeout/error.
+
+        Used by `Dimos.peek_stream` to scan running modules.
+        """
+        stream = self.outputs.get(stream_name) or self.inputs.get(stream_name)
+        if stream is None:
+            return PeekNotFound()
+        try:
+            return stream.get_next(timeout)
+        except Exception:
+            return None
 
     # called from remote
     def connect_stream(self, input_name: str, remote_stream: RemoteOut[T]):  # type: ignore[no-untyped-def]
