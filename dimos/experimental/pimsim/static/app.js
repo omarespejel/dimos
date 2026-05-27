@@ -304,6 +304,10 @@ function setSceneVisibility(visible) {
   for (const mesh of sceneMeshes) setRenderableVisible(mesh, visible);
   setAllEntityVisualsVisible(visible);
   setButtonActive("toggleScene", visible);
+  console.log(
+    `[pimsim] toggle scene visible=${visible} ` +
+      `sceneRoot=${!!sceneRoot} meshes=${sceneMeshes.length} entities=${entities.size}`,
+  );
 }
 
 function setRobotVisibility(visible) {
@@ -876,8 +880,15 @@ async function loadSceneAsset(config) {
   for (const camera of result.cameras || []) {
     camera.dispose();
   }
+  // Reparent EVERY imported node (meshes + transform nodes — Babylon's
+  // SceneLoader splits them across two lists) into sceneRoot. Anything
+  // we leave parented to its original __root__ would dodge the
+  // setEnabled toggle and keep rendering.
+  const importedNodes = [...(result.meshes || []), ...(result.transformNodes || [])];
+  for (const node of importedNodes) {
+    if (node.parent === null) node.parent = root;
+  }
   for (const mesh of result.meshes) {
-    if (mesh.parent === null) mesh.parent = root;
     mesh.isPickable = true;
     mesh.metadata = { dimosSceneMesh: true };
     if (mesh.getTotalVertices && mesh.getTotalVertices() > 0) registerSceneMesh(mesh);
@@ -889,6 +900,11 @@ async function loadSceneAsset(config) {
       mesh.doNotSyncBoundingInfo = true;
     }
   }
+  console.log(
+    `[pimsim] loaded scene: meshes=${(result.meshes || []).length} ` +
+      `transformNodes=${(result.transformNodes || []).length} ` +
+      `sceneRoot.children=${root.getChildren().length}`,
+  );
   root.freezeWorldMatrix();
   setSceneDepthWrite(sceneDepthEnabled);
   setSceneWireframe(sceneWireEnabled);
