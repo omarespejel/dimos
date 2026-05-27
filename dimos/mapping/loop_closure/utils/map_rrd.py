@@ -17,14 +17,17 @@
 Lidar clouds are assumed to be in world frame and logged directly under
 their entity path (no parent transform). Entities written:
 
-- ``world/lidar``     — primary point cloud (default: Go2 L1, ``--lidar-stream``)
-- ``world/livox``     — fastlio_lidar raw cloud (if present)
-- ``world/fastlio``   — fastlio_odometry pose axis (if present)
-- ``world/camera``    — color_image camera pose (static pinhole + Transform3D)
-- ``world/camera/image`` — color_image frames
+- ``world/lidar``         — Go2 L1 per-frame point cloud
+- ``world/lidar_voxels``  — accumulated voxel map of the primary lidar (``--map``)
+- ``world/fastlio_lidar`` — fastlio_lidar raw cloud (if present)
+- ``world/fastlio_voxels``— accumulated voxel map of fastlio_lidar (``--map``)
+- ``world/fastlio``       — fastlio_odometry pose axis (if present)
+- ``world/camera``        — color_image camera pose (static pinhole + Transform3D)
+- ``world/camera/image``  — color_image frames
 
 Usage:
     uv run python -m dimos.mapping.loop_closure.utils.map_rrd mid360 --out map.rrd
+    uv run python -m dimos.mapping.loop_closure.utils.map_rrd mid360 --out map.rrd --map
     rerun map.rrd
 """
 
@@ -38,7 +41,9 @@ from typing import Any
 import rerun as rr
 import typer
 
+from dimos.mapping.voxels import VoxelMapTransformer
 from dimos.memory2.store.sqlite import SqliteStore
+from dimos.memory2.stream import Stream
 from dimos.memory2.transform import throttle
 from dimos.memory2.type.observation import Observation
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
@@ -82,12 +87,32 @@ def _progress(total: int, label: str) -> Callable[[Observation[Any]], None]:
     return tick
 
 
+def _log_clouds(
+    label: str,
+    stream: Stream[PointCloud2],
+    entity: str,
+    voxel: float,
+    point_mode: str,
+    *,
+    total: int | None = None,
+) -> None:
+    """Iterate a PointCloud2 stream and log each obs to ``entity``.
+
+    ``total`` overrides the progress denominator — useful for transform
+    pipelines where calling :py:meth:`Stream.count` would materialize the
+    whole pipeline.
+    """
+    n = total if total is not None else stream.count()
+    cb = _progress(n, label)
+    for obs in stream:
+        cb(obs)
+        rr.set_time(TIMELINE, timestamp=obs.ts)
+        rr.log(entity, obs.data.to_rerun(voxel_size=voxel, mode=point_mode))
+
+
 def main(
     dataset: str = typer.Argument(..., help="Dataset .db: bare name (cwd or data/) or path"),
     out: Path = typer.Option(..., "--out", help="Output .rrd path"),
-    lidar_stream: str = typer.Option(
-        "lidar", "--lidar-stream", help="Primary point cloud stream (default: Go2 L1)"
-    ),
     voxel: float = typer.Option(
         0.05, "--voxel", help="Voxel size hint for the point cloud renderer"
     ),
@@ -96,6 +121,22 @@ def main(
     ),
     camera_hz: float = typer.Option(
         2.0, "--camera-hz", help="Throttle color_image to at most this rate; 0 disables"
+    ),
+    map: bool = typer.Option(
+        False,
+        "--map",
+        help="Accumulate each lidar stream into a VoxelGrid and log only the final map",
+    ),
+    map_voxel: float = typer.Option(
+        0.05, "--map-voxel", help="Voxel size for the accumulated map (m); --map only"
+    ),
+    map_device: str = typer.Option(
+        "CUDA:0", "--map-device", help="Open3D device for the VoxelGrid; --map only"
+    ),
+    map_emit_every: int = typer.Option(
+        10,
+        "--map-emit-every",
+        help="Emit accumulated map every N frames (0 = only at end); --map only",
     ),
 ) -> None:
     db_path = resolve_named_path(dataset, ".db")
@@ -124,27 +165,46 @@ def main(
     with store:
         print(store.summary())
 
-        lidar = store.stream(lidar_stream, PointCloud2)
+        lidar = store.stream("lidar", PointCloud2)
         color_image = store.stream("color_image", Image)
+        has_livox = "fastlio_lidar" in store.streams
+        livox = store.stream("fastlio_lidar", PointCloud2) if has_livox else None
 
-        n_lidar = lidar.count()
-        cb = _progress(n_lidar, f"{lidar_stream:>12s}")
-        for lidar_obs in lidar:
-            cb(lidar_obs)
-            rr.set_time(TIMELINE, timestamp=lidar_obs.ts)
-            rr.log(
-                "world/lidar",
-                lidar_obs.data.to_rerun(voxel_size=voxel, mode=point_mode),
+        # ---- per-frame raw clouds ----
+        _log_clouds("       lidar", lidar, "world/lidar", voxel, point_mode)
+        if livox is not None:
+            _log_clouds("fastlio_lidar", livox, "world/fastlio_lidar", voxel, point_mode)
+
+        # ---- accumulated voxel maps (--map only) ----
+        # Go2 L1 forward-facing → column carving on.
+        # Mid360 spherical → column carving off, just aggregate.
+        if map:
+            grid_kwargs = {"voxel_size": map_voxel, "device": map_device, "show_startup_log": False}
+            _log_clouds(
+                " lidar_voxels",
+                lidar.transform(
+                    VoxelMapTransformer(
+                        emit_every=map_emit_every, carve_columns=True, **grid_kwargs
+                    )
+                ),
+                "world/lidar_voxels",
+                voxel,
+                point_mode,
+                total=max(1, lidar.count() // max(map_emit_every, 1)),
             )
-
-        # ---- livox raw cloud at world/livox (skip if it's the primary) ----
-        if "fastlio_lidar" in store.streams and lidar_stream != "fastlio_lidar":
-            livox = store.stream("fastlio_lidar", PointCloud2)
-            cb = _progress(livox.count(), "fastlio_lidar")
-            for obs in livox:
-                cb(obs)
-                rr.set_time(TIMELINE, timestamp=obs.ts)
-                rr.log("world/livox", obs.data.to_rerun(voxel_size=voxel, mode=point_mode))
+            if livox is not None:
+                _log_clouds(
+                    "fastlio_voxels",
+                    livox.transform(
+                        VoxelMapTransformer(
+                            emit_every=map_emit_every, carve_columns=False, **grid_kwargs
+                        )
+                    ),
+                    "world/fastlio_voxels",
+                    voxel,
+                    point_mode,
+                    total=max(1, livox.count() // max(map_emit_every, 1)),
+                )
 
         # ---- fastlio pose axis from fastlio_odometry stream ----
         if "fastlio_odometry" in store.streams:
