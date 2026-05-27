@@ -207,7 +207,7 @@ class ModuleBase(Configurable, CompositeResource):
         if not hasattr(frame_mapping_field, "default_factory") or not callable(
             frame_mapping_field.default_factory
         ):
-            raise Exception(
+            raise ValueError(
                 f"""In the {self.name!r} module config definition, the frame_remapping needs to be a pydantic field, not a dict"""
             )
         existing_frames: dict[str, str] = frame_mapping_field.default_factory()  # type: ignore[call-arg]
@@ -241,7 +241,7 @@ class ModuleBase(Configurable, CompositeResource):
         }
         for existing_frame, remapped_frame in final_frame_mapping.items():
             if existing_frame not in valid_frame_ids:
-                raise Exception(
+                raise ValueError(
                     f"""On module {self.name}, tried to map {existing_frame!r} to {remapped_frame!r} but that first frame doesn't exist. The existing ones are: {list(existing_frames.keys())!r} """
                 )
         static_transforms_final = {

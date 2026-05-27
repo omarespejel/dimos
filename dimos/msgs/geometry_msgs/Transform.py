@@ -66,6 +66,7 @@ class Transform(Timestamped):
             frame_id=self.frame_id,
             child_frame_id=self.child_frame_id,
             ts=time.time(),
+            static=self.static,
         )
 
     def __repr__(self) -> str:
@@ -133,6 +134,7 @@ class Transform(Timestamped):
             frame_id=self.frame_id,
             child_frame_id=other.child_frame_id,
             ts=self.ts,
+            static=self.static or other.static,
         )
 
     def inverse(self) -> Transform:
@@ -157,6 +159,7 @@ class Transform(Timestamped):
             frame_id=self.child_frame_id,  # Swap frame references
             child_frame_id=self.frame_id,
             ts=self.ts,
+            static=self.static,
         )
 
     def __neg__(self) -> Transform:
