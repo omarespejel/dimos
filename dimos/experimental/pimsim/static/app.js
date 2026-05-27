@@ -271,11 +271,6 @@ function setButtonActive(id, active) {
 
 function setRenderableVisible(node, visible) {
   if (!node) return;
-  // setEnabled works on both Mesh and TransformNode, and recursively
-  // applies to descendants — mesh-only isVisible/visibility miss any
-  // child geometry nested under a parent TransformNode (e.g. chair
-  // seat under a wrapper transform that's not itself a Mesh).
-  if (typeof node.setEnabled === "function") node.setEnabled(visible);
   if ("isVisible" in node) node.isVisible = visible;
   if ("visibility" in node) node.visibility = visible ? 1 : 0;
 }
