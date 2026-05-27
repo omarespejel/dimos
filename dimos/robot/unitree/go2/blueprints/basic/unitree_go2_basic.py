@@ -22,6 +22,7 @@ from dimos.core.coordination.blueprints import autoconnect
 from dimos.core.global_config import global_config
 from dimos.core.transport import pSHMTransport
 from dimos.msgs.sensor_msgs.Image import Image
+from dimos.robot.unitree.go2.blueprints.basic._babylon_sim import go2_babylon_blueprint
 from dimos.robot.unitree.go2.connection import GO2Connection
 from dimos.visualization.vis_module import vis_module
 
@@ -128,10 +129,17 @@ _with_vis = autoconnect(
 )
 
 
+_sim_only_blueprints = []
+if global_config.simulation in ("babylon", "pimsim"):
+    _babylon_bp = go2_babylon_blueprint()
+    if _babylon_bp is not None:
+        _sim_only_blueprints.append(_babylon_bp)
+
 unitree_go2_basic = (
     autoconnect(
         _with_vis,
         GO2Connection.blueprint(),
+        *_sim_only_blueprints,
     ).global_config(n_workers=4, robot_model="unitree_go2")
     # we temporarily disabled sensor timestamps
     # and are derriving all timestmaps upon reception

@@ -1,0 +1,26 @@
+<!-- Minimal Go2 proxy MJCF for the Babylon viewer / pimsim browser sim.
+
+Babylon owns the kinematic base in `--simulation=pimsim` mode — it
+integrates /cmd_vel and publishes /odom — so this proxy only needs a
+single free-jointed body with one visible geom for rendering. No STL
+meshes, no actuated joints; Go2's real low-level loop runs on the
+robot firmware via SPORT_MOD and never reaches the simulator.
+
+Dimensions match the Go2's standing pose roughly: 65 cm long, 31 cm
+wide, body sitting ~40 cm above the floor. Tweak `pos` z if you want
+the spawn height to align with the support floor. -->
+<mujoco model="go2_proxy">
+  <compiler angle="radian"/>
+  <option timestep="0.005"/>
+
+  <worldbody>
+    <body name="base_link" pos="0 0 0.40">
+      <inertial pos="0 0 0" mass="12.0" diaginertia="0.05 0.18 0.20"/>
+      <joint name="floating_base_joint" type="free" limited="false" actuatorfrclimited="false"/>
+      <geom name="body" type="box" size="0.325 0.155 0.080"
+            rgba="0.35 0.35 0.40 1" contype="0" conaffinity="0" group="1" density="0"/>
+      <geom name="head" type="box" size="0.04 0.05 0.05" pos="0.32 0 0.04"
+            rgba="0.85 0.85 0.20 1" contype="0" conaffinity="0" group="1" density="0"/>
+    </body>
+  </worldbody>
+</mujoco>
