@@ -13,19 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Basic G1 sim stack: base sensors plus sim connection and planner."""
+from __future__ import annotations
+
+import os
 
 from dimos.core.coordination.blueprints import autoconnect
-from dimos.navigation.replanning_a_star.module import ReplanningAStarPlanner
-from dimos.robot.unitree.g1.blueprints.primitive.unitree_g1_primitive_no_nav import (
-    unitree_g1_primitive_no_nav,
-)
-from dimos.robot.unitree.g1.mujoco_sim import G1SimConnection
+from dimos.hardware.sensors.lidar.fastlio2.module import FastLio2
+from dimos.robot.unitree.g1.config import G1
+from dimos.robot.unitree.g1.effectors.high_level.dds_sdk import G1HighLevelDdsSdk
 
-unitree_g1_basic_sim = autoconnect(
-    unitree_g1_primitive_no_nav,
-    G1SimConnection.blueprint(),
-    ReplanningAStarPlanner.blueprint(),
-)
+unitree_g1_onboard = autoconnect(
+    FastLio2.blueprint(
+        host_ip=os.getenv("LIDAR_HOST_IP", "192.168.123.164"),
+        lidar_ip=os.getenv("LIDAR_IP", "192.168.123.120"),
+        mount=G1.internal_odom_offsets["mid360_link"],
+        map_freq=1.0,
+        config="default.yaml",
+    ),
+    G1HighLevelDdsSdk.blueprint(),
+).global_config(n_workers=12, robot_model="unitree_g1")
 
-__all__ = ["unitree_g1_basic_sim"]
+
+__all__ = ["unitree_g1_onboard"]

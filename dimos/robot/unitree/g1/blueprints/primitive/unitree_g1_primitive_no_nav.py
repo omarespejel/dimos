@@ -130,7 +130,7 @@ _camera = (
     else autoconnect()
 )
 
-uintree_g1_primitive_no_nav = (
+unitree_g1_primitive_no_nav = (
     autoconnect(
         _with_vis,
         _camera,
@@ -163,4 +163,4 @@ uintree_g1_primitive_no_nav = (
     )
 )
 
-__all__ = ["uintree_g1_primitive_no_nav"]
+__all__ = ["unitree_g1_primitive_no_nav"]
