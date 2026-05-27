@@ -29,10 +29,11 @@ from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.navigation.movement_manager.movement_manager import MovementManager
-from dimos.robot.unitree.go2.blueprints.basic.unitree_go2_basic import unitree_go2_basic
 from dimos.robot.unitree.go2.connection import GO2Connection
+from dimos.robot.unitree.keyboard_teleop import KeyboardTeleop
 from dimos.utils.logging_config import setup_logger
 
+# dimos --no-obstacle-avoidance --robot-ip 192.168.124.177 run unitree-go2-record
 logger = setup_logger()
 
 # FastLIO ports stamped by the C++ binary with hardware clock; must be
@@ -48,12 +49,13 @@ class Go2Mid360MemoryConfig(RecorderConfig):
 class Go2Mid360Memory(Recorder):
     """Records Go2 camera, native Go2 lidar, Mid-360 lidar, FastLio2 odometry, and Go2 leg odometry."""
 
-    color_image: In[Image]
-    go2_lidar: In[PointCloud2]
-    lidar: In[PointCloud2]
-    odometry: In[Odometry]
-    odom: In[PoseStamped]
     config: Go2Mid360MemoryConfig
+
+    color_image: In[Image]
+    lidar: In[PointCloud2]
+    odom: In[PoseStamped]
+    fastlio_lidar: In[PointCloud2]
+    fastlio_odometry: In[Odometry]
 
     # def _port_to_stream(self, name: str, input_topic: In[Any], stream: Stream[Any]) -> None:
     #     if name not in _FASTLIO_PORTS:
@@ -121,11 +123,13 @@ class Go2Mid360Memory(Recorder):
 
 
 unitree_go2_record = autoconnect(
-    unitree_go2_basic.remappings(
-        [
-            (GO2Connection, "lidar", "go2_lidar"),
-        ]
-    ),
+    GO2Connection.blueprint(),
+    KeyboardTeleop.blueprint(),
+    # unitree_go2_basic.remappings(
+    #     [
+    #         # (GO2Connection, "lidar", "go2_lidar"),
+    #     ]
+    # ),
     MovementManager.blueprint(),
     FastLio2.blueprint(
         # host_ip=os.getenv("LIDAR_HOST_IP", "192.168.123.164"),
@@ -136,6 +140,8 @@ unitree_go2_record = autoconnect(
     ).remappings(
         [
             # (FastLio2, "global_map", "global_map_fastlio"),
+            (FastLio2, "lidar", "fastlio_lidar"),
+            (FastLio2, "odometry", "fastlio_odometry"),
         ]
     ),
     Go2Mid360Memory.blueprint(),
