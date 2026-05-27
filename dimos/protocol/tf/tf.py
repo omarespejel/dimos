@@ -115,6 +115,7 @@ class MultiTBuffer:
     def __init__(self, buffer_size: float = 10.0) -> None:
         self.buffers: dict[tuple[str, str], TBuffer] = {}
         self.buffer_size = buffer_size
+        self._statics: dict[tuple[str, str], Transform] = {}
         self._cv = threading.Condition()
 
     def receive_transform(self, *args: Transform) -> None:
@@ -124,6 +125,8 @@ class MultiTBuffer:
                 if key not in self.buffers:
                     self.buffers[key] = TBuffer(self.buffer_size)
                 self.buffers[key].add(transform)
+                if transform.static:
+                    self._statics[key] = transform
             self._cv.notify_all()
 
     def get_frames(self) -> set[str]:
@@ -160,13 +163,18 @@ class MultiTBuffer:
             )
 
         with self._cv:
-            # Check forward direction
             key = (parent_frame, child_frame)
+            reverse_key = (child_frame, parent_frame)
+
+            # Check statics first (no tolerance needed)
+            if key in self._statics:
+                return self._statics[key]
+            if reverse_key in self._statics:
+                return self._statics[reverse_key].inverse()
+
+            # Check dynamic buffers
             if key in self.buffers:
                 return self.buffers[key].get(time_point, time_tolerance)  # type: ignore[arg-type]
-
-            # Check reverse direction and return inverse
-            reverse_key = (child_frame, parent_frame)
             if reverse_key in self.buffers:
                 transform = self.buffers[reverse_key].get(time_point, time_tolerance)  # type: ignore[arg-type]
                 return transform.inverse() if transform else None
@@ -274,6 +282,43 @@ class MultiTBuffer:
 
             return None
 
+    @property
+    def tree_str(self) -> str:
+        if not self.buffers:
+            return "(empty)"
+
+        children: dict[str, list[str]] = {}
+        all_children: set[str] = set()
+        for parent, child in self.buffers:
+            children.setdefault(parent, []).append(child)
+            all_children.add(child)
+
+        roots = [frame for frame in children if frame not in all_children]
+        if not roots:
+            roots = sorted(children.keys())[:1]
+
+        for root in roots:
+            children.setdefault(root, [])
+        for frame_list in children.values():
+            frame_list.sort()
+
+        lines: list[str] = []
+
+        def walk(frame: str, prefix: str, is_last: bool, is_root: bool) -> None:
+            connector = "" if is_root else ("└── " if is_last else "├── ")
+            lines.append(f"{prefix}{connector}{frame}")
+            child_prefix = prefix if is_root else prefix + ("    " if is_last else "│   ")
+            kids = children.get(frame, [])
+            for index, kid in enumerate(kids):
+                walk(kid, child_prefix, index == len(kids) - 1, False)
+
+        for index, root in enumerate(sorted(roots)):
+            if index > 0:
+                lines.append("")
+            walk(root, "", index == len(roots) - 1, True)
+
+        return "\n".join(lines)
+
     def graph(self) -> str:
         import subprocess
 
@@ -356,14 +401,28 @@ class PubSubTF(MultiTBuffer, TFSpec):
             self.pubsub.publish(topic, TFMessage(*args))
 
     def publish_static(self, *args: Transform) -> None:
-        raise NotImplementedError("Static transforms not implemented in PubSubTF.")
+        # TODO: note this is a stop-gap, we'd rather this be a latched publish but thats not supported at the moment
+        static_transforms = tuple(
+            Transform(
+                translation=transform.translation,
+                rotation=transform.rotation,
+                frame_id=transform.frame_id,
+                child_frame_id=transform.child_frame_id,
+                ts=transform.ts,
+                static=True,
+            )
+            for transform in args
+        )
+        self.receive_transform(*static_transforms)
+        topic = getattr(self.config, "topic", None)
+        if topic:
+            self.pubsub.publish(topic, TFMessage(*static_transforms))
 
     def publish_all(self) -> None:
         """Publish all transforms currently stored in all buffers."""
         all_transforms = []
         with self._cv:
             for buffer in self.buffers.values():
-                # Get the latest transform from each buffer
                 latest = buffer.get()  # get() with no args returns latest
                 if latest:
                     all_transforms.append(latest)

@@ -113,7 +113,7 @@ class ModuleConfig(BaseConfig):
     # TODO: in the future we should make self.tf.publish error if it tried to publish a transform that references a frame that is not mentioned in this dict (same with self.tf.get)
     # TODO: later expose frame remappings, somehow, at the blueprint level
     frame_mapping: dict[str, str] = Field(default_factory=dict)
-    static_publish_rate: float = 1.0
+    static_publish_interval: float = 1.0
     g: GlobalConfig = global_config
 
 
@@ -190,9 +190,11 @@ class ModuleBase(Configurable, CompositeResource):
 
     @rpc
     def start(self) -> None:
+        # NOTE: there's basically always going to be some inital race around static transform frames and tf.get's
+        # putting the statics at the top helps mitigate/reduce that
+        self._start_static_publish()
         self._start_main()
         self._auto_bind_handlers()
-        self._start_static_publish()
 
     @rpc
     def stop(self) -> None:
@@ -200,7 +202,7 @@ class ModuleBase(Configurable, CompositeResource):
         super().stop()
         self._close_module()
 
-    def _setup_frames(self) -> dict[str, str]:
+    def _setup_frames(self) -> tuple[dict[str, str], dict[str, Transform]]:
         frame_mapping_field = type(self.config).model_fields["frame_mapping"]
         if not hasattr(frame_mapping_field, "default_factory") or not callable(
             frame_mapping_field.default_factory
@@ -208,7 +210,7 @@ class ModuleBase(Configurable, CompositeResource):
             raise Exception(
                 f"""In the {self.name!r} module config definition, the frame_remapping needs to be a pydantic field, not a dict"""
             )
-        existing_frames = frame_mapping_field.default_factory()
+        existing_frames: dict[str, str] = frame_mapping_field.default_factory()  # type: ignore[call-arg]
 
         # given something like:
         # class MyConfig:
@@ -256,33 +258,25 @@ class ModuleBase(Configurable, CompositeResource):
         return final_frame_mapping, static_transforms_final
 
     def _start_static_publish(self) -> None:
-        if not self.config.static_transforms or self.config.static_publish_rate <= 0:
+        self._static_publish()
+        if not self.config.static_transforms or self.config.static_publish_interval <= 0:
             return
         self._static_publish_stop.clear()
         self._static_publish_thread = threading.Thread(
-            target=self._static_publish,
+            target=self._static_publisher,
             daemon=True,
         )
         self._static_publish_thread.start()
 
-    # TODO: we're only using this until self.tf.publish_static is implemented
+    # TODO: later this should be replaced with latching streams
+    def _static_publisher(self) -> None:
+        while not self._static_publish_stop.wait(self.config.static_publish_interval):
+            self._static_publish()
+
     def _static_publish(self) -> None:
-        period = 1.0 / self.config.static_publish_rate
-        while not self._static_publish_stop.wait(period):
-            now = time.time()
-            self.tf.publish(
-                *(
-                    Transform(
-                        translation=transform.translation,
-                        rotation=transform.rotation,
-                        frame_id=transform.frame_id,
-                        child_frame_id=transform.child_frame_id,
-                        ts=now,
-                    )
-                    for transform in self.static_transforms.values()
-                )
-            )
-            tfs = list(
+        now = time.time()
+        self.tf.publish_static(
+            *(
                 Transform(
                     translation=transform.translation,
                     rotation=transform.rotation,
@@ -292,11 +286,8 @@ class ModuleBase(Configurable, CompositeResource):
                 )
                 for transform in self.static_transforms.values()
             )
-            for each in tfs:
-                print(f"""each.frame_id = {each.frame_id}""")
-                print(f"""each.child_frame_id = {each.child_frame_id}""")
-            print(f"""tfs = {tfs}""")
-            self._on_static_publish()
+        )
+        self._on_static_publish()
 
     def _on_static_publish(self) -> None:
         """

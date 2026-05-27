@@ -311,11 +311,7 @@ class Recorder(MemoryModule):
 
             if not pose:
                 logger.warning(
-                    "[%s] No tf available for frame '%s' at time %s (msg ts: %s), storing without pose",
-                    name,
-                    frame_id,
-                    ts,
-                    getattr(msg, "ts", None),
+                    f"""[{name}] No tf available for frame {name!r} at time {ts} (msg ts: {getattr(msg, "ts", None)}), storing without pose\n{self.tf.tree_str}"""
                 )
             stream.append(msg, ts=ts, pose=pose)
 
