@@ -197,6 +197,35 @@ def go2_babylon_blueprint() -> Blueprint | None:
     )
 
 
+def go2_sim_mapping_blueprint() -> Blueprint | None:
+    """Voxel→global_map mapper that converts /lidar into /global_map.
+
+    Lives in the sim path because real-hardware Go2 already has its own
+    mapping chain via the higher-level ``unitree_go2`` blueprint. In
+    ``unitree-go2-basic --simulation pimsim`` (the headless / smoke
+    path) we still want a populated ``BabylonSceneViewerModule.point\
+    cloud_overlay`` so the user sees what the raycaster is doing.
+
+    Returns ``None`` if lidar is disabled — /lidar wouldn't have any
+    publisher anyway.
+    """
+    if _env_bool("DIMOS_DISABLE_LIDAR", False):
+        return None
+    scene_package = _scene_package()
+    if scene_package is None or scene_package.browser_collision_path is None:
+        return None
+
+    from dimos.mapping.voxels import VoxelGridMapper
+
+    voxel_size = _env_float("DIMOS_GLOBAL_MAP_VOXEL_SIZE", 0.05)
+    return VoxelGridMapper.blueprint(voxel_size=voxel_size, emit_every=5).transports(
+        {
+            ("lidar", PointCloud2): LCMTransport("/lidar", PointCloud2),
+            ("global_map", PointCloud2): LCMTransport("/global_map", PointCloud2),
+        }
+    )
+
+
 def go2_scene_lidar_blueprint() -> Blueprint | None:
     """Wire the rust SceneLidarModule when a cooked scene is configured.
 
@@ -260,4 +289,8 @@ def go2_scene_lidar_blueprint() -> Blueprint | None:
     )
 
 
-__all__ = ["go2_babylon_blueprint", "go2_scene_lidar_blueprint"]
+__all__ = [
+    "go2_babylon_blueprint",
+    "go2_scene_lidar_blueprint",
+    "go2_sim_mapping_blueprint",
+]

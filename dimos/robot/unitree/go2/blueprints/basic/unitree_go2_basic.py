@@ -25,6 +25,7 @@ from dimos.msgs.sensor_msgs.Image import Image
 from dimos.robot.unitree.go2.blueprints.basic._babylon_sim import (
     go2_babylon_blueprint,
     go2_scene_lidar_blueprint,
+    go2_sim_mapping_blueprint,
 )
 from dimos.robot.unitree.go2.connection import GO2Connection
 from dimos.visualization.vis_module import vis_module
@@ -140,6 +141,13 @@ if global_config.simulation in ("babylon", "pimsim"):
     _lidar_bp = go2_scene_lidar_blueprint()
     if _lidar_bp is not None:
         _sim_only_blueprints.append(_lidar_bp)
+        # /lidar needs a consumer for the browser pointcloud_overlay to
+        # populate; unitree-go2 (higher-level) already brings its own
+        # VoxelGridMapper, but unitree-go2-basic on its own would leave
+        # /lidar dangling. Append the mapper conditionally.
+        _mapping_bp = go2_sim_mapping_blueprint()
+        if _mapping_bp is not None:
+            _sim_only_blueprints.append(_mapping_bp)
 
 unitree_go2_basic = (
     autoconnect(
