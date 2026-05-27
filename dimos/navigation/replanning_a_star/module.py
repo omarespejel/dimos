@@ -25,6 +25,7 @@ from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
+from dimos.msgs.nav_msgs.Odometry import Odometry
 from dimos.msgs.nav_msgs.Path import Path
 from dimos.navigation.base import NavigationInterface, NavigationState
 from dimos.navigation.replanning_a_star.global_planner import GlobalPlanner
@@ -35,6 +36,7 @@ logger = setup_logger()
 
 class ReplanningAStarPlanner(Module, NavigationInterface):
     odom: In[PoseStamped]  # TODO: Use TF.
+    odometry: In[Odometry]
     global_costmap: In[OccupancyGrid]
     goal_request: In[PoseStamped]
     clicked_point: In[PointStamped]
@@ -58,6 +60,13 @@ class ReplanningAStarPlanner(Module, NavigationInterface):
         super().start()
 
         self.register_disposable(Disposable(self.odom.subscribe(self._planner.handle_odom)))
+        self.register_disposable(
+            Disposable(
+                self.odometry.subscribe(
+                    lambda msg: self._planner.handle_odom(msg.to_pose_stamped())
+                )
+            )
+        )
         self.register_disposable(
             Disposable(self.global_costmap.subscribe(self._planner.handle_global_costmap))
         )

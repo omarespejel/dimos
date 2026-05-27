@@ -131,6 +131,22 @@ class Odometry(Timestamped):
     def yaw(self) -> float:
         return self.pose.yaw
 
+    def to_pose_stamped(self) -> PoseStamped:
+        """Convert to PoseStamped, dropping twist and covariance."""
+        from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+
+        return PoseStamped(
+            ts=self.ts,
+            frame_id=self.frame_id,
+            position=[self.position.x, self.position.y, self.position.z],
+            orientation=[
+                self.orientation.x,
+                self.orientation.y,
+                self.orientation.z,
+                self.orientation.w,
+            ],
+        )
+
     # -- Serialization --
 
     def lcm_encode(self) -> bytes:

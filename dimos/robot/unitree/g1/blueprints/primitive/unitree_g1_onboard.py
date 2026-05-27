@@ -19,6 +19,7 @@ import os
 
 from dimos.core.coordination.blueprints import autoconnect
 from dimos.hardware.sensors.lidar.fastlio2.module import FastLio2
+from dimos.robot.unitree.g1.blueprints.primitive.unitree_g1_vis import unitree_g1_vis
 from dimos.robot.unitree.g1.config import G1
 from dimos.robot.unitree.g1.effectors.high_level.dds_sdk import G1HighLevelDdsSdk
 
@@ -29,8 +30,9 @@ unitree_g1_onboard = autoconnect(
         mount=G1.internal_odom_offsets["mid360_link"],
         map_freq=1.0,
         config="default.yaml",
-    ),
+    ).remappings([(FastLio2, "global_map", "global_map_fastlio")]),
     G1HighLevelDdsSdk.blueprint(),
+    unitree_g1_vis,
 ).global_config(n_workers=12, robot_model="unitree_g1")
 
 

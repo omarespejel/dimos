@@ -16,20 +16,20 @@
 """Basic G1 stack: base sensors plus real robot connection and ROS nav."""
 
 from dimos.core.coordination.blueprints import autoconnect
-from dimos.hardware.sensors.lidar.fastlio2.module import FastLio2
 from dimos.mapping.costmapper import CostMapper
 from dimos.mapping.ray_tracing.module import RayTracingVoxelMap
 from dimos.navigation.movement_manager.movement_manager import MovementManager
 from dimos.navigation.replanning_a_star.module import ReplanningAStarPlanner
-from dimos.robot.unitree.g1.connection import G1Connection
+from dimos.robot.unitree.g1.blueprints.primitive.unitree_g1_onboard import unitree_g1_onboard
+from dimos.robot.unitree.g1.blueprints.primitive.unitree_g1_vis import unitree_g1_vis
 
 unitree_g1_nav_simple = autoconnect(
-    FastLio2.blueprint(),
-    G1Connection.blueprint(),
-    RayTracingVoxelMap.blueprint(),
+    unitree_g1_onboard,
+    RayTracingVoxelMap.blueprint(voxel_size=0.05),
     CostMapper.blueprint(),
     ReplanningAStarPlanner.blueprint(),
     MovementManager.blueprint(),
+    unitree_g1_vis,
 ).global_config(n_workers=10, robot_model="unitree_g1")
 
 __all__ = ["unitree_g1_nav_simple"]
