@@ -364,6 +364,12 @@ fn find_misses_along_ray(
             continue;
         }
 
+        // don't remove points in the same xy plane as the hit, unless the plane only walks that plane
+        // we do this to preserve floors, which is more important than some missed points
+        if origin_voxel.2 != endpoint.2 && z == endpoint.2 {
+            continue;
+        }
+
         let cx = x as f32 * voxel_size + half;
         let cy = y as f32 * voxel_size + half;
         let cz = z as f32 * voxel_size + half;
@@ -636,7 +642,7 @@ mod tests {
         let origin_voxel = world_to_voxel(origin.0, origin.1, origin.2, inv);
         let endpoint = world_to_voxel(end.0, end.1, end.2, inv);
 
-        let expected: AHashSet<VoxelKey> = [
+        let walked: AHashSet<VoxelKey> = [
             (1, 0, 0),
             (1, 1, 0),
             (1, 1, 1),
@@ -649,7 +655,7 @@ mod tests {
         .into_iter()
         .collect();
         let mut map_voxels: AHashMap<VoxelKey, i32> = AHashMap::new();
-        for v in &expected {
+        for v in &walked {
             map_voxels.insert(*v, 1);
         }
 
@@ -666,6 +672,13 @@ mod tests {
             endpoint,
         );
 
+        // z-slab protection skips voxels in the endpoint's z-slab (z=1) when the
+        // ray crosses z-slabs.
+        let expected: AHashSet<VoxelKey> = walked
+            .iter()
+            .filter(|v| v.2 != endpoint.2)
+            .copied()
+            .collect();
         assert_eq!(misses, expected);
     }
 
