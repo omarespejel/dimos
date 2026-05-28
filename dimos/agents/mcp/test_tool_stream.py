@@ -27,9 +27,11 @@ from dimos.agents.mcp.mcp_server import McpServer
 from dimos.agents.mcp.tool_stream import (
     NOTIFICATIONS_MESSAGE_METHOD,
     NOTIFICATIONS_PROGRESS_METHOD,
+    TOOL_STREAM_STOPPED_METHOD,
     ToolStream,
     make_notification,
     make_progress_notification,
+    make_stopped_notification,
 )
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.coordination.blueprints import autoconnect
@@ -292,6 +294,7 @@ def test_send_publishes_notification(stream_with_transport_mock) -> None:
 def test_send_after_stop_does_not_raise(stream_with_transport_mock) -> None:
     stream, mock_transport = stream_with_transport_mock
     stream.stop()
+    mock_transport.reset_mock()
     stream.send("should be ignored")
     mock_transport.publish.assert_not_called()
 
@@ -303,11 +306,33 @@ def test_stop_tears_down_transport(stream_with_transport_mock) -> None:
     mock_transport.stop.assert_called_once()
 
 
-def test_stop_without_send_does_nothing(stream_with_transport_mock) -> None:
+def test_stop_emits_stopped_frame(stream_with_transport_mock) -> None:
+    """`stop()` publishes a `dimos/tool_stopped` frame so subscribers (e.g.
+    McpServer's capability registry) know the background skill released."""
+    stream, mock_transport = stream_with_transport_mock
+    stream.send("kick off transport")
+    mock_transport.reset_mock()
+    stream.stop()
+    publish_calls = mock_transport.publish.call_args_list
+    assert len(publish_calls) == 1
+    frame = publish_calls[0].args[0]
+    assert frame["method"] == TOOL_STREAM_STOPPED_METHOD
+    assert frame["params"]["tool_name"] == "test_tool"
+
+
+def test_stop_without_send_still_emits_stopped_frame(stream_with_transport_mock) -> None:
+    """The stopped frame must go out even when no `send()` ever happened, so
+    `start_tool`/`stop_tool` pairs that emit no progress updates (e.g.
+    `start_patrol`) still release their capability hold."""
     stream, mock_transport = stream_with_transport_mock
     stream.stop()
-    mock_transport.start.assert_not_called()
-    mock_transport.stop.assert_not_called()
+    mock_transport.start.assert_called_once()
+    publish_calls = mock_transport.publish.call_args_list
+    assert len(publish_calls) == 1
+    frame = publish_calls[0].args[0]
+    assert frame["method"] == TOOL_STREAM_STOPPED_METHOD
+    assert frame["params"]["tool_name"] == "test_tool"
+    mock_transport.stop.assert_called_once()
 
 
 def test_double_stop_is_safe(stream_with_transport_mock) -> None:
@@ -324,6 +349,14 @@ def test_make_notification_shape() -> None:
         "jsonrpc": "2.0",
         "method": NOTIFICATIONS_MESSAGE_METHOD,
         "params": {"level": "info", "logger": "greet", "data": "hi"},
+    }
+
+
+def test_make_stopped_notification_shape() -> None:
+    assert make_stopped_notification("patrol") == {
+        "jsonrpc": "2.0",
+        "method": TOOL_STREAM_STOPPED_METHOD,
+        "params": {"tool_name": "patrol"},
     }
 
 
@@ -499,7 +532,13 @@ def test_tool_update_routes_to_registered_stream(tool_helper_module, skill_conte
     module.tool_update("job", "progress 2")
     module.stop_tool("job")
 
-    texts = [c.args[0]["params"]["data"] for c in mock_transport.publish.call_args_list]
+    # publish() also receives the final `dimos/tool_stopped` frame from stop_tool;
+    # filter to only the `notifications/message` (data) frames.
+    texts = [
+        c.args[0]["params"]["data"]
+        for c in mock_transport.publish.call_args_list
+        if c.args[0].get("method") == NOTIFICATIONS_MESSAGE_METHOD
+    ]
     assert texts == ["progress 1", "progress 2"]
 
 

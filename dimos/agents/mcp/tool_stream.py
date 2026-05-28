@@ -46,6 +46,7 @@ logger = setup_logger()
 TOOL_STREAM_TOPIC = "/tool_streams"
 NOTIFICATIONS_MESSAGE_METHOD = "notifications/message"
 NOTIFICATIONS_PROGRESS_METHOD = "notifications/progress"
+TOOL_STREAM_STOPPED_METHOD = "dimos/tool_stopped"
 
 ToolStreamCallback = Callable[[dict[str, Any]], Any]
 
@@ -79,6 +80,19 @@ def make_progress_notification(
     if tool_name is not None:
         params["_meta"] = {"tool_name": tool_name}
     return {"jsonrpc": "2.0", "method": NOTIFICATIONS_PROGRESS_METHOD, "params": params}
+
+
+def make_stopped_notification(tool_name: str) -> dict[str, Any]:
+    """Build a dimos-internal frame signaling that a tool-stream has closed.
+
+    Subscribers (notably `McpServer`) use this to release capabilities held by
+    background skills. The frame is not part of the MCP spec.
+    """
+    return {
+        "jsonrpc": "2.0",
+        "method": TOOL_STREAM_STOPPED_METHOD,
+        "params": {"tool_name": tool_name},
+    }
 
 
 def subscribe(callback: ToolStreamCallback) -> Callable[[], None]:
@@ -166,11 +180,21 @@ class ToolStream:
             self._closed.set()
             transport = self._transport
             self._transport = None
-        if transport is not None:
-            try:
-                transport.stop()
-            except Exception:
-                logger.exception("tool-stream transport stop failed", stream_id=self.id)
+        # Publish a final "stopped" frame so subscribers (e.g. McpServer's
+        # capability registry) know the background skill released its hold.
+        # If no `send()` ever happened we spin up a transport here so the
+        # lifecycle signal isn't lost.
+        if transport is None:
+            transport = pLCMTransport(TOOL_STREAM_TOPIC)
+            transport.start()
+        try:
+            transport.publish(make_stopped_notification(self.tool_name))
+        except Exception:
+            logger.exception("tool-stream stopped publish failed", stream_id=self.id)
+        try:
+            transport.stop()
+        except Exception:
+            logger.exception("tool-stream transport stop failed", stream_id=self.id)
 
     @property
     def is_closed(self) -> bool:

@@ -26,10 +26,12 @@ Users hear you through speakers but cannot see text. Use `speak` to communicate 
 
 # SKILL COORDINATION
 
+## Capability Conflicts
+Some skills hold a shared capability (e.g. `movement`). If a tool call returns "Cannot start 'X': capability 'Y' is held by 'Z'", call the appropriate stop tool for Z first, then retry your original call.
+
 ## Navigation Flow
 - Use `navigate_with_text` for most navigation. It searches tagged locations first, then visible objects, then the semantic map.
 - Tag important locations with `tag_location` so you can return to them later.
-- During `start_exploration`, avoid calling other skills except `stop_movement`.
 - Always run `execute_sport_command("RecoveryStand")` after dynamic movements (flips, jumps, sit) before navigating.
 
 ## GPS Navigation Flow

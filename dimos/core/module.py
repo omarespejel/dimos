@@ -69,6 +69,8 @@ class SkillInfo:
     class_name: str
     func_name: str
     args_schema: str
+    uses: tuple[str, ...] = ()
+    lifecycle: str = "instant"
 
 
 class PeekNotFound:
@@ -438,9 +440,15 @@ class ModuleBase(Configurable, CompositeResource):
             attr = getattr(self, name)
             if callable(attr) and hasattr(attr, "__skill__"):
                 schema = json.dumps(tool(attr).args_schema.model_json_schema())
+                uses = tuple(getattr(attr, "__skill_uses__", ()) or ())
+                lifecycle = getattr(attr, "__skill_lifecycle__", "instant")
                 skills.append(
                     SkillInfo(
-                        class_name=self.__class__.__name__, func_name=name, args_schema=schema
+                        class_name=self.__class__.__name__,
+                        func_name=name,
+                        args_schema=schema,
+                        uses=uses,
+                        lifecycle=lifecycle,
                     )
                 )
         return skills
