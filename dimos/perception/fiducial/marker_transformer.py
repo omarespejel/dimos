@@ -50,6 +50,7 @@ from dimos.perception.fiducial.marker_detect import (
 )
 from dimos.perception.fiducial.marker_pose import (
     camera_info_to_cv_matrices,
+    camera_optical_frame_id,
     create_aruco_detector,
 )
 from dimos.types.timestamped import TimestampedBufferCollection
@@ -208,10 +209,11 @@ class DetectMarkers(Transformer[Image, Detection3DMarker]):
                 )
                 continue
 
+            optical_frame = camera_optical_frame_id(image, info)
             t_world_optical = _pose_tuple_to_transform(
                 obs.pose,
                 frame_id=self.world_frame,
-                child_frame_id="optical",
+                child_frame_id=optical_frame,
                 ts=obs.ts,
             )
 
