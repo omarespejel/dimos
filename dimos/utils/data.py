@@ -145,7 +145,7 @@ def backup_file(path: str | Path, keep_last: int = 3) -> Path | None:
     for old in backups[:-keep_last] if keep_last > 0 else backups:
         old.unlink()
 
-    return backup
+    return backup if backup.exists() else None
 
 
 @cache

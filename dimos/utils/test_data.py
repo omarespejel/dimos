@@ -95,7 +95,7 @@ def test_backup_file_keep_last_zero_removes_all(tmp_path: Path) -> None:
     _make_backups(tmp_path, "recording_go2", ".db", ["20260101010101"])
     db.write_text("live")
 
-    backup_file(db, keep_last=0)
+    assert backup_file(db, keep_last=0) is None
 
     assert list(tmp_path.glob("recording_go2.*.db")) == []
 

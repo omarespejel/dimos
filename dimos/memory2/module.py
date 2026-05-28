@@ -21,7 +21,7 @@ from pathlib import Path
 import time
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from reactivex.disposable import Disposable
 
 from dimos.agents.annotation import skill
@@ -247,7 +247,7 @@ class OnExisting(str, enum.Enum):
 
 class RecorderConfig(MemoryModuleConfig):
     on_existing: OnExisting = OnExisting.BACKUP
-    backup_keep_last: int = 10
+    backup_keep_last: int = Field(default=10, ge=0)
     default_frame_id: str = "base_link"
     tf_tolerance: float = 0.5
     db_path: str | Path = "recording.db"
@@ -288,7 +288,10 @@ class Recorder(MemoryModule):
                 logger.info("Deleted existing recording %s", db_path)
             elif self.config.on_existing is OnExisting.BACKUP:
                 backup = backup_file(db_path, keep_last=self.config.backup_keep_last)
-                logger.info("Backed up existing recording %s -> %s", db_path, backup)
+                if backup is None:
+                    logger.info("Removed existing recording %s (backup_keep_last=0)", db_path)
+                else:
+                    logger.info("Backed up existing recording %s -> %s", db_path, backup)
             else:
                 raise FileExistsError(f"Recording already exists: {db_path}")
 
