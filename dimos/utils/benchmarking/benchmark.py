@@ -36,24 +36,30 @@ per-robot topic dance.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from dataclasses import asdict
 import json
 import math
 import os
 from pathlib import Path
-import sys
+import queue
 import threading
 import time
+from typing import Any, Literal
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from reactivex.disposable import Disposable
 
 from dimos.control.components import make_twist_base_joints
 from dimos.control.coordinator import ControlCoordinator
 from dimos.control.tasks.feedforward_gain_compensator import FeedforwardGainConfig
+from dimos.core.core import rpc
+from dimos.core.module import Module, ModuleConfig
 from dimos.core.rpc_client import RPCClient
+from dimos.core.stream import In
 from dimos.core.transport import LCMTransport
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
@@ -61,6 +67,8 @@ from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.nav_msgs.Path import Path as NavPath
 from dimos.msgs.sensor_msgs.JointState import JointState
+from dimos.msgs.std_msgs.Int8 import Int8
+from dimos.robot.unitree.keyboard_teleop import GATE_ADVANCE, GATE_QUIT, GATE_SKIP
 from dimos.utils.benchmarking.paths import circle, single_corner, square, straight_line
 from dimos.utils.benchmarking.plant import ROBOT_PLANT_PROFILES, RobotPlantProfile
 from dimos.utils.benchmarking.scoring import ExecutedTrajectory, TrajectoryTick, score_run
@@ -71,6 +79,7 @@ from dimos.utils.benchmarking.tuning import (
     invert_tolerance,
 )
 from dimos.utils.benchmarking.velocity_profile import VelocityProfileConfig
+from dimos.utils.path_utils import get_project_root
 
 # Well-known topic the operator coord publishes its JointState Out on.
 # Positions carry [x,y,yaw] (ConnectedTwistBase populates them from
@@ -85,6 +94,9 @@ _ARRIVED_STATES = frozenset({"arrived", "completed"})
 _FAILED_STATES = frozenset({"aborted"})
 
 REPORTS_DIR = Path(__file__).parent / "reports"
+# New default landing dir for benchmark plots + standalone-arm JSONs.
+# REPORTS_DIR is retained for legacy callers only; new artifacts go here.
+DEFAULT_OUT_DIR = get_project_root() / "data" / "benchmark"
 
 
 def _resolve_profile(name: str) -> RobotPlantProfile:
@@ -279,6 +291,7 @@ def _run_baseline(
     profile_config: VelocityProfileConfig | None,
     timeout_s: float,
     label: str,
+    velocity_profile: list[float] | None = None,
 ) -> tuple[ExecutedTrajectory, NavPath]:
     """Send a path to the operator coord's ``baseline_follower`` task and
     wait for it to terminate. The task is pre-added by the operator's
@@ -308,7 +321,13 @@ def _run_baseline(
         print(f"  [{label}] configure rejected — task still active from prior run?")
         return ExecutedTrajectory(ticks=recorder.snapshot(), arrived=False), path_w
 
-    if not _invoke(coord, "start_path", path=path_w, current_odom=pose0):
+    start_kwargs: dict[str, Any] = {"path": path_w, "current_odom": pose0}
+    if velocity_profile is not None:
+        # Path was rigid-transformed by _shift_path_to_start_at_pose;
+        # waypoint count + local curvature are preserved, so the
+        # per-waypoint speeds computed on the original path remain valid.
+        start_kwargs["velocity_profile"] = velocity_profile
+    if not _invoke(coord, "start_path", **start_kwargs):
         print(f"  [{label}] start_path rejected")
         return ExecutedTrajectory(ticks=recorder.snapshot(), arrived=False), path_w
 
@@ -363,24 +382,71 @@ def _run_ladder(
     use_profile: bool,
     coord_rpc: RPCClient,
     recorder: _JointStateRecorder,
+    use_rg: bool = False,
+    e_max: float = 0.05,
+    rg_min_speed: float | None = None,
+    gate_input: Callable[[str], str] = input,
+    gate_keys_label: str = "ENTER=run  s=skip  q=quit",
 ) -> tuple[list[OperatingPoint], list[dict]]:
     # Bare stock baseline by default: this is the physical-limit
-    # measurement. FF / velocity profile are opt-in comparison arms.
+    # measurement. FF / velocity profile / RG are opt-in comparison arms.
     ff = cfg.feedforward.to_runtime() if use_ff else None
     k_angular = float(cfg.recommended_controller.params.get("k_angular", 0.5))
+
+    # Build RG constraint set + plant once if --rg arm is enabled. We
+    # import the math directly from the reference_governor module
+    # (solve_profile + the constraint classes are public module-level
+    # exports); no RG Module composition needed.
+    rg_constraints = None
+    rg_plant = None
+    rg_vp = None
+    if use_rg:
+        from dimos.navigation.reference_governor.reference_governor import (
+            GeometricMVC,
+            LateralMVC,
+            PrecisionMVC,
+            SaturationMVC,
+            solve_profile,
+        )
+
+        rg_plant = cfg.plant
+        rg_vp = cfg.velocity_profile
+        # Closure over e_max so PrecisionMVC stays decoupled from a
+        # specific value — same callable contract RG itself uses.
+        rg_constraints = [
+            GeometricMVC(v_max=rg_vp.max_linear_speed),
+            SaturationMVC(omega_max=rg_vp.max_angular_speed),
+            LateralMVC(a_lat_max=rg_vp.max_centripetal_accel),
+            PrecisionMVC(e_max_provider=lambda: e_max),
+        ]
+        _solve_profile = solve_profile
 
     points: list[OperatingPoint] = []
     runs: list[dict] = []  # for the XY trajectory overlay
     for name, path in _path_set().items():
+        # Precompute RG-derived per-waypoint speeds once per path (same
+        # for every speed cell — RG output is path-shape dependent, not
+        # commanded-speed dependent). Plain list[float] crosses the
+        # configure RPC cleanly.
+        rg_speeds: list[float] | None = None
+        if use_rg and rg_constraints is not None and rg_plant is not None and rg_vp is not None:
+            arr = _solve_profile(
+                path,
+                rg_plant,
+                rg_constraints,
+                accel_max=rg_vp.max_linear_accel,
+                decel_max=rg_vp.max_linear_decel,
+                min_speed=(rg_min_speed if rg_min_speed is not None else rg_vp.min_speed),
+            )
+            rg_speeds = [float(v) for v in arr]
         for speed in speeds:
             prof_cfg = (
                 cfg.velocity_profile.to_runtime(max_linear_speed=speed) if use_profile else None
             )
             if mode == "hw":
                 resp = (
-                    input(
-                        f"\n[{name} v={speed:.2f}] reposition+aim robot, "
-                        f"ENTER=run  s=skip  q=quit: "
+                    gate_input(
+                        f"\n[{name} v={speed:.2f}] reposition+aim robot, {gate_keys_label}: "
                     )
                     .strip()
                     .lower()
@@ -401,6 +467,7 @@ def _run_ladder(
                 prof_cfg,
                 timeout_s,
                 f"{name}@{speed:.2f}",
+                velocity_profile=rg_speeds,
             )
             # Score/plot against the executed-frame reference (anchored path).
             s = score_run(ref, traj)
@@ -548,6 +615,230 @@ def _prereq_banner(profile: RobotPlantProfile, mode: str) -> None:
     )
 
 
+class BenchmarkerConfig(ModuleConfig):
+    """Config for :class:`Benchmarker`. Each field mirrors a CLI flag on
+    the existing ``benchmark`` entrypoint.
+
+    ``gate_source`` selects how each (path, speed) cell is gated.
+    ``"stdin"`` (default, CLI mode) reads ENTER/s/q from the terminal;
+    ``"stream"`` (blueprint mode) consumes events from the ``gate`` In
+    port wired to a co-running ``KeyboardTeleop`` that publishes
+    ENTER/K/Backspace as ``GATE_ADVANCE / GATE_SKIP / GATE_QUIT``.
+    """
+
+    robot: str = "go2"
+    config: str | None = None  # path to characterization artifact (required at runtime)
+    mode: Literal["hw", "sim"] = "hw"
+    speeds: str = "0.3,0.5,0.7,0.9,1.0"
+    tolerances: str = "5,10,15"
+    timeout: float = 60.0
+    ff: bool = False
+    profile: bool = False
+    # OPT-IN: apply RG-derived per-waypoint speed profile (uses the
+    # artifact's plant + cfg.e_max for the precision constraint).
+    rg: bool = False
+    e_max: float = 0.05
+    # RG OUTPUT FLOOR (m/s). Overrides artifact.velocity_profile.min_speed
+    # for the RG arm. Default 0.2 matches the Go2's practical min motion
+    # threshold — characterization typically writes ~0.05 into the
+    # artifact, which is below where the platform actually moves, so the
+    # RG output at SaturationMVC-binding corners falls below threshold
+    # and the robot stalls. Set explicitly (or None to defer to the
+    # artifact) for other platforms.
+    min_speed: float | None = 0.2
+    # OPT-IN: output directory for plots + standalone-arm JSONs (the
+    # input config artifact augmentation always lands at args.config).
+    out_dir: str | None = None
+    gate_source: Literal["stdin", "stream"] = "stdin"
+
+
+class Benchmarker(Module):
+    """Module wrapper around the operating-point benchmark sequence.
+
+    Driven via the CLI shim in :func:`main` (``gate_source="stdin"``) or
+    composed into the all-in-one blueprint ``unitree-go2-benchmark``
+    (``gate_source="stream"``). ``start()`` blocks for the full
+    operator-gated speed-ladder loop, then returns.
+
+    See :mod:`dimos.utils.benchmarking.characterization`'s ``Characterizer``
+    for the same pattern — gate stream is the only way to drive operator
+    confirmation in the blueprint context because module workers don't
+    share the parent CLI's TTY.
+    """
+
+    config: BenchmarkerConfig
+
+    gate: In[Int8]
+
+    _gate_queue: queue.Queue[str]
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._gate_queue = queue.Queue()
+
+    @rpc
+    def start(self) -> None:
+        super().start()
+        if self.config.gate_source == "stream":
+            self.register_disposable(Disposable(self.gate.subscribe(self._on_gate_event)))
+        self._run()
+
+    def _on_gate_event(self, msg: Int8) -> None:
+        # Translate pygame-side gate codes to the legacy CLI vocab so
+        # _run_ladder's response check (""=run, "s"=skip, "q"=quit) is
+        # unchanged. Mirrors Characterizer._on_gate_event.
+        code = int(msg.data)
+        translated = {GATE_ADVANCE: "", GATE_SKIP: "s", GATE_QUIT: "q"}.get(code, "")
+        self._gate_queue.put(translated)
+
+    def _wait_gate_stream(self, prompt: str) -> str:
+        print(prompt, end="", flush=True)
+        return self._gate_queue.get()
+
+    def _run(self) -> None:
+        cfg = self.config
+        if not cfg.config:
+            raise SystemExit("benchmark: --config (path to characterization artifact) is required")
+
+        profile = _resolve_profile(cfg.robot)
+        config_path = Path(cfg.config).expanduser()
+        artifact = TuningConfig.from_json(config_path)  # asserts schema_version
+        speeds = [float(s) for s in cfg.speeds.split(",")]
+        tolerances = [float(t) for t in cfg.tolerances.split(",")]
+        arm = (
+            "+".join(
+                x for x, on in (("ff", cfg.ff), ("profile", cfg.profile), ("rg", cfg.rg)) if on
+            )
+            or "bare"
+        )
+
+        # Sim-derived ff/profile/rg are only meaningless on the real robot
+        # if you actually apply them; the bare baseline doesn't use them.
+        if cfg.mode == "hw" and (cfg.ff or cfg.profile or cfg.rg) and not artifact.valid_for_tuning:
+            raise SystemExit(
+                f"Refusing --mode hw with --{arm} and a non-robot-valid config "
+                f"({config_path.name}, sim_or_hw={artifact.provenance.sim_or_hw!r}): its "
+                "feedforward/profile/plant were derived from the sim plant. Re-run "
+                "`characterization --mode hw` first, drop --ff/--profile/--rg for "
+                "the bare physical-limit run, or use --mode sim."
+            )
+        if cfg.mode == "sim":
+            print(
+                "[pre-check] --mode sim: validates wiring against the FOPDT sim "
+                "plant only; the operating-point map is NOT a real-robot result."
+            )
+
+        _prereq_banner(profile, cfg.mode)
+
+        arm_desc = (
+            "BARE stock baseline (no FF, no profile, no RG) — the plant's physical tracking limit"
+            if arm == "bare"
+            else f"baseline + {arm} (comparison arm, vs the bare physical limit)"
+        )
+        print(
+            f"{profile.name} {cfg.mode} speed ladder {speeds} over {len(_path_set())} paths\n"
+            f"  controller: {arm_desc}\n"
+            f"  k_angular={artifact.recommended_controller.params.get('k_angular')}"
+        )
+        coord_rpc: RPCClient = RPCClient(None, ControlCoordinator)
+        joints = make_twist_base_joints(profile.joints_prefix)
+        recorder = _JointStateRecorder(joint_names=joints)
+        js_sub = LCMTransport(_JOINT_STATE_TOPIC, JointState)
+        js_unsub = js_sub.subscribe(recorder.on_joint_state)
+
+        # Gate input wiring (mirrors Characterizer._run).
+        if cfg.gate_source == "stream":
+            gate_input: Callable[[str], str] = self._wait_gate_stream
+            gate_keys_label = "focus pygame window: ENTER=run  K=skip  Backspace=quit"
+        else:
+            gate_input = input
+            gate_keys_label = "ENTER=run  s=skip  q=quit"
+
+        try:
+            points, runs = _run_ladder(
+                artifact,
+                profile,
+                speeds,
+                cfg.timeout,
+                cfg.mode,
+                use_ff=cfg.ff,
+                use_profile=cfg.profile,
+                coord_rpc=coord_rpc,
+                recorder=recorder,
+                use_rg=cfg.rg,
+                e_max=cfg.e_max,
+                rg_min_speed=cfg.min_speed,
+                gate_input=gate_input,
+                gate_keys_label=gate_keys_label,
+            )
+        except KeyboardInterrupt:
+            points, runs = [], []
+            print("\n[hw] aborted by operator — robot stopped, no artifact written.")
+            os._exit(1)
+
+        # === ARTIFACTS FIRST (before any teardown that might segfault) ===
+        inversion = invert_tolerance(points, tolerances)
+        opm = OperatingPointMap(speeds=speeds, points=points, tolerance_inversion=inversion)
+
+        sha = artifact.provenance.git_sha
+        rid = artifact.provenance.robot_id
+        out_root = Path(cfg.out_dir).expanduser() if cfg.out_dir else DEFAULT_OUT_DIR / rid
+        out_root.mkdir(parents=True, exist_ok=True)
+        # Only the BARE run defines section 5 (the canonical physical-limit
+        # operating-point map). Comparison arms emit standalone artifacts so
+        # they never clobber the physical-limit map in the config.
+        if arm == "bare":
+            artifact.operating_point_map = opm
+            artifact.to_json(config_path)
+            artifact_msg = (
+                f"Augmented artifact (section 5 = physical limit): {config_path.resolve()}"
+            )
+        else:
+            artifact_msg = (
+                f"Config NOT modified (arm '{arm}' is a comparison, not the "
+                f"physical-limit map). See standalone outputs below."
+            )
+        bench_path = out_root / f"{rid}_benchmark_{arm}_{sha}.json"
+        bench_path.write_text(json.dumps(asdict(opm), indent=2))
+        plot_path = out_root / f"{rid}_benchmark_cte_vs_speed_{arm}_{sha}.png"
+        _plot(points, plot_path, profile.name, arm)
+        xy_path = out_root / f"{rid}_benchmark_xy_{arm}_{sha}.png"
+        _plot_xy(runs, xy_path, profile.name, arm)
+
+        print(f"\n{artifact_msg}")
+        print(f"Benchmark json     : {bench_path.resolve()}")
+        print(f"CTE-vs-speed plot  : {plot_path.resolve()}")
+        print(f"XY trajectory plot : {xy_path.resolve()}  <-- the diagnostic view")
+        print("\nOperating-point recommendation:")
+        for row in inversion:
+            if row.max_speed is None:
+                print(
+                    f"  tolerance {row.tol_cm:g} cm: NO tested speed keeps every "
+                    f"path within tolerance — relax the tolerance or slow the fleet."
+                )
+            else:
+                print(
+                    f"  For tolerance {row.tol_cm:g} cm, run at speed "
+                    f"{row.max_speed:.2f} m/s with this profile "
+                    f"(binding path: {row.binding_path})."
+                )
+
+        # === BEST-EFFORT TEARDOWN (artifacts already on disk) ===
+        for label, cleanup in (
+            ("unsubscribe", js_unsub),
+            ("rpc client", coord_rpc.stop_rpc_client),
+        ):
+            try:
+                cleanup()
+            except Exception as e:
+                print(f"  [cleanup warning] {label}: {e}")
+
+        # Skip Python interp shutdown to avoid LCM/portal C-library teardown
+        # segfaults. Artifacts are already saved; nothing useful happens after
+        # this point. Exit code 0 (success).
+        os._exit(0)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Twist-base operating-point benchmark")
     ap.add_argument("--robot", default="go2", help=f"one of {sorted(ROBOT_PLANT_PROFILES)}")
@@ -568,122 +859,48 @@ def main() -> None:
         help="OPT-IN arm: apply the artifact's derived curvature velocity "
         "profile (default OFF — bare stock baseline)",
     )
+    ap.add_argument(
+        "--rg",
+        action="store_true",
+        help="OPT-IN arm: apply RG-derived per-waypoint speed profile "
+        "(uses the same artifact + --e-max corridor; default OFF)",
+    )
+    ap.add_argument(
+        "--e-max",
+        type=float,
+        default=0.05,
+        help="RG corridor half-width in m (only used when --rg is set)",
+    )
+    ap.add_argument(
+        "--min-speed",
+        type=float,
+        default=None,
+        help="override the RG arm's min_speed floor (default: artifact's "
+        "velocity_profile.min_speed). Useful when the robot's actual min "
+        "motion threshold is higher than what was characterized.",
+    )
+    ap.add_argument(
+        "--out",
+        default=None,
+        help=f"output dir for plots + standalone-arm JSON (default: {DEFAULT_OUT_DIR}/<robot_id>/)",
+    )
     args = ap.parse_args()
 
-    profile = _resolve_profile(args.robot)
-    config_path = Path(args.config).expanduser()
-    cfg = TuningConfig.from_json(config_path)  # asserts schema_version
-    speeds = [float(s) for s in args.speeds.split(",")]
-    tolerances = [float(t) for t in args.tolerances.split(",")]
-    arm = "+".join(x for x, on in (("ff", args.ff), ("profile", args.profile)) if on) or "bare"
-
-    # The sim-derived ff/profile are only meaningless on the real robot
-    # if you actually apply them; the bare baseline doesn't use them.
-    if args.mode == "hw" and (args.ff or args.profile) and not cfg.valid_for_tuning:
-        sys.exit(
-            f"Refusing --mode hw with --{arm} and a non-robot-valid config "
-            f"({config_path.name}, sim_or_hw={cfg.provenance.sim_or_hw!r}): its "
-            "feedforward/profile were derived from the sim plant. Re-run "
-            "`characterization --mode hw` first, drop --ff/--profile for "
-            "the bare physical-limit run, or use --mode sim."
-        )
-    if args.mode == "sim":
-        print(
-            "[pre-check] --mode sim: validates wiring against the FOPDT sim "
-            "plant only; the operating-point map is NOT a real-robot result."
-        )
-
-    _prereq_banner(profile, args.mode)
-
-    arm_desc = (
-        "BARE stock baseline (no FF, no profile) — the plant's physical tracking limit"
-        if arm == "bare"
-        else f"baseline + {arm} (comparison arm, vs the bare physical limit)"
+    instance = Benchmarker(
+        robot=args.robot,
+        config=args.config,
+        mode=args.mode,
+        speeds=args.speeds,
+        tolerances=args.tolerances,
+        timeout=args.timeout,
+        ff=args.ff,
+        profile=args.profile,
+        rg=args.rg,
+        e_max=args.e_max,
+        min_speed=args.min_speed,
+        out_dir=args.out,
     )
-    print(
-        f"{profile.name} {args.mode} speed ladder {speeds} over {len(_path_set())} paths\n"
-        f"  controller: {arm_desc}\n"
-        f"  k_angular={cfg.recommended_controller.params.get('k_angular')}"
-    )
-    coord_rpc: RPCClient = RPCClient(None, ControlCoordinator)
-    joints = make_twist_base_joints(profile.joints_prefix)
-    recorder = _JointStateRecorder(joint_names=joints)
-    js_sub = LCMTransport(_JOINT_STATE_TOPIC, JointState)
-    js_unsub = js_sub.subscribe(recorder.on_joint_state)
-
-    try:
-        points, runs = _run_ladder(
-            cfg,
-            profile,
-            speeds,
-            args.timeout,
-            args.mode,
-            use_ff=args.ff,
-            use_profile=args.profile,
-            coord_rpc=coord_rpc,
-            recorder=recorder,
-        )
-    except KeyboardInterrupt:
-        # Try not to lose accumulated data even on operator quit.
-        points, runs = [], []
-        print("\n[hw] aborted by operator — robot stopped, no artifact written.")
-        os._exit(1)
-
-    # === ARTIFACTS FIRST (before any teardown that might segfault) ===
-    inversion = invert_tolerance(points, tolerances)
-    opm = OperatingPointMap(speeds=speeds, points=points, tolerance_inversion=inversion)
-
-    sha = cfg.provenance.git_sha
-    rid = cfg.provenance.robot_id
-    # Only the BARE run defines section 5 (the canonical physical-limit
-    # operating-point map). Comparison arms emit standalone artifacts so
-    # they never clobber the physical-limit map in the config.
-    if arm == "bare":
-        cfg.operating_point_map = opm
-        cfg.to_json(config_path)
-        artifact_msg = f"Augmented artifact (section 5 = physical limit): {config_path.resolve()}"
-    else:
-        artifact_msg = (
-            f"Config NOT modified (arm '{arm}' is a comparison, not the "
-            f"physical-limit map). See standalone outputs below."
-        )
-    bench_path = REPORTS_DIR / f"{rid}_benchmark_{arm}_{sha}.json"
-    bench_path.parent.mkdir(parents=True, exist_ok=True)
-    bench_path.write_text(json.dumps(asdict(opm), indent=2))
-    plot_path = REPORTS_DIR / f"{rid}_benchmark_cte_vs_speed_{arm}_{sha}.png"
-    _plot(points, plot_path, profile.name, arm)
-    xy_path = REPORTS_DIR / f"{rid}_benchmark_xy_{arm}_{sha}.png"
-    _plot_xy(runs, xy_path, profile.name, arm)
-
-    print(f"\n{artifact_msg}")
-    print(f"Benchmark json     : {bench_path.resolve()}")
-    print(f"CTE-vs-speed plot  : {plot_path.resolve()}")
-    print(f"XY trajectory plot : {xy_path.resolve()}  <-- the diagnostic view")
-    print("\nOperating-point recommendation:")
-    for row in inversion:
-        if row.max_speed is None:
-            print(
-                f"  tolerance {row.tol_cm:g} cm: NO tested speed keeps every "
-                f"path within tolerance — relax the tolerance or slow the fleet."
-            )
-        else:
-            print(
-                f"  For tolerance {row.tol_cm:g} cm, run at speed "
-                f"{row.max_speed:.2f} m/s with this profile "
-                f"(binding path: {row.binding_path})."
-            )
-
-    # === BEST-EFFORT TEARDOWN (artifacts already on disk) ===
-    for label, cleanup in (("unsubscribe", js_unsub), ("rpc client", coord_rpc.stop_rpc_client)):
-        try:
-            cleanup()
-        except Exception as e:
-            print(f"  [cleanup warning] {label}: {e}")
-
-    # Skip Python interp shutdown to avoid LCM/portal C-library teardown
-    # segfaults. Artifacts are already saved; nothing useful happens after
-    # this point. Exit code 0 (success).
-    os._exit(0)
+    instance.start()
 
 
 if __name__ == "__main__":

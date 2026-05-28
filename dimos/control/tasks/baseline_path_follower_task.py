@@ -141,6 +141,12 @@ class BaselinePathFollowerTask(BaseControlTask):
         # Closed-path gate: track the furthest-along path index reached so
         # that closed paths (where goal==start) don't trip arrival on tick 1.
         self._max_progress_idx: int = 0
+        # Optional per-waypoint speed cap supplied directly by a caller
+        # (e.g. Benchmarker handing in RG-derived speeds across RPC). When
+        # set, takes precedence over self._profile_cap in compute(). See
+        # start_path() for how it's installed.
+        self._velocity_profile: np.ndarray | None = None
+        self._velocity_profile_pts: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # ControlTask protocol
@@ -201,8 +207,26 @@ class BaselinePathFollowerTask(BaseControlTask):
             # Static gain compensation: cmd_to_robot = controller_cmd / K_plant
             vx, vy, wz = self._ff.compute(vx, vy, wz)
 
-        # Curvature velocity-profile cap (preserves commanded turn radius).
-        if self._profile_cap is not None:
+        # Speed cap: prefer a precomputed per-waypoint profile (e.g. from
+        # the Benchmarker's --rg arm, shipped as a list[float] across RPC)
+        # over the auto-built curvature-based PathSpeedCap. Both preserve
+        # the commanded turn radius by scaling (vx, vy, wz) uniformly.
+        #
+        # Lookahead window mirrors PathSpeedCap.speed_limit_at — take the
+        # min over the next ~8 waypoints so braking starts BEFORE a corner
+        # rather than at it. Keeps arm-to-arm comparison fair across the
+        # static-profile arm and the RG arm.
+        if self._velocity_profile is not None and self._velocity_profile_pts is not None:
+            x = self._current_odom.position.x
+            y = self._current_odom.position.y
+            i = int(np.argmin(np.sum((self._velocity_profile_pts - np.array([x, y])) ** 2, axis=1)))
+            j = min(len(self._velocity_profile), i + 8)
+            vlim = float(np.min(self._velocity_profile[i:j]))
+            s = abs(vx)
+            if s > vlim and s > 1e-9:
+                k = vlim / s
+                vx, vy, wz = vx * k, vy * k, wz * k
+        elif self._profile_cap is not None:
             vx, vy, wz = self._profile_cap.cap(
                 self._current_odom.position.x, self._current_odom.position.y, vx, vy, wz
             )
@@ -346,7 +370,12 @@ class BaselinePathFollowerTask(BaseControlTask):
             )
         return True
 
-    def start_path(self, path: Path, current_odom: PoseStamped) -> bool:
+    def start_path(
+        self,
+        path: Path,
+        current_odom: PoseStamped,
+        velocity_profile: list[float] | None = None,
+    ) -> bool:
         if path is None or len(path.poses) < 2:
             logger.warning(f"BaselinePathFollowerTask '{self._name}': invalid path")
             return False
@@ -361,6 +390,21 @@ class BaselinePathFollowerTask(BaseControlTask):
             self._ff.reset()
         if self._profile_cap is not None:
             self._profile_cap.for_path(path)
+        # Install the optional precomputed per-waypoint speed profile.
+        # Length must match path.poses; falls back to clearing if mismatched.
+        if velocity_profile is not None and len(velocity_profile) == len(path.poses):
+            self._velocity_profile = np.asarray(velocity_profile, dtype=float)
+            self._velocity_profile_pts = np.array(
+                [[p.position.x, p.position.y] for p in path.poses], dtype=float
+            )
+        else:
+            if velocity_profile is not None:
+                logger.warning(
+                    f"BaselinePathFollowerTask '{self._name}': velocity_profile length "
+                    f"{len(velocity_profile)} != path.poses {len(path.poses)}; ignoring"
+                )
+            self._velocity_profile = None
+            self._velocity_profile_pts = None
 
         first_yaw = path.poses[0].orientation.euler[2]
         robot_yaw = current_odom.orientation.euler[2]
