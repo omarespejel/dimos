@@ -32,8 +32,8 @@ def test_lcm_encode_decode() -> None:
     decoded = PointCloud2.lcm_decode(binary_msg)
 
     # 1. Check number of points
-    original_points, _ = lidar_msg.as_numpy()
-    decoded_points, _ = decoded.as_numpy()
+    original_points = lidar_msg.as_numpy()
+    decoded_points = decoded.as_numpy()
 
     assert len(original_points) == len(decoded_points), (
         f"Point count mismatch: {len(original_points)} vs {len(decoded_points)}"
