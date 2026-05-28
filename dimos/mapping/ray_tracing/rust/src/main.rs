@@ -330,8 +330,19 @@ fn find_misses_along_ray(
     let shadow_sq = shadow_depth.powi(2);
     let grace_sq = grace_depth.powi(2);
 
+    let ray_len = (dx * dx + dy * dy + dz * dz).sqrt();
+    let t_max = 1.0 + shadow_depth / ray_len.max(f32::EPSILON);
+
     let mut past_endpoint = false;
     loop {
+        let t_enter = tx.min(ty).min(tz);
+        if t_enter > t_max {
+            return;
+        }
+        if t_enter >= 1.0 {
+            past_endpoint = true;
+        }
+
         if tx < ty {
             if tx < tz {
                 x += step_x;
@@ -848,6 +859,59 @@ mod tests {
             build_pointclouds(&map, &live, 1.0, &cylinder, "world", Time::default());
         assert!(cloud_points(&global).contains(&voxel_center(10, 10, 10)));
         assert!(cloud_points(&local).contains(&voxel_center(10, 10, 10)));
+    }
+
+    /// Test how bad the planar ray clipping is.
+    /// For example, points on floors can be counted as misses because they are close to the same ray as the hit.
+    #[test]
+    fn ground_clipping_single_ray() {
+        let voxel_size = 0.1_f32;
+        let lidar_height = 1.0_f32;
+        let cfg = Config {
+            voxel_size,
+            max_range: 50.0,
+            ray_subsample: 1,
+            shadow_depth: 0.2,
+            grace_depth: 0.2,
+            min_health: 0,
+            max_health: 1,
+        };
+        let inv = 1.0 / voxel_size;
+
+        // Cover the full range we will probe, plus a little for shadow.
+        let max_x = 25.0_f32;
+        let n_ground = (max_x / voxel_size).ceil() as i32;
+
+        let ranges: Vec<f32> = (1..=20).map(|i| i as f32).collect();
+        eprintln!(
+            "voxel_size={voxel_size} lidar_height={lidar_height} grace={} shadow={}",
+            cfg.grace_depth, cfg.shadow_depth
+        );
+        eprintln!("range_m  ground_voxels_in_row  clipped  clipped_pct");
+        for &range in &ranges {
+            let mut map = VoxelMap::default();
+            for i in 0..n_ground {
+                let x = (i as f32) * voxel_size + voxel_size * 0.5;
+                let key = world_to_voxel(x, 0.0, 0.0, inv);
+                map.voxels.insert(key, cfg.max_health);
+            }
+            let n_before = map.voxels.len();
+
+            let origin = (0.0_f32, 0.0_f32, lidar_height);
+            let hits = vec![(range, 0.0_f32, 0.0_f32)];
+            update_map(&mut map, origin, &hits, &cfg);
+
+            let n_after_ground: usize = (0..n_ground)
+                .filter(|i| {
+                    let x = (*i as f32) * voxel_size + voxel_size * 0.5;
+                    let key = world_to_voxel(x, 0.0, 0.0, inv);
+                    map.voxels.contains_key(&key)
+                })
+                .count();
+            let clipped = n_before - n_after_ground;
+            let pct = 100.0 * clipped as f32 / n_before as f32;
+            eprintln!("{range:>6.1}  {n_before:>20}  {clipped:>7}  {pct:>10.1}");
+        }
     }
 
     #[test]
