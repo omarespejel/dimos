@@ -25,6 +25,7 @@ actions.
 - Hugging Face dataset: https://huggingface.co/datasets/espejelomar/worldforge-go2-dimos-replay-world-pairs
 - Hugging Face model: https://huggingface.co/espejelomar/go2-dimos-replay-latent-dynamics
 - Decision trace examples: https://github.com/omarespejel/worldforge-go2-trace-judge/tree/main/docs/decision_trace_examples
+- Replay-MPC demo: https://github.com/omarespejel/worldforge-go2-trace-judge/tree/main/artifacts/replay_mpc_demo
 - Final demo video: pending final voiceover upload
 
 ## What We Built
@@ -38,10 +39,12 @@ actions.
   - `outcome_after_execution.json`
   - `run_manifest.json`
 - A micro world scorer for action ranking from trace features.
-- A DimOS replay-derived Hugging Face dataset of action-conditioned Go2
-  current/future frame pairs.
+- A DimOS replay-derived Hugging Face dataset of 2,557 action-conditioned Go2
+  current/future frame pairs from six usable public replay DBs.
 - A small frozen-DINOv2 residual latent dynamics head trained on those replay
   pairs.
+- A no-robot replay-MPC demo: real DimOS replay frame, six candidate egomotion
+  futures, selected action, and WorldForge-style trace JSON.
 
 ## Why It Fits DimOS
 
@@ -71,6 +74,15 @@ make final-video
 The DimOS replay target downloads public replay archives into an ignored local
 cache, derives current/future Go2 frame pairs, trains a small latent dynamics
 head, and exports Hugging Face-ready dataset/model folders.
+
+Current replay-world-model outputs:
+
+```text
+pairs: 2557
+validation lift vs no-motion baseline: +0.0507 cosine
+test lift vs no-motion baseline: +0.0182 cosine
+replay-MPC selected demo margin: +0.0170 over best counterfactual
+```
 
 If memory is tight, run the DimOS side with the venue-recommended memory limit,
 for example:
