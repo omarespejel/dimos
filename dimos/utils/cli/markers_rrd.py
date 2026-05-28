@@ -82,7 +82,7 @@ def main(
         color_image = store.stream("color_image", Image)
         lidar = store.stream("lidar", PointCloud2)
 
-        # ---- pass 1: robot base pose over time (from lidar.pose) ----
+        # Pass 1: robot base pose over time (from lidar.pose).
         for lidar_obs in lidar:
             if lidar_obs.pose is None:
                 continue
@@ -95,7 +95,7 @@ def main(
                 ),
             )
 
-        # ---- pass 2: camera pose + image per color_image frame ----
+        # Pass 2: camera pose + image per color_image frame.
         n_img = color_image.count()
         for i, img_obs in enumerate(color_image):
             rr.set_time(TIMELINE, timestamp=img_obs.ts)
@@ -117,7 +117,7 @@ def main(
             if (i + 1) % 50 == 0 or i + 1 == n_img:
                 print(f"images: {i + 1}/{n_img}")
 
-        # ---- pass 3: marker detections (filtered same way as `dimos map`) ----
+        # Pass 3: marker detections (filtered same way as `dimos map`).
         xf = DetectMarkers(camera_info=cam_info, marker_length_m=marker_size)
         pipeline: Stream[Any] = color_image.transform(
             QualityWindow(lambda img: img.sharpness, window=quality_window)
@@ -175,7 +175,7 @@ def main(
             )
         print(f"detections: {n_det}")
 
-        # ---- pass 4: averaged tracks (smoothing_window > 0 → per-track ids) ----
+        # Pass 4: averaged tracks (smoothing_window > 0 → per-track ids).
         # Re-runs the same filtered pipeline through a smoothing detector;
         # each track yields one entity that updates as the windowed average
         # refines. Color stable per track_id for visual identity.
