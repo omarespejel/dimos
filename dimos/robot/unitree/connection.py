@@ -344,28 +344,38 @@ class UnitreeWebRTCConnection(Resource):
         """Activate FreeWalk locomotion mode — enables walking and velocity commands."""
         return bool(self.publish_request(RTC_TOPIC["SPORT_MOD"], {"api_id": SPORT_CMD["FreeWalk"]}))
 
-    def enable_rage_mode(self) -> bool:
-        """Enable Rage Mode on the Go2 via WebRTC.
-        Assumes the robot is already in BalanceStand.
+    def set_rage_mode(self, enable: bool) -> bool:
+        """Toggle Rage Mode (api 2059) over WebRTC, both directions.
+
+        BalanceStand → 2059 {data:enable} → SwitchJoystick(enable). When on,
+        normal move() twists drive at the ~2.5 m/s rage envelope.
         """
+        # Re-establish BalanceStand before toggling (notes: always BalanceStand
+        # before flipping Rage).
+        if not self.balance_stand():
+            logger.warning("balance_stand() failed before rage toggle — proceeding")
+        time.sleep(0.3)
+
         rage_ok = bool(
             self.publish_request(
                 RTC_TOPIC["SPORT_MOD"],
-                {"api_id": self._SPORT_API_ID_RAGEMODE, "parameter": {"data": True}},
+                {"api_id": self._SPORT_API_ID_RAGEMODE, "parameter": {"data": enable}},
             )
         )
-        time.sleep(2.0)
+        if not rage_ok:
+            return False
 
+        if enable:
+            time.sleep(2.0)  # let FsmRageMode transition settle
         joystick_ok = bool(
             self.publish_request(
                 RTC_TOPIC["SPORT_MOD"],
-                {
-                    "api_id": SPORT_CMD["SwitchJoystick"],
-                    "parameter": {"data": True},
-                },
+                {"api_id": SPORT_CMD["SwitchJoystick"], "parameter": {"data": enable}},
             )
         )
-        return rage_ok and joystick_ok
+        if not joystick_ok:
+            logger.warning("SwitchJoystick failed after rage toggle", enabled=enable)
+        return joystick_ok
 
     def liedown(self) -> bool:
         return bool(
