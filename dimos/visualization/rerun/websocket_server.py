@@ -20,6 +20,7 @@ import logging
 import threading
 from typing import Any, Literal, TypedDict, Union
 
+from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 import websockets
 import websockets.asyncio.server as ws_server
 
@@ -76,6 +77,7 @@ class RerunWebSocketServer(Module):
 
     clicked_point: Out[PointStamped]
     tele_cmd_vel: Out[Twist]
+    teleop_stop: Out[Bool]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -185,4 +187,5 @@ class RerunWebSocketServer(Module):
             )
 
         elif msg_type == "stop":
+            self.teleop_stop.publish(Bool(data=True))
             self.tele_cmd_vel.publish(Twist.zero())

@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import math
 import time
 
+from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 import pytest
 
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
@@ -108,8 +109,20 @@ def test_manual_only_mode_never_forwards_navigation():
     captured, unsubs = _attach(manager)
     try:
         manager._on_nav(_twist(lx=0.9))
+
         assert captured.cmd_vel == []
+    finally:
+        for unsub in unsubs:
+            unsub()
+        manager._close_module()
+
+
+def test_manual_only_mode_still_forwards_teleop():
+    manager = MovementManager(control_mode="manual_only")
+    captured, unsubs = _attach(manager)
+    try:
         manager._on_teleop(_twist(lx=0.3))
+
         assert captured.cmd_vel == [_twist(lx=0.3)]
     finally:
         for unsub in unsubs:
@@ -117,23 +130,30 @@ def test_manual_only_mode_never_forwards_navigation():
         manager._close_module()
 
 
-def test_latched_teleop_stop_requires_new_valid_goal(manager_and_captured):
+def test_idle_zero_teleop_does_not_latch_operator_stop(manager_and_captured):
     manager, captured = manager_and_captured
     manager.config.latch_teleop_stop = True
     manager.config.tele_cooldown_sec = 0.0
 
     manager._on_teleop(_twist())
-    cmd_count_after_stop = len(captured.cmd_vel)
     manager._on_nav(_twist(lx=0.9))
-    assert len(captured.cmd_vel) == cmd_count_after_stop
 
+    assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
+
+
+def test_latched_teleop_stop_requires_new_valid_goal(manager_and_captured):
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager.config.tele_cooldown_sec = 0.0
+
+    manager._on_teleop_stop(Bool(data=True))
+    manager._on_nav(_twist(lx=0.7))
     manager._on_click(_click(x=float("nan")))
-    manager._on_nav(_twist(lx=0.9))
-    assert len(captured.cmd_vel) == cmd_count_after_stop
-
+    manager._on_nav(_twist(lx=0.8))
     manager._on_click(_click())
     manager._on_nav(_twist(lx=0.9))
-    assert len(captured.cmd_vel) == cmd_count_after_stop + 1
+
+    assert captured.cmd_vel == [_twist(lx=0.9)]
 
 
 def test_valid_click_publishes_goal(manager_and_captured):
