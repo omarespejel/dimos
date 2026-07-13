@@ -18,6 +18,7 @@ The leaf (UnitreeWebRTCConnection.__init__) is covered in
 dimos/robot/unitree/test_connection.py; this pins the go2-local routing.
 """
 
+from collections.abc import Callable, Generator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -26,11 +27,14 @@ import pytest
 from reactivex.disposable import Disposable
 
 from dimos.core.global_config import GlobalConfig
-from dimos.core.module import Module
-from dimos.core.resource import CompositeResource
 from dimos.memory2.store.sqlite import SqliteStore
 from dimos.robot.unitree.go2 import connection as go2_conn
-from dimos.robot.unitree.go2.connection import ConnectionConfig, ReplayConnection
+from dimos.robot.unitree.go2.connection import (
+    ConnectionConfig,
+    GO2Connection,
+    Go2ConnectionProtocol,
+    ReplayConnection,
+)
 
 
 @pytest.fixture
@@ -40,6 +44,24 @@ def stub_webrtc(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     stub = MagicMock(name="UnitreeWebRTCConnection")
     monkeypatch.setattr(go2_conn, "UnitreeWebRTCConnection", stub)
     return stub
+
+
+@pytest.fixture
+def make_go2_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[Callable[[Go2ConnectionProtocol], GO2Connection], None, None]:
+    modules: list[GO2Connection] = []
+
+    def make(connection: Go2ConnectionProtocol) -> GO2Connection:
+        monkeypatch.setattr(go2_conn, "make_connection", MagicMock(return_value=connection))
+        module = GO2Connection(ip="fake", camera=False, lidar=False)
+        modules.append(module)
+        return module
+
+    yield make
+
+    for module in modules:
+        module._close_module()
 
 
 def test_make_connection_webrtc_forwards_aes_128_key(stub_webrtc: MagicMock) -> None:
@@ -87,6 +109,7 @@ def test_replay_connection_shutdown_is_idempotent(
 
 def test_go2_replay_shutdown_disposes_subscriptions_before_store(
     monkeypatch: pytest.MonkeyPatch,
+    make_go2_module: Callable[[Go2ConnectionProtocol], GO2Connection],
 ) -> None:
     events: list[str] = []
     connection = ReplayConnection(dataset="recording")
@@ -95,15 +118,26 @@ def test_go2_replay_shutdown_disposes_subscriptions_before_store(
         "stop",
         MagicMock(side_effect=lambda: events.append("store")),
     )
-    module = object.__new__(go2_conn.GO2Connection)
-    module.connection = connection
-    module._camera_info_thread = None
-    module._camera_info_stop_event = MagicMock()
-    module._disposables = None
+    module = make_go2_module(connection)
     module.register_disposable(Disposable(lambda: events.append("subscriptions")))
-    monkeypatch.setattr(Module, "stop", CompositeResource.stop)
 
     module.stop()
 
     assert events == ["subscriptions", "store"]
-    module._camera_info_stop_event.set.assert_called_once_with()
+    assert module._camera_info_stop_event.is_set()
+
+
+def test_go2_live_shutdown_disposes_subscriptions_before_connection(
+    make_go2_module: Callable[[Go2ConnectionProtocol], GO2Connection],
+) -> None:
+    events: list[str] = []
+    connection = MagicMock(spec=Go2ConnectionProtocol)
+    connection.stop.side_effect = lambda: events.append("connection")
+    module = make_go2_module(connection)
+    module.register_disposable(Disposable(lambda: events.append("subscriptions")))
+
+    module.stop()
+
+    assert events == ["subscriptions", "connection"]
+    assert module._camera_info_stop_event.is_set()
+    connection.stop.assert_called_once_with()
