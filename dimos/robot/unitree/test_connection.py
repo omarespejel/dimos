@@ -128,6 +128,61 @@ def test_move_api_toggle_sends_selected_wire_command(
         connection.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
 
 
+@pytest.mark.parametrize(
+    ("connection_options", "expected_call"),
+    [
+        pytest.param(
+            {},
+            call(
+                RTC_TOPIC["WIRELESS_CONTROLLER"],
+                data={"lx": -0.0, "ly": 0.0, "rx": -0.0, "ry": 0},
+            ),
+            id="joystick",
+        ),
+        pytest.param(
+            {"velocity_api": True},
+            call(
+                RTC_TOPIC["SPORT_MOD"],
+                data={
+                    "header": {
+                        "identity": {
+                            "id": ANY,
+                            "api_id": SPORT_CMD["Move"],
+                        }
+                    },
+                    "parameter": json.dumps({"x": 0.0, "y": 0.0, "z": 0.0}),
+                },
+                msg_type=DATA_CHANNEL_TYPE["REQUEST"],
+            ),
+            id="velocity",
+        ),
+    ],
+)
+def test_move_watchdog_sends_zero_command(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_options: dict[str, bool],
+    expected_call: Any,
+) -> None:
+    driver = _stub_driver()
+    monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
+    timer = MagicMock()
+    timer_factory = MagicMock(return_value=timer)
+    monkeypatch.setattr(conn_mod.threading, "Timer", timer_factory)
+
+    connection = UnitreeWebRTCConnection(ip="10.0.0.99", **connection_options)
+    try:
+        assert connection.move(Twist(linear=Vector3(x=0.4)))
+        watchdog = timer_factory.call_args.args[1]
+        driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+        watchdog()
+
+        assert driver.datachannel.pub_sub.publish_without_callback.call_args == expected_call
+    finally:
+        connection.loop.call_soon_threadsafe(connection.loop.stop)
+        connection.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+
 @pytest.fixture
 def stub_legion(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     """Replace LegionConnection with a mock and no-op connect() so __init__

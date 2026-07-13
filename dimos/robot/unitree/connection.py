@@ -220,7 +220,7 @@ class UnitreeWebRTCConnection(Resource):
         if self.stop_timer:
             self.stop_timer.cancel()
 
-        # Auto-stop after 0.5 seconds if no new commands
+        # Auto-stop after the configured timeout if no new commands arrive.
         self.stop_timer = threading.Timer(self.cmd_vel_timeout, self.stop_movement)
         self.stop_timer.daemon = True
         self.stop_timer.start()
@@ -471,10 +471,29 @@ class UnitreeWebRTCConnection(Resource):
         return self.video_stream()
 
     def stop_movement(self) -> None:
-        """Cancel the auto-stop timer (used by move() for continuous commands)."""
+        """Cancel the watchdog and publish zero velocity on the active wire API."""
         if self.stop_timer:
             self.stop_timer.cancel()
             self.stop_timer = None
+
+        def publish_stop() -> None:
+            self._publish_movement(0.0, 0.0, 0.0)
+
+        if threading.current_thread() is self.thread:
+            publish_stop()
+            return
+        if not self.loop.is_running():
+            logger.warning("Cannot send movement stop: WebRTC event loop is not running")
+            return
+
+        async def async_stop() -> None:
+            publish_stop()
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(async_stop(), self.loop)
+            future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        except Exception as e:
+            logger.warning("Failed to send movement stop: %s", e)
 
     def disconnect(self) -> None:
         """Disconnect from the robot and clean up resources."""
