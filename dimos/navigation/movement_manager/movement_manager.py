@@ -69,10 +69,13 @@ class MovementManager(Module):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._teleop_active = False
         self._last_teleop_time = 0.0
         self._operator_stop_latched = False
+        self._active_goal_frame_id: str | None = None
+        self._last_goal: tuple[float, float, float, float] | None = None
+        self._transition_generation = 0
 
     @rpc
     def start(self) -> None:
@@ -87,6 +90,9 @@ class MovementManager(Module):
         with self._lock:
             self._teleop_active = False
             self._operator_stop_latched = False
+            self._active_goal_frame_id = None
+            self._last_goal = None
+            self._transition_generation += 1
         super().stop()
 
     def _on_click(self, msg: PointStamped) -> None:
@@ -101,13 +107,46 @@ class MovementManager(Module):
             logger.warning("Ignored out-of-range click", x=msg.x, y=msg.y, z=msg.z)
             return
 
-        logger.debug("Goal", x=round(msg.x, 1), y=round(msg.y, 1), z=round(msg.z, 1))
-        self.way_point.publish(msg)
-        self.goal.publish(msg)
-
-        # Release only after publishing a valid replacement goal, so stale planner
-        # traffic cannot slip through between the operator action and goal update.
         with self._lock:
+            if self._operator_stop_latched:
+                if (
+                    self._active_goal_frame_id is not None
+                    and msg.frame_id != self._active_goal_frame_id
+                ):
+                    logger.warning(
+                        "Ignored replacement goal from a different frame",
+                        expected=self._active_goal_frame_id,
+                        received=msg.frame_id,
+                    )
+                    return
+                if self._last_goal is not None:
+                    last_ts, last_x, last_y, last_z = self._last_goal
+                    if msg.ts < last_ts or (
+                        msg.ts == last_ts and (msg.x, msg.y, msg.z) == (last_x, last_y, last_z)
+                    ):
+                        logger.warning(
+                            "Ignored stale or replayed replacement goal",
+                            received_ts=msg.ts,
+                            last_ts=last_ts,
+                        )
+                        return
+
+            self._transition_generation += 1
+            transition_generation = self._transition_generation
+            logger.debug("Goal", x=round(msg.x, 1), y=round(msg.y, 1), z=round(msg.z, 1))
+            self.way_point.publish(msg)
+            if transition_generation != self._transition_generation:
+                return
+            self.goal.publish(msg)
+            if transition_generation != self._transition_generation:
+                return
+
+            self._active_goal_frame_id = msg.frame_id
+            self._last_goal = (msg.ts, msg.x, msg.y, msg.z)
+
+            # The same lock serializes replacement-goal publication with STOP.
+            # Keep the latch set during publish so reentrant planner traffic is
+            # rejected, then release it only after the goal has reached subscribers.
             if self._operator_stop_latched:
                 self._operator_stop_latched = False
                 self._teleop_active = False
@@ -163,11 +202,12 @@ class MovementManager(Module):
             return
 
         with self._lock:
+            self._transition_generation += 1
             self._operator_stop_latched = True
             self._teleop_active = True
             self._last_teleop_time = time.monotonic()
-
-        # Handle the explicit stop atomically in this module. The viewer also keeps
-        # publishing a zero Twist for consumers that do not use MovementManager.
-        self._cancel_goal()
-        self.cmd_vel.publish(Twist.zero())
+            # Serialize the full STOP transition with replacement-goal
+            # publication. The viewer also publishes a zero Twist for consumers
+            # that do not use MovementManager.
+            self._cancel_goal()
+            self.cmd_vel.publish(Twist.zero())
