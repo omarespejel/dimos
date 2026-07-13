@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 import reactivex as rx
 from reactivex.abc import DisposableBase, ObserverBase, SchedulerBase
-from reactivex.disposable import Disposable
+from reactivex.disposable import Disposable, SerialDisposable, SingleAssignmentDisposable
 from reactivex.observable import Observable
 from reactivex.scheduler import TimeoutScheduler
 
@@ -232,7 +232,10 @@ class ReplayStream(Generic[T]):
             scheduler: SchedulerBase | None = None,
         ) -> DisposableBase:
             sched = scheduler or TimeoutScheduler()
+            scheduled = SerialDisposable()
+            state = threading.Condition()
             is_disposed = False
+            active_threads: dict[int, int] = {}
 
             def make_iterator() -> Iterator[tuple[float, T]]:
                 while True:
@@ -284,26 +287,63 @@ class ReplayStream(Generic[T]):
 
                 def emit(_s: SchedulerBase, _state: object) -> DisposableBase | None:
                     nonlocal wrap_offset, prev_ts
-                    if is_disposed:
-                        return None
-                    observer.on_next(data)
+                    thread_id = threading.get_ident()
+                    with state:
+                        if is_disposed:
+                            return None
+                        active_threads[thread_id] = active_threads.get(thread_id, 0) + 1
                     try:
-                        nxt = next(iterator)
-                    except StopIteration:
-                        observer.on_completed()
+                        observer.on_next(data)
+                        next_error: Exception | None = None
+                        with state:
+                            if is_disposed:
+                                return None
+                            try:
+                                nxt = next(iterator)
+                            except StopIteration:
+                                nxt = None
+                            except Exception as error:
+                                nxt = None
+                                next_error = error
+                            else:
+                                wrap_offset = wrap_off
+                                prev_ts = ts
+                        if next_error is not None:
+                            observer.on_error(next_error)
+                            return None
+                        if nxt is None:
+                            observer.on_completed()
+                            return None
+                        schedule(nxt, wrap_offset, prev_ts)
                         return None
-                    wrap_offset = wrap_off
-                    prev_ts = ts
-                    schedule(nxt, wrap_offset, prev_ts)
-                    return None
+                    finally:
+                        with state:
+                            active_count = active_threads[thread_id] - 1
+                            if active_count:
+                                active_threads[thread_id] = active_count
+                            else:
+                                del active_threads[thread_id]
+                            state.notify_all()
 
-                sched.schedule_relative(delay, emit)
+                current = SingleAssignmentDisposable()
+                scheduled.disposable = current
+                current.disposable = sched.schedule_relative(delay, emit)
 
             schedule((first_ts, first_data), wrap_offset, prev_ts)
 
             def dispose() -> None:
                 nonlocal is_disposed
-                is_disposed = True
+                with state:
+                    is_disposed = True
+                scheduled.dispose()
+                caller = threading.get_ident()
+                with state:
+                    state.wait_for(
+                        lambda: not any(
+                            thread_id != caller and count
+                            for thread_id, count in active_threads.items()
+                        )
+                    )
 
             return Disposable(dispose)
 
