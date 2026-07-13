@@ -1,0 +1,49 @@
+# Qodo Code Review repository configuration.
+# https://docs.qodo.ai/install-and-configure/configuration-overview/configuration-file
+
+[github_app]
+pr_commands = [
+  "/agentic_describe",
+  "/agentic_review"
+]
+
+[review_agent]
+comments_location_policy = "both"
+inline_comments_severity_threshold = 2
+
+issues_user_guidelines = """
+Read AGENTS.md and the relevant docs/coding-agents guidance before reviewing.
+Prioritize correctness, lifecycle ownership, concurrency, cleanup, serialization
+and replay compatibility, timestamps and coordinate frames, physical-device
+safety, configuration and CLI compatibility, and focused regression coverage.
+
+High-priority findings include:
+- work started in constructors or imports, leaked workers or subscriptions,
+  mutable global state, shutdown races, and failures that are caught or hidden;
+- incompatible protocol, config, codec, database, or replay changes;
+- incorrect arrival-time versus data-time handling or invalid transform trees;
+- robot commands with wrong units, signs, frames, bounds, or stop semantics;
+- motion that can occur without an explicit operator-controlled path;
+- memory2 ordering, atomicity, corruption, truncation, or silent-loss problems;
+- hardcoded hosts, interfaces, ports, credentials, or environment assumptions;
+- tests that rely on fixed sleeps, leak resources, or miss the failure path.
+
+Keep suggestions within the PR scope. Treat style-only rewrites, broad unrelated
+refactors, generated files, and speculative architecture changes as low priority.
+"""
+
+compliance_user_guidelines = """
+Check that the PR follows the repository contribution contract:
+- the body explains the problem, solution, test procedure, and CLA status;
+- new tests are colocated with the implementation and fixtures clean resources;
+- physical-hardware behavior has bounded commands and a deterministic stop path;
+- public APIs, configs, recordings, codecs, and stored data remain compatible or
+  include an explicit migration and regression test;
+- secrets, private recordings, account data, and machine-specific paths are not
+  committed;
+- generated dimos/robot/all_blueprints.py changes come from the repository's
+  generator workflow rather than hand editing;
+- safety, reliability, and performance claims are backed by reproducible evidence;
+- commit messages do not add co-author trailers, generated-with lines, or robot
+  emoji, matching the repository's commit-message filter.
+"""
