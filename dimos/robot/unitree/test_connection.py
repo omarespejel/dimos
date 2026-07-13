@@ -20,6 +20,7 @@ aes_128_key forwarding, and the UNITREE_AES_128_KEY env var via GlobalConfig.
 
 import asyncio
 import json
+from threading import Event
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call
 
@@ -38,6 +39,7 @@ def _stub_driver(connect_exc: Exception | None = None) -> MagicMock:
     """A LegionConnection instance double covering everything connect() touches."""
     driver = MagicMock(name="LegionConnection-instance")
     driver.connect = AsyncMock(side_effect=connect_exc)
+    driver.disconnect = AsyncMock()
     driver.datachannel.disableTrafficSaving = AsyncMock()
     driver.datachannel.set_decoder = MagicMock()
     driver.datachannel.pub_sub.publish_request_new = AsyncMock()
@@ -233,6 +235,54 @@ def test_move_is_not_published_when_watchdog_cannot_arm(
     driver.datachannel.pub_sub.publish_without_callback.assert_not_called()
 
 
+def test_rearming_failure_preserves_active_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory(velocity_api=True)
+    timer_handle = MagicMock()
+    scheduled: list[tuple[Any, tuple[Any, ...]]] = []
+
+    def arm_once(_delay: float, callback: Any, *args: Any) -> MagicMock:
+        scheduled.append((callback, args))
+        return timer_handle
+
+    monkeypatch.setattr(connection.loop, "call_later", arm_once)
+    assert connection.move(Twist(linear=Vector3(x=0.2)))
+    watchdog, watchdog_args = scheduled[0]
+    generation = connection._movement_generation
+    monkeypatch.setattr(
+        connection.loop,
+        "call_later",
+        MagicMock(side_effect=RuntimeError("event loop is closing")),
+    )
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+    assert not connection.move(Twist(linear=Vector3(x=0.4)))
+    assert connection.stop_timer is timer_handle
+    assert connection._movement_generation == generation
+    timer_handle.cancel.assert_not_called()
+    driver.datachannel.pub_sub.publish_without_callback.assert_not_called()
+
+    _run_on_connection_loop(connection, watchdog, *watchdog_args)
+
+    timer_handle.cancel.assert_called_once_with()
+    parameter = json.dumps({"x": 0.0, "y": 0.0, "z": 0.0})
+    driver.datachannel.pub_sub.publish_without_callback.assert_called_once_with(
+        RTC_TOPIC["SPORT_MOD"],
+        data={
+            "header": {
+                "identity": {
+                    "id": ANY,
+                    "api_id": SPORT_CMD["Move"],
+                }
+            },
+            "parameter": parameter,
+        },
+        msg_type=DATA_CHANNEL_TYPE["REQUEST"],
+    )
+
+
 def test_stop_movement_from_connection_loop_publishes_zero(
     connection_factory: Any,
 ) -> None:
@@ -255,6 +305,51 @@ def test_stop_movement_from_connection_loop_publishes_zero(
         },
         msg_type=DATA_CHANNEL_TYPE["REQUEST"],
     )
+
+
+def test_stop_waits_for_disconnect_before_stopping_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory()
+    events: list[str] = []
+
+    async def disconnect() -> None:
+        events.append("disconnect")
+
+    driver.disconnect.side_effect = disconnect
+    original_stop = connection.loop.stop
+
+    def stop_loop() -> None:
+        events.append("loop_stop")
+        original_stop()
+
+    monkeypatch.setattr(connection.loop, "stop", stop_loop)
+
+    connection.stop()
+
+    assert events == ["disconnect", "loop_stop"]
+    driver.disconnect.assert_awaited_once_with()
+    assert not connection.thread.is_alive()
+
+
+def test_stop_from_connection_loop_disconnects_before_stopping(
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory()
+    disconnected = Event()
+
+    async def disconnect() -> None:
+        disconnected.set()
+
+    driver.disconnect.side_effect = disconnect
+
+    connection.loop.call_soon_threadsafe(connection.stop)
+    connection.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+    assert disconnected.is_set()
+    driver.disconnect.assert_awaited_once_with()
+    assert not connection.thread.is_alive()
 
 
 def test_stale_watchdog_cannot_stop_replacement_command(

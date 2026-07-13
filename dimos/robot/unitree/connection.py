@@ -160,9 +160,22 @@ class UnitreeWebRTCConnection(Resource):
                 pass
 
         if self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
+            if threading.current_thread() is self.thread:
 
-            self.loop.call_soon_threadsafe(self.loop.stop)
+                async def disconnect_then_stop() -> None:
+                    await async_disconnect()
+                    self.loop.stop()
+
+                self.loop.create_task(disconnect_then_stop())
+                return
+
+            future = asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
+            try:
+                future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+            except Exception:
+                pass
+            finally:
+                self.loop.call_soon_threadsafe(self.loop.stop)
 
         if self.thread.is_alive():
             self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
@@ -486,13 +499,17 @@ class UnitreeWebRTCConnection(Resource):
 
     def _arm_movement_watchdog(self) -> None:
         """Refresh the command-scoped watchdog on the WebRTC event loop."""
-        self._cancel_movement_watchdog()
-        generation = self._movement_generation
-        self.stop_timer = self.loop.call_later(
+        generation = self._movement_generation + 1
+        replacement = self.loop.call_later(
             self.cmd_vel_timeout,
             self._movement_watchdog_expired,
             generation,
         )
+        previous = self.stop_timer
+        self._movement_generation = generation
+        self.stop_timer = replacement
+        if previous:
+            previous.cancel()
 
     def _movement_watchdog_expired(self, generation: int) -> None:
         """Stop only if this callback still owns the active command generation."""
@@ -507,21 +524,4 @@ class UnitreeWebRTCConnection(Resource):
 
     def disconnect(self) -> None:
         """Disconnect from the robot and clean up resources."""
-        self.stop_movement()
-
-        if hasattr(self, "conn"):
-
-            async def async_disconnect() -> None:
-                try:
-                    await self.conn.disconnect()
-                except:
-                    pass
-
-            if hasattr(self, "loop") and self.loop.is_running():
-                asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
-
-        if hasattr(self, "loop") and self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
-
-        if hasattr(self, "thread") and self.thread.is_alive():
-            self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        self.stop()
