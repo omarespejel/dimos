@@ -107,11 +107,13 @@ class GlobalPlanner(Resource):
         self._thread.start()
 
     def stop(self) -> None:
-        self.cancel_goal()
-        self._local_planner.stop()
-        self._disposables.dispose()
+        # Block the monitor before LocalPlanner emits its final stop event. Otherwise the
+        # callback can request a replan after cancel_goal() has cleared the active goal.
         self._stop_planner.set()
         self._replan_event.set()
+        self._disposables.dispose()
+        self.cancel_goal()
+        self._local_planner.stop()
 
         if self._thread is not None and self._thread is not current_thread():
             self._thread.join(DEFAULT_THREAD_JOIN_TIMEOUT)
@@ -258,6 +260,9 @@ class GlobalPlanner(Resource):
                 last_stuck_check = time.perf_counter()
 
     def _on_stopped_navigating(self, stop_message: StopMessage) -> None:
+        if self._stop_planner.is_set():
+            return
+
         with self._lock:
             self._replan_reason = stop_message
         # Signal the monitoring thread to do the replanning. This is so we don't have two
@@ -287,10 +292,11 @@ class GlobalPlanner(Resource):
             current_odom = self._current_odom
             current_goal = self._current_goal
 
-        logger.info("Replanning.", attempt=self._replan_limiter.get_attempt())
+        if self._stop_planner.is_set() or current_odom is None or current_goal is None:
+            logger.debug("Skipping replan during shutdown or without an active goal and odometry.")
+            return
 
-        assert current_odom is not None
-        assert current_goal is not None
+        logger.info("Replanning.", attempt=self._replan_limiter.get_attempt())
 
         if current_goal.position.distance(current_odom.position) < self._replan_goal_tolerance:
             self.cancel_goal(arrived=True)
@@ -309,13 +315,18 @@ class GlobalPlanner(Resource):
         self._plan_path()
 
     def _plan_path(self) -> None:
+        if self._stop_planner.is_set():
+            return
+
         self.cancel_goal(but_will_try_again=True)
 
         with self._lock:
             current_odom = self._current_odom
             current_goal = self._current_goal
 
-        assert current_goal is not None
+        if self._stop_planner.is_set() or current_goal is None:
+            logger.debug("Skipping path planning during shutdown or without an active goal.")
+            return
 
         if current_odom is None:
             logger.warning("Cannot handle goal request: missing odometry.")
@@ -340,6 +351,12 @@ class GlobalPlanner(Resource):
             return
 
         resampled_path = smooth_resample_path(path, current_goal, 0.1)
+
+        with self._lock:
+            goal_is_current = self._current_goal is current_goal
+        if self._stop_planner.is_set() or not goal_is_current:
+            logger.debug("Discarding a path computed for an inactive goal.")
+            return
 
         self.path.on_next(resampled_path)
 
