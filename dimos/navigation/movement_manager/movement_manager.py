@@ -48,7 +48,7 @@ class MovementManagerConfig(ModuleConfig):
     tele_cmd_vel_scaling: Twist = Twist(Vector3(1, 1, 1), Vector3(1, 1, 1))
     # mixed preserves the teleop cooldown mux; manual_only rejects all planner velocity.
     control_mode: Literal["mixed", "manual_only"] = "mixed"
-    # The current viewer represents operator STOP as a zero teleop Twist.
+    # Keep an explicit viewer STOP active until the operator publishes a valid new goal.
     latch_teleop_stop: bool = False
 
 
@@ -60,6 +60,7 @@ class MovementManager(Module):
     clicked_point: In[PointStamped]
     nav_cmd_vel: In[Twist]
     tele_cmd_vel: In[Twist]
+    teleop_stop: In[Bool]
 
     goal: Out[PointStamped]
     way_point: Out[PointStamped]
@@ -79,6 +80,7 @@ class MovementManager(Module):
         self.register_disposable(Disposable(self.clicked_point.subscribe(self._on_click)))
         self.register_disposable(Disposable(self.nav_cmd_vel.subscribe(self._on_nav)))
         self.register_disposable(Disposable(self.tele_cmd_vel.subscribe(self._on_teleop)))
+        self.register_disposable(Disposable(self.teleop_stop.subscribe(self._on_teleop_stop)))
 
     @rpc
     def stop(self) -> None:
@@ -138,8 +140,6 @@ class MovementManager(Module):
         with self._lock:
             self._teleop_active = True
             self._last_teleop_time = time.monotonic()
-            if self.config.latch_teleop_stop and self._is_zero_twist(msg):
-                self._operator_stop_latched = True
 
         self._cancel_goal()
 
@@ -158,16 +158,9 @@ class MovementManager(Module):
         )
         self.cmd_vel.publish(scaled)
 
-    @staticmethod
-    def _is_zero_twist(msg: Twist) -> bool:
-        return all(
-            value == 0.0
-            for value in (
-                msg.linear.x,
-                msg.linear.y,
-                msg.linear.z,
-                msg.angular.x,
-                msg.angular.y,
-                msg.angular.z,
-            )
-        )
+    def _on_teleop_stop(self, msg: Bool) -> None:
+        if not self.config.latch_teleop_stop or not msg.data:
+            return
+
+        with self._lock:
+            self._operator_stop_latched = True
