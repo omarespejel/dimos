@@ -216,6 +216,47 @@ def test_move_watchdog_sends_zero_command(
     )
 
 
+def test_move_is_not_published_when_watchdog_cannot_arm(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory(velocity_api=True)
+    monkeypatch.setattr(
+        connection.loop,
+        "call_later",
+        MagicMock(side_effect=RuntimeError("event loop is closing")),
+    )
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+    assert not connection.move(Twist(linear=Vector3(x=0.4)))
+
+    driver.datachannel.pub_sub.publish_without_callback.assert_not_called()
+
+
+def test_stop_movement_from_connection_loop_publishes_zero(
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory(velocity_api=True)
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+    _run_on_connection_loop(connection, connection.stop_movement)
+
+    parameter = json.dumps({"x": 0.0, "y": 0.0, "z": 0.0})
+    driver.datachannel.pub_sub.publish_without_callback.assert_called_once_with(
+        RTC_TOPIC["SPORT_MOD"],
+        data={
+            "header": {
+                "identity": {
+                    "id": ANY,
+                    "api_id": SPORT_CMD["Move"],
+                }
+            },
+            "parameter": parameter,
+        },
+        msg_type=DATA_CHANNEL_TYPE["REQUEST"],
+    )
+
+
 def test_stale_watchdog_cannot_stop_replacement_command(
     monkeypatch: pytest.MonkeyPatch,
     connection_factory: Any,

@@ -202,8 +202,8 @@ class UnitreeWebRTCConnection(Resource):
         x, y, yaw = twist.linear.x, twist.linear.y, twist.angular.z
 
         async def async_move() -> None:
-            self._publish_movement(x, y, yaw)
             self._arm_movement_watchdog()
+            self._publish_movement(x, y, yaw)
 
         async def async_move_duration() -> None:
             """Send movement commands continuously for the specified duration."""
