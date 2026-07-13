@@ -12,20 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test that go2.connection.make_connection forwards aes_128_key.
+"""Tests for Go2 connection routing and replay lifecycle.
 
 The leaf (UnitreeWebRTCConnection.__init__) is covered in
 dimos/robot/unitree/test_connection.py; this pins the go2-local routing.
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from dimos.core.global_config import GlobalConfig
+from dimos.memory2.store.sqlite import SqliteStore
 from dimos.robot.unitree.go2 import connection as go2_conn
-from dimos.robot.unitree.go2.connection import ConnectionConfig
+from dimos.robot.unitree.go2.connection import ConnectionConfig, ReplayConnection
 
 
 @pytest.fixture
@@ -52,3 +54,28 @@ def test_connection_config_aes_key_defaults_from_global_config() -> None:
     """ConnectionConfig.aes_128_key defaults from GlobalConfig.unitree_aes_128_key."""
     g = GlobalConfig(robot_ip="127.0.0.1", unitree_aes_128_key="dd" * 16)
     assert ConnectionConfig(g=g).aes_128_key == "dd" * 16
+
+
+def test_replay_connection_shutdown_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    replay = MagicMock()
+    store.replay.return_value = replay
+    store_factory = MagicMock(return_value=store)
+    monkeypatch.setattr(go2_conn, "SqliteStore", store_factory)
+    monkeypatch.setattr(
+        go2_conn,
+        "resolve_db_path",
+        MagicMock(return_value=Path("/tmp/replay.db")),
+    )
+    connection = ReplayConnection(dataset="recording")
+
+    assert connection.replay is replay
+    connection.stop()
+    connection.stop()
+    connection.disconnect()
+
+    store_factory.assert_called_once_with(path="/tmp/replay.db", must_exist=True)
+    store.start.assert_called_once_with()
+    store.dispose.assert_called_once_with()

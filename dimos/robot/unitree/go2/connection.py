@@ -149,12 +149,13 @@ def make_connection(
         raise ValueError(f"Unknown simulator {cfg.simulation!r}. Choose from: mujoco, dimsim")
 
 
-class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
+class ReplayConnection(CompositeResource):
     def __init__(  # type: ignore[no-untyped-def]
         self,
         dataset: str = "go2_china_office",
         **kwargs,
     ) -> None:
+        self._disposables = None
         self.dataset = dataset
         self._loop = kwargs.get("loop", False)
         self._seek = kwargs.get("seek")
@@ -175,6 +176,12 @@ class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
 
     def start(self) -> None:
         pass
+
+    def stop(self) -> None:
+        super().stop()
+
+    def disconnect(self) -> None:
+        self.stop()
 
     def standup(self) -> bool:
         return True
