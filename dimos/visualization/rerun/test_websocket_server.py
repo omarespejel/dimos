@@ -185,7 +185,6 @@ def test_stop_publishes_explicit_signal_and_zero_twist(
     unsub_stop = server.teleop_stop.subscribe(capture_stop)
 
     publisher.send_stop()
-    publisher.flush()
     done.wait(timeout=2.0)
     unsub_twist()
     unsub_stop()

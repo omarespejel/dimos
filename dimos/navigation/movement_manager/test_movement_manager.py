@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 import math
 import time
@@ -23,6 +23,7 @@ from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 import pytest
 
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
+from dimos.core.stream import Stream, Transport
 from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
@@ -39,6 +40,32 @@ class Captured:
     stop_movement: list = field(default_factory=list)
     goal: list = field(default_factory=list)
     way_point: list = field(default_factory=list)
+
+
+class _DirectTransport(Transport):  # type: ignore[type-arg]
+    """Synchronous transport for exercising subscriptions registered by start()."""
+
+    def __init__(self) -> None:
+        self._subscribers: list[Callable[[Any], Any]] = []
+
+    def broadcast(self, _selfstream: Any, value: Any) -> None:
+        for callback in list(self._subscribers):
+            callback(value)
+
+    def subscribe(
+        self, callback: Callable[[Any], Any], _selfstream: Stream[Any] | None = None
+    ) -> Callable[[], None]:
+        self._subscribers.append(callback)
+
+        def unsubscribe() -> None:
+            self._subscribers.remove(callback)
+
+        return unsubscribe
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None:
+        self._subscribers.clear()
 
 
 def _attach(module):
@@ -63,6 +90,21 @@ def manager_and_captured() -> Generator[tuple[MovementManager, Captured], None, 
         for unsub in unsubs:
             unsub()
         module._close_module()
+
+
+@pytest.fixture()
+def started_manager_and_captured() -> Generator[tuple[MovementManager, Captured], None, None]:
+    module = MovementManager(latch_teleop_stop=True, tele_cooldown_sec=0.0)
+    for input_stream in module.inputs.values():
+        input_stream.transport = _DirectTransport()
+    captured, unsubs = _attach(module)
+    module.start()
+    try:
+        yield module, captured
+    finally:
+        for unsub in unsubs:
+            unsub()
+        module.stop()
 
 
 def _twist(lx=0.0):
@@ -150,10 +192,31 @@ def test_latched_teleop_stop_requires_new_valid_goal(manager_and_captured):
     manager._on_nav(_twist(lx=0.7))
     manager._on_click(_click(x=float("nan")))
     manager._on_nav(_twist(lx=0.8))
+    manager._on_click(_click(x=600.0))
+    manager._on_nav(_twist(lx=0.85))
     manager._on_click(_click())
     manager._on_nav(_twist(lx=0.9))
 
-    assert captured.cmd_vel == [_twist(lx=0.9)]
+    assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
+
+
+def test_started_manager_latches_explicit_stop(started_manager_and_captured):
+    manager, captured = started_manager_and_captured
+
+    manager.teleop_stop.transport.publish(Bool(data=True))
+    manager.nav_cmd_vel.transport.publish(_twist(lx=0.9))
+
+    assert captured.cmd_vel == [_twist()]
+
+
+def test_stop_clears_operator_stop_latch(manager_and_captured):
+    manager, _captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager._on_teleop_stop(Bool(data=True))
+
+    manager.stop()
+
+    assert not manager._operator_stop_latched
 
 
 def test_valid_click_publishes_goal(manager_and_captured):
