@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from typing import Any
+from typing import Any, Literal
 
 from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 from reactivex.disposable import Disposable
@@ -46,6 +46,10 @@ MAX_CLICK_VERTICAL_M = 50.0
 class MovementManagerConfig(ModuleConfig):
     tele_cooldown_sec: float = 1.0
     tele_cmd_vel_scaling: Twist = Twist(Vector3(1, 1, 1), Vector3(1, 1, 1))
+    # mixed preserves the teleop cooldown mux; manual_only rejects all planner velocity.
+    control_mode: Literal["mixed", "manual_only"] = "mixed"
+    # The current viewer represents operator STOP as a zero teleop Twist.
+    latch_teleop_stop: bool = False
 
 
 class MovementManager(Module):
@@ -67,6 +71,7 @@ class MovementManager(Module):
         self._lock = threading.Lock()
         self._teleop_active = False
         self._last_teleop_time = 0.0
+        self._operator_stop_latched = False
 
     @rpc
     def start(self) -> None:
@@ -79,6 +84,7 @@ class MovementManager(Module):
     def stop(self) -> None:
         with self._lock:
             self._teleop_active = False
+            self._operator_stop_latched = False
         super().stop()
 
     def _on_click(self, msg: PointStamped) -> None:
@@ -97,6 +103,13 @@ class MovementManager(Module):
         self.way_point.publish(msg)
         self.goal.publish(msg)
 
+        # Release only after publishing a valid replacement goal, so stale planner
+        # traffic cannot slip through between the operator action and goal update.
+        with self._lock:
+            if self._operator_stop_latched:
+                self._operator_stop_latched = False
+                self._teleop_active = False
+
     def _cancel_goal(self) -> None:
         self.stop_movement.publish(Bool(data=True))
         # NOTE: this NaN goal is more of a safety fallback.
@@ -111,6 +124,8 @@ class MovementManager(Module):
 
     def _on_nav(self, msg: Twist) -> None:
         with self._lock:
+            if self.config.control_mode == "manual_only" or self._operator_stop_latched:
+                return
             if self._teleop_active:
                 # check if cooldown has expired
                 elapsed = time.monotonic() - self._last_teleop_time
@@ -123,6 +138,8 @@ class MovementManager(Module):
         with self._lock:
             self._teleop_active = True
             self._last_teleop_time = time.monotonic()
+            if self.config.latch_teleop_stop and self._is_zero_twist(msg):
+                self._operator_stop_latched = True
 
         self._cancel_goal()
 
@@ -140,3 +157,17 @@ class MovementManager(Module):
             ),
         )
         self.cmd_vel.publish(scaled)
+
+    @staticmethod
+    def _is_zero_twist(msg: Twist) -> bool:
+        return all(
+            value == 0.0
+            for value in (
+                msg.linear.x,
+                msg.linear.y,
+                msg.linear.z,
+                msg.angular.x,
+                msg.angular.y,
+                msg.angular.z,
+            )
+        )
