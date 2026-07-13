@@ -18,6 +18,7 @@ Pure-Python test suite with no hardware or network. Covers connect() error propa
 aes_128_key forwarding, and the UNITREE_AES_128_KEY env var via GlobalConfig.
 """
 
+import asyncio
 import json
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call
@@ -75,6 +76,40 @@ def test_connect_success_completes_setup(built_connection: Any) -> None:
     driver.datachannel.pub_sub.publish_request_new.assert_awaited_once()
 
 
+@pytest.fixture
+def connection_factory(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Create stubbed connections and always stop their loop/thread."""
+    connections: list[UnitreeWebRTCConnection] = []
+
+    def build(**connection_options: bool) -> tuple[UnitreeWebRTCConnection, MagicMock]:
+        driver = _stub_driver()
+        monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
+        connection = UnitreeWebRTCConnection(ip="10.0.0.99", **connection_options)
+        connections.append(connection)
+        return connection, driver
+
+    try:
+        yield build
+    finally:
+        for connection in connections:
+            if connection.loop.is_running():
+                connection.stop_movement()
+                connection.loop.call_soon_threadsafe(connection.loop.stop)
+            connection.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+
+def _run_on_connection_loop(
+    connection: UnitreeWebRTCConnection,
+    callback: Any,
+    *args: Any,
+) -> None:
+    async def run_callback() -> None:
+        callback(*args)
+
+    future = asyncio.run_coroutine_threadsafe(run_callback(), connection.loop)
+    future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+
 @pytest.mark.parametrize(
     ("connection_options", "expected_call"),
     [
@@ -106,26 +141,22 @@ def test_connect_success_completes_setup(built_connection: Any) -> None:
     ],
 )
 def test_move_api_toggle_sends_selected_wire_command(
-    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
     connection_options: dict[str, bool],
     expected_call: Any,
 ) -> None:
-    driver = _stub_driver()
-    monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
+    connection, driver = connection_factory(**connection_options)
     twist = Twist(
         linear=Vector3(1.5, -0.4, 0.0),
         angular=Vector3(0.0, 0.0, 0.8),
     )
 
-    connection = UnitreeWebRTCConnection(ip="10.0.0.99", **connection_options)
-    try:
-        driver.datachannel.pub_sub.publish_without_callback.reset_mock()
-        assert connection.move(twist)
-        assert driver.datachannel.pub_sub.publish_without_callback.call_args == expected_call
-    finally:
-        connection.stop_movement()
-        connection.loop.call_soon_threadsafe(connection.loop.stop)
-        connection.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+    assert connection.move(twist)
+    driver.datachannel.pub_sub.publish_without_callback.assert_called_once_with(
+        *expected_call.args,
+        **expected_call.kwargs,
+    )
 
 
 @pytest.mark.parametrize(
@@ -160,27 +191,70 @@ def test_move_api_toggle_sends_selected_wire_command(
 )
 def test_move_watchdog_sends_zero_command(
     monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
     connection_options: dict[str, bool],
     expected_call: Any,
 ) -> None:
-    driver = _stub_driver()
-    monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
-    timer = MagicMock()
-    timer_factory = MagicMock(return_value=timer)
-    monkeypatch.setattr(conn_mod.threading, "Timer", timer_factory)
+    connection, driver = connection_factory(**connection_options)
+    timer_handle = MagicMock()
+    scheduled: list[tuple[Any, tuple[Any, ...]]] = []
 
-    connection = UnitreeWebRTCConnection(ip="10.0.0.99", **connection_options)
-    try:
-        assert connection.move(Twist(linear=Vector3(x=0.4)))
-        watchdog = timer_factory.call_args.args[1]
-        driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+    def call_later(_delay: float, callback: Any, *args: Any) -> MagicMock:
+        scheduled.append((callback, args))
+        return timer_handle
 
-        watchdog()
+    monkeypatch.setattr(connection.loop, "call_later", call_later)
+    assert connection.move(Twist(linear=Vector3(x=0.4)))
+    watchdog, args = scheduled.pop()
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
 
-        assert driver.datachannel.pub_sub.publish_without_callback.call_args == expected_call
-    finally:
-        connection.loop.call_soon_threadsafe(connection.loop.stop)
-        connection.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+    _run_on_connection_loop(connection, watchdog, *args)
+
+    driver.datachannel.pub_sub.publish_without_callback.assert_called_once_with(
+        *expected_call.args,
+        **expected_call.kwargs,
+    )
+
+
+def test_stale_watchdog_cannot_stop_replacement_command(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory(velocity_api=True)
+    timer_handles = [MagicMock(), MagicMock()]
+    scheduled: list[tuple[Any, tuple[Any, ...]]] = []
+
+    def call_later(_delay: float, callback: Any, *args: Any) -> MagicMock:
+        scheduled.append((callback, args))
+        return timer_handles[len(scheduled) - 1]
+
+    monkeypatch.setattr(connection.loop, "call_later", call_later)
+    assert connection.move(Twist(linear=Vector3(x=0.2)))
+    stale_watchdog, stale_args = scheduled[0]
+    assert connection.move(Twist(linear=Vector3(x=0.4)))
+    timer_handles[0].cancel.assert_called_once_with()
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+    _run_on_connection_loop(connection, stale_watchdog, *stale_args)
+
+    driver.datachannel.pub_sub.publish_without_callback.assert_not_called()
+    assert connection.stop_timer is timer_handles[1]
+
+
+def test_duration_refreshes_watchdog_until_final_zero(connection_factory: Any) -> None:
+    connection, driver = connection_factory(velocity_api=True)
+    connection.cmd_vel_timeout = 0.1
+    expected_stop = json.dumps({"x": 0.0, "y": 0.0, "z": 0.0})
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+    assert connection.move(Twist(linear=Vector3(x=0.2)), duration=0.25)
+
+    parameters = [
+        mock_call.kwargs["data"]["parameter"]
+        for mock_call in driver.datachannel.pub_sub.publish_without_callback.call_args_list
+    ]
+    assert parameters[-1] == expected_stop
+    assert parameters.count(expected_stop) == 1
 
 
 @pytest.fixture

@@ -108,7 +108,8 @@ class UnitreeWebRTCConnection(Resource):
     ) -> None:
         self.ip = ip
         self.mode = mode
-        self.stop_timer: threading.Timer | None = None
+        self.stop_timer: asyncio.TimerHandle | None = None
+        self._movement_generation = 0
         self.cmd_vel_timeout = 0.2
         self._velocity_api = velocity_api
         self._move_ids = SequentialIds()
@@ -150,14 +151,10 @@ class UnitreeWebRTCConnection(Resource):
         pass
 
     def stop(self) -> None:
-        # Cancel timer
-        if self.stop_timer:
-            self.stop_timer.cancel()
-            self.stop_timer = None
+        self.stop_movement()
 
         async def async_disconnect() -> None:
             try:
-                self._publish_movement(0, 0, 0)
                 await self.conn.disconnect()
             except Exception:
                 pass
@@ -206,6 +203,7 @@ class UnitreeWebRTCConnection(Resource):
 
         async def async_move() -> None:
             self._publish_movement(x, y, yaw)
+            self._arm_movement_watchdog()
 
         async def async_move_duration() -> None:
             """Send movement commands continuously for the specified duration."""
@@ -215,15 +213,6 @@ class UnitreeWebRTCConnection(Resource):
             while time.time() - start_time < duration:
                 await async_move()
                 await asyncio.sleep(sleep_time)
-
-        # Cancel existing timer and start a new one
-        if self.stop_timer:
-            self.stop_timer.cancel()
-
-        # Auto-stop after the configured timeout if no new commands arrive.
-        self.stop_timer = threading.Timer(self.cmd_vel_timeout, self.stop_movement)
-        self.stop_timer.daemon = True
-        self.stop_timer.start()
 
         try:
             if duration > 0:
@@ -472,22 +461,15 @@ class UnitreeWebRTCConnection(Resource):
 
     def stop_movement(self) -> None:
         """Cancel the watchdog and publish zero velocity on the active wire API."""
-        if self.stop_timer:
-            self.stop_timer.cancel()
-            self.stop_timer = None
-
-        def publish_stop() -> None:
-            self._publish_movement(0.0, 0.0, 0.0)
-
         if threading.current_thread() is self.thread:
-            publish_stop()
+            self._stop_movement_on_loop()
             return
         if not self.loop.is_running():
             logger.warning("Cannot send movement stop: WebRTC event loop is not running")
             return
 
         async def async_stop() -> None:
-            publish_stop()
+            self._stop_movement_on_loop()
 
         try:
             future = asyncio.run_coroutine_threadsafe(async_stop(), self.loop)
@@ -495,12 +477,37 @@ class UnitreeWebRTCConnection(Resource):
         except Exception as e:
             logger.warning("Failed to send movement stop: %s", e)
 
-    def disconnect(self) -> None:
-        """Disconnect from the robot and clean up resources."""
-        # Cancel timer
+    def _cancel_movement_watchdog(self) -> None:
+        """Invalidate the current watchdog. Must run on the WebRTC event loop."""
+        self._movement_generation += 1
         if self.stop_timer:
             self.stop_timer.cancel()
             self.stop_timer = None
+
+    def _arm_movement_watchdog(self) -> None:
+        """Refresh the command-scoped watchdog on the WebRTC event loop."""
+        self._cancel_movement_watchdog()
+        generation = self._movement_generation
+        self.stop_timer = self.loop.call_later(
+            self.cmd_vel_timeout,
+            self._movement_watchdog_expired,
+            generation,
+        )
+
+    def _movement_watchdog_expired(self, generation: int) -> None:
+        """Stop only if this callback still owns the active command generation."""
+        if generation != self._movement_generation:
+            return
+        self._stop_movement_on_loop()
+
+    def _stop_movement_on_loop(self) -> None:
+        """Invalidate the active watchdog and publish zero velocity."""
+        self._cancel_movement_watchdog()
+        self._publish_movement(0.0, 0.0, 0.0)
+
+    def disconnect(self) -> None:
+        """Disconnect from the robot and clean up resources."""
+        self.stop_movement()
 
         if hasattr(self, "conn"):
 
