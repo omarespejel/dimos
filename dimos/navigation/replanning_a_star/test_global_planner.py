@@ -12,84 +12,155 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from threading import Event, RLock
-from unittest.mock import MagicMock, call, patch
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from typing import Any, cast
+from unittest.mock import MagicMock, call
 
+import pytest
+from pytest_mock import MockerFixture
+
+from dimos.core.global_config import GlobalConfig
+from dimos.navigation.replanning_a_star import global_planner as planner_module
 from dimos.navigation.replanning_a_star.global_planner import GlobalPlanner
 
 
-def _planner_without_dependencies() -> GlobalPlanner:
-    planner = object.__new__(GlobalPlanner)
-    planner._lock = RLock()
-    planner._stop_planner = Event()
-    planner._current_odom = None
-    planner._current_goal = None
-    return planner
+@pytest.fixture()
+def planner(mocker: MockerFixture) -> GlobalPlanner:
+    mocker.patch.object(planner_module, "NavigationMap", autospec=True)
+    mocker.patch.object(planner_module, "LocalPlanner", autospec=True)
+    mocker.patch.object(planner_module, "PositionTracker", autospec=True)
+    mocker.patch.object(planner_module, "ReplanLimiter", autospec=True)
+    return GlobalPlanner(GlobalConfig())
 
 
-def test_replan_without_active_goal_is_noop() -> None:
-    planner = _planner_without_dependencies()
+def test_replan_without_active_goal_is_noop(planner: GlobalPlanner) -> None:
     planner._current_odom = MagicMock()
-    planner._replan_limiter = MagicMock()
 
     planner._replan_path()
 
-    planner._replan_limiter.get_attempt.assert_not_called()
+    cast("MagicMock", planner._replan_limiter.get_attempt).assert_not_called()
 
 
-def test_plan_path_cancelled_before_snapshot_is_noop() -> None:
-    planner = _planner_without_dependencies()
+def test_plan_path_cancelled_before_snapshot_is_noop(
+    planner: GlobalPlanner, mocker: MockerFixture
+) -> None:
     planner._current_odom = MagicMock()
+    cancel_goal = mocker.patch.object(planner, "cancel_goal")
+    find_safe_goal = mocker.patch.object(planner, "_find_safe_goal")
 
-    with (
-        patch.object(planner, "cancel_goal") as cancel_goal,
-        patch.object(planner, "_find_safe_goal") as find_safe_goal,
-    ):
-        planner._plan_path()
+    planner._plan_path()
 
     cancel_goal.assert_called_once_with(but_will_try_again=True)
     find_safe_goal.assert_not_called()
 
 
-def test_plan_path_during_shutdown_does_not_cancel_again() -> None:
-    planner = _planner_without_dependencies()
+def test_plan_path_during_shutdown_does_not_cancel_again(
+    planner: GlobalPlanner, mocker: MockerFixture
+) -> None:
     planner._stop_planner.set()
+    cancel_goal = mocker.patch.object(planner, "cancel_goal")
 
-    with patch.object(planner, "cancel_goal") as cancel_goal:
-        planner._plan_path()
+    planner._plan_path()
 
     cancel_goal.assert_not_called()
 
 
-def test_plan_path_discards_result_if_goal_is_cancelled_while_planning() -> None:
-    planner = _planner_without_dependencies()
+def test_plan_path_discards_result_if_goal_is_cancelled_while_planning(
+    planner: GlobalPlanner, mocker: MockerFixture
+) -> None:
     planner._current_odom = MagicMock()
     planner._current_goal = MagicMock()
     planner.path = MagicMock()
-    planner._local_planner = MagicMock()
+    mocker.patch.object(planner, "cancel_goal")
+    mocker.patch.object(planner, "_find_safe_goal", return_value=MagicMock())
 
-    def cancel_while_planning(*_args: object) -> MagicMock:
+    def cancel_while_planning(*_args: Any) -> MagicMock:
         planner._current_goal = None
         return MagicMock()
 
-    with (
-        patch.object(planner, "cancel_goal"),
-        patch.object(planner, "_find_safe_goal", return_value=MagicMock()),
-        patch.object(planner, "_find_wide_path", side_effect=cancel_while_planning),
-        patch(
-            "dimos.navigation.replanning_a_star.global_planner.smooth_resample_path",
-            return_value=MagicMock(),
-        ),
-    ):
-        planner._plan_path()
+    mocker.patch.object(planner, "_find_wide_path", side_effect=cancel_while_planning)
+    mocker.patch.object(planner_module, "smooth_resample_path", return_value=MagicMock())
+
+    planner._plan_path()
 
     planner.path.on_next.assert_not_called()
-    planner._local_planner.start_planning.assert_not_called()
+    cast("MagicMock", planner._local_planner.start_planning).assert_not_called()
 
 
-def test_stopped_navigating_is_ignored_during_shutdown() -> None:
-    planner = _planner_without_dependencies()
-    planner._replan_event = Event()
+def test_plan_path_discards_result_cancelled_by_path_subscriber(
+    planner: GlobalPlanner, mocker: MockerFixture
+) -> None:
+    planner._current_odom = MagicMock()
+    planner._current_goal = MagicMock()
+    resampled_path = MagicMock()
+    planner.path = MagicMock()
+    mocker.patch.object(planner, "_find_safe_goal", return_value=MagicMock())
+    mocker.patch.object(planner, "_find_wide_path", return_value=MagicMock())
+    mocker.patch.object(planner_module, "smooth_resample_path", return_value=resampled_path)
+
+    def cancel_on_path(path: Any) -> None:
+        if path is resampled_path:
+            planner.cancel_goal()
+
+    planner.path.on_next.side_effect = cancel_on_path
+
+    planner._plan_path()
+
+    cast("MagicMock", planner._local_planner.start_planning).assert_not_called()
+
+
+def test_cancel_cannot_finish_before_inflight_path_activation(
+    planner: GlobalPlanner, mocker: MockerFixture
+) -> None:
+    planner._current_odom = MagicMock()
+    planner._current_goal = MagicMock()
+    resampled_path = MagicMock()
+    activation_started = Event()
+    release_activation = Event()
+    cancel_started = Event()
+    cancel_finished = Event()
+    planner.path = MagicMock()
+    mocker.patch.object(planner, "_find_safe_goal", return_value=MagicMock())
+    mocker.patch.object(planner, "_find_wide_path", return_value=MagicMock())
+    mocker.patch.object(planner_module, "smooth_resample_path", return_value=resampled_path)
+
+    def pause_activation(path: Any) -> None:
+        if path is resampled_path:
+            activation_started.set()
+            release_activation.wait(timeout=1.0)
+
+    def cancel() -> None:
+        cancel_started.set()
+        planner.cancel_goal()
+        cancel_finished.set()
+
+    planner.path.on_next.side_effect = pause_activation
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        plan_future = executor.submit(planner._plan_path)
+        activation_was_reached = activation_started.wait(timeout=1.0)
+        start_planning = cast("MagicMock", planner._local_planner.start_planning)
+        stop_planning = cast("MagicMock", planner._local_planner.stop_planning)
+        start_planning.reset_mock()
+        stop_planning.reset_mock()
+        lifecycle = MagicMock()
+        lifecycle.attach_mock(start_planning, "start")
+        lifecycle.attach_mock(stop_planning, "stop")
+        cancel_future = executor.submit(cancel)
+        cancel_was_started = cancel_started.wait(timeout=1.0)
+        cancel_finished_before_release = cancel_finished.wait(timeout=0.2)
+        release_activation.set()
+        plan_future.result(timeout=1.0)
+        cancel_future.result(timeout=1.0)
+
+    assert activation_was_reached
+    assert cancel_was_started
+    assert not cancel_finished_before_release
+    assert lifecycle.mock_calls == [call.start(resampled_path), call.stop()]
+
+
+def test_stopped_navigating_is_ignored_during_shutdown(planner: GlobalPlanner) -> None:
     planner._replan_reason = None
     planner._stop_planner.set()
 
@@ -99,21 +170,23 @@ def test_stopped_navigating_is_ignored_during_shutdown() -> None:
     assert not planner._replan_event.is_set()
 
 
-def test_stop_blocks_replanning_before_stopping_local_planner() -> None:
-    planner = _planner_without_dependencies()
+def test_stop_blocks_replanning_before_stopping_local_planner(
+    planner: GlobalPlanner, mocker: MockerFixture
+) -> None:
     lifecycle = MagicMock()
-    planner._stop_planner = Event()
-    planner._replan_event = Event()
     planner._thread = None
     planner._disposables = MagicMock()
-    planner._local_planner = MagicMock()
+    cancel_goal = mocker.patch.object(planner, "cancel_goal")
 
+    def assert_monitor_stopped() -> None:
+        assert planner._stop_planner.is_set()
+        assert planner._replan_event.is_set()
+
+    planner._disposables.dispose.side_effect = assert_monitor_stopped
     lifecycle.attach_mock(planner._disposables.dispose, "dispose")
-    lifecycle.attach_mock(planner._local_planner.stop, "local_stop")
-    with patch.object(planner, "cancel_goal") as cancel_goal:
-        lifecycle.attach_mock(cancel_goal, "cancel_goal")
-        planner.stop()
+    lifecycle.attach_mock(cancel_goal, "cancel_goal")
+    lifecycle.attach_mock(cast("MagicMock", planner._local_planner.stop), "local_stop")
 
-    assert planner._stop_planner.is_set()
-    assert planner._replan_event.is_set()
+    planner.stop()
+
     assert lifecycle.mock_calls == [call.dispose(), call.cancel_goal(), call.local_stop()]

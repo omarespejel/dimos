@@ -62,6 +62,7 @@ class GlobalPlanner(Resource):
     _replan_event: Event
     _replan_reason: StopMessage | None
     _lock: RLock
+    _activation_lock: RLock
     _safe_goal_clearance: float
 
     _safe_goal_tolerance: float = 4.0
@@ -95,6 +96,7 @@ class GlobalPlanner(Resource):
         self._replan_event = Event()
         self._replan_reason = None
         self._lock = RLock()
+        self._activation_lock = RLock()
         self._reset_safe_goal_clearance()
 
     def start(self) -> None:
@@ -148,27 +150,28 @@ class GlobalPlanner(Resource):
         self._reset_safe_goal_clearance()
 
     def cancel_goal(self, *, but_will_try_again: bool = False, arrived: bool = False) -> None:
-        # return silently so we don't flood the logs.
-        with self._lock:
-            no_goal = self._current_goal is None
-        if no_goal and self._local_planner.get_state() == NavigationState.IDLE:
-            return
+        with self._activation_lock:
+            # return silently so we don't flood the logs.
+            with self._lock:
+                no_goal = self._current_goal is None
+            if no_goal and self._local_planner.get_state() == NavigationState.IDLE:
+                return
 
-        logger.info("Cancelling goal.", but_will_try_again=but_will_try_again, arrived=arrived)
+            logger.info("Cancelling goal.", but_will_try_again=but_will_try_again, arrived=arrived)
 
-        with self._lock:
-            self._position_tracker.reset_data()
+            with self._lock:
+                self._position_tracker.reset_data()
+
+                if not but_will_try_again:
+                    self._current_goal = None
+                    self._goal_reached = arrived
+                    self._replan_limiter.reset()
+
+            self.path.on_next(Path())
+            self._local_planner.stop_planning()
 
             if not but_will_try_again:
-                self._current_goal = None
-                self._goal_reached = arrived
-                self._replan_limiter.reset()
-
-        self.path.on_next(Path())
-        self._local_planner.stop_planning()
-
-        if not but_will_try_again:
-            self.goal_reached.on_next(Bool(arrived))
+                self.goal_reached.on_next(Bool(arrived))
 
     def set_replanning_enabled(self, enabled: bool) -> None:
         with self._lock:
@@ -352,15 +355,23 @@ class GlobalPlanner(Resource):
 
         resampled_path = smooth_resample_path(path, current_goal, 0.1)
 
-        with self._lock:
-            goal_is_current = self._current_goal is current_goal
-        if self._stop_planner.is_set() or not goal_is_current:
-            logger.debug("Discarding a path computed for an inactive goal.")
-            return
+        with self._activation_lock:
+            with self._lock:
+                goal_is_current = self._current_goal is current_goal
+            if self._stop_planner.is_set() or not goal_is_current:
+                logger.debug("Discarding a path computed for an inactive goal.")
+                return
 
-        self.path.on_next(resampled_path)
+            self.path.on_next(resampled_path)
 
-        self._local_planner.start_planning(resampled_path)
+            # Subject callbacks run synchronously and may cancel the goal reentrantly.
+            with self._lock:
+                goal_is_current = self._current_goal is current_goal
+            if self._stop_planner.is_set() or not goal_is_current:
+                logger.debug("Discarding a path cancelled while being published.")
+                return
+
+            self._local_planner.start_planning(resampled_path)
 
     def _find_wide_path(self, goal: Vector3, robot_pos: Vector3) -> Path | None:
         #        sizes_to_try: list[float] = [2.2, 1.7, 1.3, 1]
