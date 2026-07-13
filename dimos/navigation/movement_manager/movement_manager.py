@@ -164,3 +164,10 @@ class MovementManager(Module):
 
         with self._lock:
             self._operator_stop_latched = True
+            self._teleop_active = True
+            self._last_teleop_time = time.monotonic()
+
+        # Handle the explicit stop atomically in this module. The viewer also keeps
+        # publishing a zero Twist for consumers that do not use MovementManager.
+        self._cancel_goal()
+        self.cmd_vel.publish(Twist.zero())
