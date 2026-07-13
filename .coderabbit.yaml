@@ -1,0 +1,141 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+early_access: false
+enable_free_tier: true
+
+tone_instructions: "Be direct and technical. Prioritize correctness, lifecycle ownership, concurrency, cleanup, hardware safety, timestamps and frames, replay integrity, compatibility, and focused tests. Avoid style-only comments."
+
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  changed_files_summary: true
+  poem: false
+  review_status: true
+  review_details: true
+  commit_status: true
+  fail_commit_status: true
+  collapse_walkthrough: true
+  sequence_diagrams: false
+  estimate_code_review_effort: true
+  assess_linked_issues: true
+  related_issues: false
+  related_prs: false
+  suggested_labels: false
+  auto_apply_labels: false
+  suggested_reviewers: false
+  in_progress_fortune: false
+  enable_prompt_for_ai_agents: true
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 3
+    drafts: true
+    base_branches:
+      - main
+    ignore_title_keywords:
+      - WIP
+      - DO NOT MERGE
+      - artifact-only
+      - generated-only
+    ignore_usernames:
+      - github-actions[bot]
+      - dependabot[bot]
+      - coderabbitai[bot]
+      - qodo-code-review
+
+  path_filters:
+    - AGENTS.md
+    - .agents/**
+    - .github/**
+    - .coderabbit.yaml
+    - .pr_agent.toml
+    - dimos/**
+    - native/**
+    - docs/**
+    - examples/**
+    - experimental/**
+    - bin/**
+    - scripts/**
+    - misc/**
+    - pyproject.toml
+    - setup.py
+    - .pre-commit-config.yaml
+    - '!data/**'
+    - '!assets/**'
+    - '!uv.lock'
+    - '!dimos/robot/all_blueprints.py'
+    - '!**/*.bag'
+    - '!**/*.rrd'
+    - '!**/*.mp4'
+    - '!**/*.mov'
+    - '!**/*.zip'
+    - '!**/__pycache__/**'
+
+  path_instructions:
+    - path: "dimos/core/**"
+      instructions: |
+        Review module and worker lifecycle ownership, thread and process safety,
+        typed stream and RPC boundaries, failure propagation, import-time work,
+        and deterministic cleanup. Flag leaked workers, subscriptions, shared
+        mutable state, broad exception handling, or shutdown paths that can hang.
+
+    - path: "dimos/protocol/**"
+      instructions: |
+        Review transport code for connection ownership, subscription cleanup,
+        backpressure, serialization compatibility, and concurrency hazards across
+        LCM, shared memory, DDS, and Zenoh. Pay special attention to reconnects,
+        partial failures, and resources that survive module shutdown.
+
+    - path: "dimos/robot/unitree/**"
+      instructions: |
+        Treat robot control as safety-sensitive. Verify command units, coordinate
+        frames, signs, velocity bounds, stop behavior, and connection states.
+        Flag hidden motion, unbounded commands, stale command reuse, unsafe replay
+        behavior, or assumptions that do not hold across supported Go2 variants.
+
+    - path: "dimos/memory2/**"
+      instructions: |
+        Review deterministic ordering and timestamps, codec and schema
+        compatibility, atomic persistence, SQLite and filesystem concurrency,
+        replay behavior, and handling of truncation or corruption. Flag silent
+        data loss, unstable serialization, unsafe paths, or unreadable old data.
+
+    - path: "dimos/visualization/rerun/**"
+      instructions: |
+        Check timeline semantics, transform parent and child frames, coordinate
+        systems, arrival time versus data time, and source reconnect lifecycle.
+        Flag sticky timelines, invalid transform trees, or viewers that retain
+        stale state after a source disconnects.
+
+    - path: "dimos/navigation/**"
+      instructions: |
+        Check frame and timestamp consistency, stale inputs, costmap semantics,
+        bounded control output, collision checks, and stop paths. Require evidence
+        for behavior described as safe or autonomous.
+
+    - path: "dimos/mapping/**"
+      instructions: |
+        Check transforms, point-cloud and voxel units, timestamp alignment,
+        destructive filtering, map persistence, and repeatability from recordings.
+        Flag filters that silently erase observations or depend on host state.
+
+    - path: "dimos/**/test_*.py"
+      instructions: |
+        Tests should be colocated with the code, assert behavior rather than only
+        execution, clean up resources through fixtures, avoid fixed sleeps, and
+        cover negative paths and lifecycle transitions where relevant.
+
+    - path: "docs/**"
+      instructions: |
+        Verify that commands are runnable, links resolve, names match the code,
+        and capability or safety claims are supported by tests or recorded proof.
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
