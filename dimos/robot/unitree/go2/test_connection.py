@@ -23,8 +23,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from reactivex.disposable import Disposable
 
 from dimos.core.global_config import GlobalConfig
+from dimos.core.module import Module
+from dimos.core.resource import CompositeResource
 from dimos.memory2.store.sqlite import SqliteStore
 from dimos.robot.unitree.go2 import connection as go2_conn
 from dimos.robot.unitree.go2.connection import ConnectionConfig, ReplayConnection
@@ -58,24 +61,49 @@ def test_connection_config_aes_key_defaults_from_global_config() -> None:
 
 def test_replay_connection_shutdown_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     store = MagicMock(spec=SqliteStore)
     replay = MagicMock()
     store.replay.return_value = replay
     store_factory = MagicMock(return_value=store)
+    replay_path = tmp_path / "replay.db"
+    resolve_db_path = MagicMock(return_value=replay_path)
     monkeypatch.setattr(go2_conn, "SqliteStore", store_factory)
-    monkeypatch.setattr(
-        go2_conn,
-        "resolve_db_path",
-        MagicMock(return_value=Path("/tmp/replay.db")),
-    )
+    monkeypatch.setattr(go2_conn, "resolve_db_path", resolve_db_path)
     connection = ReplayConnection(dataset="recording")
 
-    assert connection.replay is replay
+    resolved_replay = connection.replay
     connection.stop()
     connection.stop()
     connection.disconnect()
 
-    store_factory.assert_called_once_with(path="/tmp/replay.db", must_exist=True)
+    assert resolved_replay is replay
+    resolve_db_path.assert_called_once_with("recording")
+    store_factory.assert_called_once_with(path=str(replay_path), must_exist=True)
     store.start.assert_called_once_with()
     store.dispose.assert_called_once_with()
+
+
+def test_go2_replay_shutdown_disposes_subscriptions_before_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    connection = ReplayConnection(dataset="recording")
+    monkeypatch.setattr(
+        connection,
+        "stop",
+        MagicMock(side_effect=lambda: events.append("store")),
+    )
+    module = object.__new__(go2_conn.GO2Connection)
+    module.connection = connection
+    module._camera_info_thread = None
+    module._camera_info_stop_event = MagicMock()
+    module._disposables = None
+    module.register_disposable(Disposable(lambda: events.append("subscriptions")))
+    monkeypatch.setattr(Module, "stop", CompositeResource.stop)
+
+    module.stop()
+
+    assert events == ["subscriptions", "store"]
+    module._camera_info_stop_event.set.assert_called_once_with()
