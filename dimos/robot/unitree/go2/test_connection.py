@@ -31,6 +31,7 @@ from reactivex.disposable import Disposable
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.global_config import GlobalConfig
 from dimos.memory2.store.sqlite import SqliteStore
+from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.robot.unitree.go2 import connection as go2_conn
 from dimos.robot.unitree.go2.connection import (
     ConnectionConfig,
@@ -144,6 +145,59 @@ def test_go2_live_shutdown_disposes_subscriptions_before_connection(
     assert events == ["subscriptions", "connection"]
     assert module._camera_info_stop_event.is_set()
     connection.stop.assert_called_once_with()
+
+
+def test_go2_shutdown_disposes_subscriptions_before_liedown(
+    make_go2_module: Callable[[Go2ConnectionProtocol], GO2Connection],
+) -> None:
+    events: list[str] = []
+    connection = MagicMock(spec=Go2ConnectionProtocol)
+    connection.liedown.side_effect = lambda: events.append("liedown")
+    connection.stop.side_effect = lambda: events.append("connection")
+    module = make_go2_module(connection)
+    module.register_disposable(Disposable(lambda: events.append("subscriptions")))
+
+    module.stop()
+
+    assert events == ["subscriptions", "liedown", "connection"]
+
+
+def test_go2_shutdown_serializes_inflight_move_before_liedown(
+    make_go2_module: Callable[[Go2ConnectionProtocol], GO2Connection],
+) -> None:
+    move_started = Event()
+    release_move = Event()
+    events: list[str] = []
+    connection = MagicMock(spec=Go2ConnectionProtocol)
+
+    def move(_twist: object, _duration: float) -> bool:
+        move_started.set()
+        assert release_move.wait(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        events.append("move")
+        return True
+
+    connection.move.side_effect = move
+    connection.liedown.side_effect = lambda: events.append("liedown")
+    connection.stop.side_effect = lambda: events.append("connection")
+    module = make_go2_module(connection)
+    move_thread = Thread(target=lambda: module.move(Twist.zero()))
+    move_thread.start()
+    assert move_started.wait(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+    stop_thread = Thread(target=module.stop)
+    stop_thread.start()
+    assert module._stopping.wait(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+    assert module.move(Twist.zero()) is False
+    assert not connection.liedown.called
+    release_move.set()
+    move_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+    stop_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+    assert not move_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert connection.move.call_count == 1
+    assert events == ["move", "liedown", "connection"]
 
 
 def test_go2_shutdown_stops_camera_info_thread(

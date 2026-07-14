@@ -15,7 +15,7 @@
 from enum import Enum
 from importlib import resources
 import sys
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 import time
 from typing import Any, Protocol
 
@@ -260,6 +260,8 @@ class GO2Connection(Module, Camera, Pointcloud):
     camera_info_static: CameraInfo = _camera_info_static()
     _camera_info_thread: Thread | None = None
     _camera_info_stop_event: Event
+    _motion_lock: RLock
+    _stopping: Event
     _latest_video_frame: Image | None = None
     _latest_lowstate: LowStateMsg | None = None
 
@@ -276,6 +278,8 @@ class GO2Connection(Module, Camera, Pointcloud):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._camera_info_stop_event = Event()
+        self._motion_lock = RLock()
+        self._stopping = Event()
         self.connection = make_connection(
             self.config.ip,
             self.config.g,
@@ -288,6 +292,7 @@ class GO2Connection(Module, Camera, Pointcloud):
 
     @rpc
     def start(self) -> None:
+        self._stopping.clear()
         super().start()
         if not hasattr(self, "connection"):
             return
@@ -326,20 +331,20 @@ class GO2Connection(Module, Camera, Pointcloud):
 
     @rpc
     def stop(self) -> None:
-        try:
-            self.liedown()
-        finally:
-            self._camera_info_stop_event.set()
-            if self._camera_info_thread and self._camera_info_thread.is_alive():
-                self._camera_info_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        self._stopping.set()
+        self._camera_info_stop_event.set()
+        if self._camera_info_thread and self._camera_info_thread.is_alive():
+            self._camera_info_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
 
+        try:
             try:
-                # Stream subscriptions may still own scheduled reads or callbacks
-                # against the connection. Dispose them before closing either the
-                # replay store or the live transport.
+                # Quiesce cmd_vel and sensor callbacks before changing posture.
+                # The Unitree transport remains alive until connection.stop().
                 super().stop()
             finally:
-                self.connection.stop()
+                self.liedown()
+        finally:
+            self.connection.stop()
 
     @classmethod
     def _odom_to_tf(cls, odom: PoseStamped) -> list[Transform]:
@@ -380,7 +385,12 @@ class GO2Connection(Module, Camera, Pointcloud):
     @rpc
     def move(self, twist: Twist, duration: float = 0.0) -> bool:
         """Send movement command to robot."""
-        return self.connection.move(twist, duration)
+        if self._stopping.is_set():
+            return False
+        with self._motion_lock:
+            if self._stopping.is_set():
+                return False
+            return self.connection.move(twist, duration)
 
     @rpc
     def standup(self) -> bool:
@@ -390,7 +400,8 @@ class GO2Connection(Module, Camera, Pointcloud):
     @rpc
     def liedown(self) -> bool:
         """Make the robot lie down."""
-        return self.connection.liedown()
+        with self._motion_lock:
+            return self.connection.liedown()
 
     @rpc
     def balance_stand(self) -> bool:
