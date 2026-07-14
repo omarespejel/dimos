@@ -17,7 +17,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Generator
+from collections.abc import Coroutine, Generator
+from concurrent.futures import Future
 import json
 import threading
 import time
@@ -107,14 +108,18 @@ class MockViewerPublisher:
 def server(wait_for_server: Any) -> Generator[RerunWebSocketServer, None, None]:
     original_port = global_config.rerun_websocket_server_port
     global_config.update(rerun_websocket_server_port=_TEST_PORT)
+    module: RerunWebSocketServer | None = None
     try:
         module = RerunWebSocketServer()
         module.start()
         wait_for_server(_TEST_PORT)
         yield module  # type: ignore[misc]
-        module.stop()
     finally:
-        global_config.update(rerun_websocket_server_port=original_port)
+        try:
+            if module is not None:
+                module.stop()
+        finally:
+            global_config.update(rerun_websocket_server_port=original_port)
 
 
 @pytest.fixture()
@@ -126,7 +131,7 @@ def publisher(server: RerunWebSocketServer) -> Generator[MockViewerPublisher, No
 def test_click_publishes_point_stamped(
     server: RerunWebSocketServer, publisher: MockViewerPublisher
 ) -> None:
-    """Click event arrives as PointStamped with correct coords, frame_id, and timestamp."""
+    """Click coordinates use the planning frame, never the picked entity path."""
     received: list[PointStamped] = []
     done = threading.Event()
 
@@ -146,7 +151,7 @@ def test_click_publishes_point_stamped(
     assert point.x == pytest.approx(1.5)
     assert point.y == pytest.approx(2.5)
     assert point.z == pytest.approx(0.0)
-    assert point.frame_id == "/robot/base"
+    assert point.frame_id == "map"
     assert point.ts == pytest.approx(5.0)
 
 
@@ -298,3 +303,65 @@ def test_mixed_message_sequence(
     assert received[0].x == pytest.approx(7.0)
     assert received[0].y == pytest.approx(8.0)
     assert received[0].z == pytest.approx(9.0)
+
+
+def test_start_propagates_serve_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = RerunWebSocketServer()
+    failed_future: Future[None] = Future()
+    failed_future.set_exception(OSError("bind failed"))
+
+    def schedule(
+        coroutine: Coroutine[Any, Any, None], _loop: asyncio.AbstractEventLoop
+    ) -> Future[None]:
+        coroutine.close()
+        return failed_future
+
+    def never_ready(timeout: float | None = None) -> bool:
+        del timeout
+        return False
+
+    module._server_ready.set()
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", schedule)
+    monkeypatch.setattr(module._server_ready, "wait", never_ready)
+    try:
+        with pytest.raises(OSError, match="bind failed"):
+            module.start()
+        assert not module._server_ready.is_set()
+        assert module._loop is None
+        assert module._loop_thread is None
+    finally:
+        module.stop()
+
+
+def test_start_cancels_serve_future_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = RerunWebSocketServer()
+    pending_future: Future[None] = Future()
+
+    def schedule(
+        coroutine: Coroutine[Any, Any, None], _loop: asyncio.AbstractEventLoop
+    ) -> Future[None]:
+        coroutine.close()
+        return pending_future
+
+    def never_ready(timeout: float | None = None) -> bool:
+        del timeout
+        return False
+
+    monotonic_calls = 0
+
+    def monotonic() -> float:
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        return 0.0 if monotonic_calls == 1 else 3.0
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", schedule)
+    monkeypatch.setattr(module._server_ready, "wait", never_ready)
+    monkeypatch.setattr(time, "monotonic", monotonic)
+    try:
+        with pytest.raises(TimeoutError, match="did not become ready"):
+            module.start()
+        assert pending_future.cancelled()
+        assert module._loop is None
+        assert module._loop_thread is None
+    finally:
+        module.stop()

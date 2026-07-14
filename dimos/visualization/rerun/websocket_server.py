@@ -19,6 +19,7 @@ from concurrent.futures import Future
 import json
 import logging
 import threading
+import time
 from typing import Any, Literal, TypedDict, Union
 
 from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
@@ -35,6 +36,8 @@ from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
+
+RERUN_CLICK_FRAME_ID = "map"
 
 
 class ClickMsg(TypedDict):
@@ -103,8 +106,31 @@ class RerunWebSocketServer(Module):
     def start(self) -> None:
         super().start()
         assert self._loop is not None
-        self._serve_future = asyncio.run_coroutine_threadsafe(self._serve(), self._loop)
-        self._server_ready.wait()
+        self._server_ready.clear()
+        try:
+            self._serve_future = asyncio.run_coroutine_threadsafe(self._serve(), self._loop)
+            deadline = time.monotonic() + DEFAULT_THREAD_JOIN_TIMEOUT
+            while not self._server_ready.wait(
+                timeout=min(0.05, max(0.0, deadline - time.monotonic()))
+            ):
+                if self._serve_future.done():
+                    self._serve_future.result()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("WebSocket server did not become ready")
+        except BaseException:
+            future = self._serve_future
+            if future is not None and not future.done():
+                future.cancel()
+                if threading.current_thread() is not self._loop_thread:
+                    try:
+                        future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+                    except BaseException:
+                        pass
+            try:
+                super().stop()
+            except BaseException:
+                logger.exception("Failed to tear down WebSocket server after startup error")
+            raise
 
     @rpc
     def stop(self) -> None:
@@ -185,7 +211,10 @@ class RerunWebSocketServer(Module):
                     y=float(msg.get("y", 0)),
                     z=float(msg.get("z", 0)),
                     ts=float(msg.get("timestamp_ms", 0)) / 1000.0,
-                    frame_id=str(msg.get("entity_path", "")),
+                    # entity_path identifies the picked Rerun entity, not a
+                    # coordinate frame. The current navigation-view contract
+                    # interprets the viewer's world-space pick as map space.
+                    frame_id=RERUN_CLICK_FRAME_ID,
                 )
             )
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 import math
+import threading
 import time
 from typing import Any
 
@@ -272,23 +273,24 @@ def test_latched_stop_accepts_missing_timestamp(
     assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
 
 
-def test_latched_stop_accepts_newer_click_on_different_viewer_entity(
+def test_latched_stop_rejects_goal_from_mismatched_coordinate_frame(
     manager_and_captured: tuple[MovementManager, Captured],
 ) -> None:
     manager, captured = manager_and_captured
     manager.config.latch_teleop_stop = True
     manager.config.tele_cooldown_sec = 0.0
 
-    # dimos-viewer reports the selected Rerun entity path, not a coordinate
-    # frame. A new click can therefore have a different path while still being
-    # a valid, newer operator action in the same spatial view.
-    manager._on_click(_click(ts=100.0, frame_id="world/global_map"))
+    manager._on_click(_click(ts=100.0, frame_id="map"))
     manager._on_teleop_stop(Bool(data=True))
+    goal_count = len(captured.goal)
+    way_point_count = len(captured.way_point)
     manager._on_click(_click(x=3.0, ts=101.0, frame_id="world/lidar"))
     manager._on_nav(_twist(lx=0.9))
 
-    assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
-    assert not manager._operator_stop_latched
+    assert len(captured.goal) == goal_count
+    assert len(captured.way_point) == way_point_count
+    assert captured.cmd_vel == [_twist()]
+    assert manager._operator_stop_latched
 
 
 def test_reentrant_stop_wins_over_replacement_goal(
@@ -406,6 +408,115 @@ def test_stop_clears_operator_stop_latch(
     assert not manager._operator_stop_latched
 
 
+def test_stop_zero_is_final_and_suppresses_waiting_callback(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
+    manager, captured = manager_and_captured
+    manager._on_teleop(_twist(lx=0.3))
+    zero_publish_entered = threading.Event()
+    release_zero_publish = threading.Event()
+    waiting_callback_started = threading.Event()
+    waiting_callback_returned = threading.Event()
+
+    def block_final_zero(twist: Twist) -> None:
+        if twist.is_zero():
+            zero_publish_entered.set()
+            assert release_zero_publish.wait(timeout=2.0)
+
+    unsubscribe = manager.cmd_vel.subscribe(block_final_zero)
+    stop_thread = threading.Thread(target=manager.stop)
+
+    def publish_waiting_teleop() -> None:
+        waiting_callback_started.set()
+        manager._on_teleop(_twist(lx=0.7))
+        waiting_callback_returned.set()
+
+    waiting_callback = threading.Thread(target=publish_waiting_teleop)
+    try:
+        stop_thread.start()
+        assert zero_publish_entered.wait(timeout=2.0)
+        waiting_callback.start()
+        assert waiting_callback_started.wait(timeout=2.0)
+        assert not waiting_callback_returned.is_set()
+        release_zero_publish.set()
+        stop_thread.join(timeout=2.0)
+        waiting_callback.join(timeout=2.0)
+    finally:
+        release_zero_publish.set()
+        stop_thread.join(timeout=2.0)
+        waiting_callback.join(timeout=2.0)
+        unsubscribe()
+
+    manager._on_nav(_twist(lx=0.9))
+    manager._on_click(_click(x=3.0))
+    manager._on_teleop_stop(Bool(data=True))
+
+    assert not stop_thread.is_alive()
+    assert not waiting_callback.is_alive()
+    assert captured.cmd_vel == [_twist(lx=0.3), _twist()]
+    assert captured.cmd_vel[-1].is_zero()
+
+
+def test_cancel_goal_uses_configured_planning_frame() -> None:
+    manager = MovementManager(planning_frame_id="/world")
+    captured, unsubs = _attach(manager)
+    try:
+        manager._cancel_goal()
+    finally:
+        for unsub in unsubs:
+            unsub()
+        manager._close_module()
+
+    assert captured.goal[-1].frame_id == "world"
+    assert captured.way_point[-1].frame_id == "world"
+
+
+@pytest.mark.parametrize(
+    ("linear", "angular"),
+    [
+        (Vector3(float("nan"), 0, 0), Vector3()),
+        (Vector3(0, float("nan"), 0), Vector3()),
+        (Vector3(0, 0, float("nan")), Vector3()),
+        (Vector3(), Vector3(float("inf"), 0, 0)),
+        (Vector3(), Vector3(0, float("inf"), 0)),
+        (Vector3(), Vector3(0, 0, float("inf"))),
+        (Vector3(1.01, 0, 0), Vector3()),
+        (Vector3(0, -1.01, 0), Vector3()),
+        (Vector3(0, 0, 1.01), Vector3()),
+        (Vector3(), Vector3(2.01, 0, 0)),
+        (Vector3(), Vector3(0, -2.01, 0)),
+        (Vector3(), Vector3(0, 0, 2.01)),
+    ],
+)
+def test_invalid_or_out_of_range_teleop_is_rejected_before_state_change(
+    manager_and_captured: tuple[MovementManager, Captured],
+    linear: Vector3,
+    angular: Vector3,
+) -> None:
+    manager, captured = manager_and_captured
+
+    manager._on_teleop(Twist(linear, angular))
+
+    assert captured.cmd_vel == [_twist()]
+    assert captured.stop_movement == []
+    assert captured.goal == []
+    assert not manager._teleop_active
+    assert manager._last_teleop_time == 0.0
+
+
+def test_teleop_rejects_scaled_output_above_configured_limit(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
+    manager, captured = manager_and_captured
+    manager.config.tele_cmd_vel_scaling = Twist(Vector3(2, 1, 1), Vector3(1, 1, 1))
+
+    manager._on_teleop(_twist(lx=0.6))
+
+    assert captured.cmd_vel == [_twist()]
+    assert not manager._teleop_active
+    assert manager._last_teleop_time == 0.0
+
+
 def test_valid_click_publishes_goal(
     manager_and_captured: tuple[MovementManager, Captured],
 ) -> None:
@@ -438,6 +549,7 @@ def test_tele_cmd_vel_scaling(
     manager, captured = manager_and_captured
     scaling = Twist(Vector3(0.5, 2.0, 0.0), Vector3(1.0, 1.0, 0.25))
     manager.config.tele_cmd_vel_scaling = scaling
+    manager.config.max_teleop_linear_speed = 2.0
     manager.config.tele_cooldown_sec = 10.0
 
     manager._on_teleop(Twist(Vector3(1, 1, 1), Vector3(1, 1, 1)))
