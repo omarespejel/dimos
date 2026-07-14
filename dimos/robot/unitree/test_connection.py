@@ -20,6 +20,7 @@ aes_128_key forwarding, and the UNITREE_AES_128_KEY env var via GlobalConfig.
 
 import asyncio
 import json
+import threading
 from threading import Event
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call
@@ -94,7 +95,8 @@ def connection_factory(monkeypatch: pytest.MonkeyPatch) -> Any:
         yield build
     finally:
         for connection in connections:
-            connection.stop()
+            if not connection._stop_complete.is_set():
+                connection.stop()
             assert not connection.thread.is_alive()
 
 
@@ -329,6 +331,7 @@ def test_stop_waits_for_disconnect_before_stopping_loop(
     assert events == ["disconnect", "loop_stop"]
     driver.disconnect.assert_awaited_once_with()
     assert not connection.thread.is_alive()
+    assert connection.loop.is_closed()
 
 
 def test_stop_from_connection_loop_disconnects_before_stopping(
@@ -348,6 +351,7 @@ def test_stop_from_connection_loop_disconnects_before_stopping(
     assert disconnected.is_set()
     driver.disconnect.assert_awaited_once_with()
     assert not connection.thread.is_alive()
+    assert connection.loop.is_closed()
 
 
 def test_stop_logs_disconnect_failure_and_still_stops_loop(
@@ -364,6 +368,7 @@ def test_stop_logs_disconnect_failure_and_still_stops_loop(
 
     warning.assert_any_call("Failed to disconnect Unitree WebRTC connection: %s", error)
     assert not connection.thread.is_alive()
+    assert connection.loop.is_closed()
 
 
 def test_stop_disconnects_when_loop_stopped_unexpectedly(
@@ -378,6 +383,192 @@ def test_stop_disconnects_when_loop_stopped_unexpectedly(
 
     driver.disconnect.assert_awaited_once_with()
     assert not connection.thread.is_alive()
+    assert connection.loop.is_closed()
+
+
+def test_timed_out_disconnect_is_cancelled_and_drained_before_loop_close(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory()
+    disconnect_started = threading.Event()
+    disconnect_cancelled = threading.Event()
+
+    async def disconnect() -> None:
+        disconnect_started.set()
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            await asyncio.sleep(0.02)
+            disconnect_cancelled.set()
+
+    monkeypatch.setattr(conn_mod, "DEFAULT_THREAD_JOIN_TIMEOUT", 0.05)
+    driver.disconnect.side_effect = disconnect
+
+    connection.stop()
+
+    assert disconnect_started.is_set()
+    assert disconnect_cancelled.is_set()
+    driver.disconnect.assert_awaited_once_with()
+    assert not connection.thread.is_alive()
+    assert connection.loop.is_closed()
+    assert not asyncio.all_tasks(connection.loop)
+
+
+def test_disconnect_cleanup_timeout_is_reported_before_eventual_loop_close(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory()
+    cleanup_done = threading.Event()
+
+    async def disconnect() -> None:
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            await asyncio.sleep(0.15)
+            cleanup_done.set()
+
+    monkeypatch.setattr(conn_mod, "DEFAULT_THREAD_JOIN_TIMEOUT", 0.03)
+    driver.disconnect.side_effect = disconnect
+
+    with pytest.raises(TimeoutError, match="draining Unitree WebRTC disconnect"):
+        connection.stop()
+
+    assert connection._stop_complete.is_set()
+    assert connection.thread.is_alive()
+    assert not connection.loop.is_closed()
+
+    assert cleanup_done.wait(timeout=1.0)
+    connection.thread.join(timeout=1.0)
+    assert not connection.thread.is_alive()
+    assert connection.loop.is_closed()
+
+    with pytest.raises(TimeoutError, match="draining Unitree WebRTC disconnect"):
+        connection.stop()
+
+
+def test_concurrent_stop_callers_share_one_shutdown_result(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory()
+    movement_error = RuntimeError("data channel unavailable")
+    movement_stop_entered = threading.Event()
+    release_movement_stop = threading.Event()
+    waiter_entered = threading.Event()
+    stop_movement_calls = 0
+    errors: list[Exception] = []
+    finish_threads: list[int | None] = []
+
+    def stop_movement() -> None:
+        nonlocal stop_movement_calls
+        stop_movement_calls += 1
+        movement_stop_entered.set()
+        assert release_movement_stop.wait(timeout=2.0)
+        raise movement_error
+
+    original_wait_for_stop = connection._wait_for_stop
+
+    def wait_for_stop() -> None:
+        waiter_entered.set()
+        original_wait_for_stop()
+
+    def call_stop() -> None:
+        try:
+            connection.stop()
+        except Exception as e:
+            errors.append(e)
+
+    original_finish_stop = connection._finish_stop
+
+    def finish_stop(error: Exception | None = None) -> None:
+        finish_threads.append(threading.current_thread().ident)
+        original_finish_stop(error)
+
+    monkeypatch.setattr(connection, "stop_movement", stop_movement)
+    monkeypatch.setattr(connection, "_wait_for_stop", wait_for_stop)
+    monkeypatch.setattr(connection, "_finish_stop", finish_stop)
+    owner = threading.Thread(target=call_stop)
+    waiter = threading.Thread(target=call_stop)
+    owner.start()
+    assert movement_stop_entered.wait(timeout=2.0)
+    waiter.start()
+    assert waiter_entered.wait(timeout=2.0)
+    release_movement_stop.set()
+    owner.join(timeout=2.0)
+    waiter.join(timeout=2.0)
+
+    assert not owner.is_alive()
+    assert not waiter.is_alive()
+    assert stop_movement_calls == 1
+    assert len(errors) == 2
+    assert all(error is movement_error for error in errors)
+    assert finish_threads == [owner.ident]
+    driver.disconnect.assert_awaited_once_with()
+    assert not connection.thread.is_alive()
+    assert connection.loop.is_closed()
+
+    with pytest.raises(RuntimeError, match="data channel unavailable") as repeated:
+        connection.stop()
+    assert repeated.value is movement_error
+
+
+def test_stop_waits_for_zero_retry_before_failed_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory(velocity_api=True)
+    movement_error = RuntimeError("data channel unavailable")
+    disconnect_error = RuntimeError("peer did not close")
+    events: list[str] = []
+    zero_attempts = 0
+    timer_handles = [MagicMock(), MagicMock()]
+    scheduled: list[tuple[Any, tuple[Any, ...]]] = []
+
+    def call_later(_delay: float, callback: Any, *args: Any) -> MagicMock:
+        scheduled.append((callback, args))
+        return timer_handles[len(scheduled) - 1]
+
+    def publish_movement(_topic: str, *, data: dict[str, Any], **_kwargs: Any) -> None:
+        nonlocal zero_attempts
+        movement = json.loads(data["parameter"])
+        if movement["x"] != 0.0:
+            events.append("move")
+            return
+        zero_attempts += 1
+        events.append("zero-failed" if zero_attempts == 1 else "zero-retry")
+        if zero_attempts == 1:
+            raise movement_error
+
+    async def disconnect() -> None:
+        events.append("disconnect")
+        raise disconnect_error
+
+    async def run_retry() -> None:
+        retry, retry_args = scheduled[1]
+        retry(*retry_args)
+
+    monkeypatch.setattr(connection.loop, "call_later", call_later)
+    monkeypatch.setattr(connection._movement_stopped_event, "wait", run_retry)
+    driver.datachannel.pub_sub.publish_without_callback.side_effect = publish_movement
+    driver.disconnect.side_effect = disconnect
+    assert connection.move(Twist(linear=Vector3(x=0.2)))
+    warning = MagicMock()
+    monkeypatch.setattr(conn_mod.logger, "warning", warning)
+
+    with pytest.raises(RuntimeError, match="data channel unavailable"):
+        connection.stop()
+
+    assert events == ["move", "zero-failed", "zero-retry", "disconnect"]
+    warning.assert_any_call("Failed to send movement stop: %s", movement_error)
+    warning.assert_any_call("Failed to disconnect Unitree WebRTC connection: %s", disconnect_error)
+    driver.disconnect.assert_awaited_once_with()
+    assert len(scheduled) == 2
+    assert connection.stop_timer is None
+    timer_handles[1].cancel.assert_called_once_with()
+    assert not connection.thread.is_alive()
+    assert connection.loop.is_closed()
 
 
 def test_failed_zero_rearms_watchdog_and_propagates(
