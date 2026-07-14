@@ -194,25 +194,28 @@ class MovementManager(Module):
 
     def _on_teleop(self, msg: Twist) -> None:
         with self._lock:
+            transition_generation = self._transition_generation
             self._teleop_active = True
             self._last_teleop_time = time.monotonic()
 
-        self._cancel_goal()
+            self._cancel_goal()
+            if transition_generation != self._transition_generation:
+                return
 
-        scale = self.config.tele_cmd_vel_scaling
-        scaled = Twist(
-            linear=Vector3(
-                msg.linear.x * scale.linear.x,
-                msg.linear.y * scale.linear.y,
-                msg.linear.z * scale.linear.z,
-            ),
-            angular=Vector3(
-                msg.angular.x * scale.angular.x,
-                msg.angular.y * scale.angular.y,
-                msg.angular.z * scale.angular.z,
-            ),
-        )
-        self.cmd_vel.publish(scaled)
+            scale = self.config.tele_cmd_vel_scaling
+            scaled = Twist(
+                linear=Vector3(
+                    msg.linear.x * scale.linear.x,
+                    msg.linear.y * scale.linear.y,
+                    msg.linear.z * scale.linear.z,
+                ),
+                angular=Vector3(
+                    msg.angular.x * scale.angular.x,
+                    msg.angular.y * scale.angular.y,
+                    msg.angular.z * scale.angular.z,
+                ),
+            )
+            self.cmd_vel.publish(scaled)
 
     def _on_teleop_stop(self, msg: Bool) -> None:
         if not self.config.latch_teleop_stop or not msg.data:
