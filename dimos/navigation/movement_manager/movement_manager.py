@@ -43,6 +43,11 @@ MAX_CLICK_HORIZONTAL_M = 500.0
 MAX_CLICK_VERTICAL_M = 50.0
 
 
+def _canonical_frame_id(frame_id: str) -> str:
+    """Normalize viewer entity paths before comparing goal frames."""
+    return frame_id.strip("/")
+
+
 class MovementManagerConfig(ModuleConfig):
     tele_cooldown_sec: float = 1.0
     tele_cmd_vel_scaling: Twist = Twist(Vector3(1, 1, 1), Vector3(1, 1, 1))
@@ -76,6 +81,7 @@ class MovementManager(Module):
         self._active_goal_frame_id: str | None = None
         self._last_goal: tuple[float, float, float, float] | None = None
         self._transition_generation = 0
+        self._stop_transition_active = False
 
     @rpc
     def start(self) -> None:
@@ -93,6 +99,7 @@ class MovementManager(Module):
             self._active_goal_frame_id = None
             self._last_goal = None
             self._transition_generation += 1
+            self._stop_transition_active = False
         super().stop()
 
     def _on_click(self, msg: PointStamped) -> None:
@@ -106,12 +113,24 @@ class MovementManager(Module):
         ):
             logger.warning("Ignored out-of-range click", x=msg.x, y=msg.y, z=msg.z)
             return
+        if not math.isfinite(msg.ts):
+            logger.warning("Ignored click with invalid timestamp", ts=msg.ts)
+            return
+
+        # The viewer uses zero when timestamp_ms is absent. Treat receipt of
+        # such a click as a new operator action while retaining explicit
+        # timestamps for stale/replay protection.
+        click_ts = time.time() if msg.ts == 0.0 else msg.ts
+        click_frame_id = _canonical_frame_id(msg.frame_id)
 
         with self._lock:
+            if self._stop_transition_active:
+                logger.warning("Ignored replacement goal during STOP transition")
+                return
             if self._operator_stop_latched:
                 if (
                     self._active_goal_frame_id is not None
-                    and msg.frame_id != self._active_goal_frame_id
+                    and click_frame_id != self._active_goal_frame_id
                 ):
                     logger.warning(
                         "Ignored replacement goal from a different frame",
@@ -120,13 +139,11 @@ class MovementManager(Module):
                     )
                     return
                 if self._last_goal is not None:
-                    last_ts, last_x, last_y, last_z = self._last_goal
-                    if msg.ts < last_ts or (
-                        msg.ts == last_ts and (msg.x, msg.y, msg.z) == (last_x, last_y, last_z)
-                    ):
+                    last_ts = self._last_goal[0]
+                    if click_ts <= last_ts:
                         logger.warning(
                             "Ignored stale or replayed replacement goal",
-                            received_ts=msg.ts,
+                            received_ts=click_ts,
                             last_ts=last_ts,
                         )
                         return
@@ -141,8 +158,8 @@ class MovementManager(Module):
             if transition_generation != self._transition_generation:
                 return
 
-            self._active_goal_frame_id = msg.frame_id
-            self._last_goal = (msg.ts, msg.x, msg.y, msg.z)
+            self._active_goal_frame_id = click_frame_id
+            self._last_goal = (click_ts, msg.x, msg.y, msg.z)
 
             # The same lock serializes replacement-goal publication with STOP.
             # Keep the latch set during publish so reentrant planner traffic is
@@ -206,8 +223,14 @@ class MovementManager(Module):
             self._operator_stop_latched = True
             self._teleop_active = True
             self._last_teleop_time = time.monotonic()
+            self._stop_transition_active = True
             # Serialize the full STOP transition with replacement-goal
             # publication. The viewer also publishes a zero Twist for consumers
             # that do not use MovementManager.
-            self._cancel_goal()
-            self.cmd_vel.publish(Twist.zero())
+            try:
+                self._cancel_goal()
+            finally:
+                try:
+                    self.cmd_vel.publish(Twist.zero())
+                finally:
+                    self._stop_transition_active = False

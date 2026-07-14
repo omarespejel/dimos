@@ -17,15 +17,19 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Generator
 import json
 import threading
 import time
 from typing import Any
 
+from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 import pytest
 import websockets.asyncio.client as ws_client
 
 from dimos.core.global_config import global_config
+from dimos.msgs.geometry_msgs.PointStamped import PointStamped
+from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
 
 _TEST_PORT = 13031
@@ -100,7 +104,7 @@ class MockViewerPublisher:
 
 
 @pytest.fixture()
-def server(wait_for_server: Any) -> RerunWebSocketServer:
+def server(wait_for_server: Any) -> Generator[RerunWebSocketServer, None, None]:
     original_port = global_config.rerun_websocket_server_port
     global_config.update(rerun_websocket_server_port=_TEST_PORT)
     try:
@@ -114,7 +118,7 @@ def server(wait_for_server: Any) -> RerunWebSocketServer:
 
 
 @pytest.fixture()
-def publisher(server: RerunWebSocketServer) -> MockViewerPublisher:
+def publisher(server: RerunWebSocketServer) -> Generator[MockViewerPublisher, None, None]:
     with MockViewerPublisher(f"ws://127.0.0.1:{_TEST_PORT}/ws") as publisher:
         yield publisher  # type: ignore[misc]
 
@@ -123,10 +127,14 @@ def test_click_publishes_point_stamped(
     server: RerunWebSocketServer, publisher: MockViewerPublisher
 ) -> None:
     """Click event arrives as PointStamped with correct coords, frame_id, and timestamp."""
-    received: list[Any] = []
+    received: list[PointStamped] = []
     done = threading.Event()
 
-    unsub = server.clicked_point.subscribe(lambda point: (received.append(point), done.set()))
+    def capture_point(point: PointStamped) -> None:
+        received.append(point)
+        done.set()
+
+    unsub = server.clicked_point.subscribe(capture_point)
 
     publisher.send_click(1.5, 2.5, 0.0, "/robot/base", timestamp_ms=5000)
     publisher.flush()
@@ -146,10 +154,14 @@ def test_twist_publishes_on_tele_cmd_vel(
     server: RerunWebSocketServer, publisher: MockViewerPublisher
 ) -> None:
     """Twist event arrives as Twist on tele_cmd_vel."""
-    received: list[Any] = []
+    received: list[Twist] = []
     done = threading.Event()
 
-    unsub = server.tele_cmd_vel.subscribe(lambda twist: (received.append(twist), done.set()))
+    def capture_twist(twist: Twist) -> None:
+        received.append(twist)
+        done.set()
+
+    unsub = server.tele_cmd_vel.subscribe(capture_twist)
 
     publisher.send_twist(0.5, 0.0, 0.0, 0.0, 0.0, 0.8)
     publisher.flush()
@@ -173,11 +185,11 @@ def test_stop_publishes_explicit_signal_and_zero_twist(
         if received_twists and received_stops:
             done.set()
 
-    def capture_twist(twist: Any) -> None:
+    def capture_twist(twist: Twist) -> None:
         received_twists.append(twist)
         mark_done()
 
-    def capture_stop(stop: Any) -> None:
+    def capture_stop(stop: Bool) -> None:
         received_stops.append(stop)
         mark_done()
 
@@ -193,6 +205,60 @@ def test_stop_publishes_explicit_signal_and_zero_twist(
     assert received_twists[0].is_zero()
     assert len(received_stops) == 1
     assert received_stops[0].data
+
+
+def test_stop_publishes_zero_when_semantic_subscriber_fails(
+    server: RerunWebSocketServer,
+) -> None:
+    received_twists: list[Twist] = []
+
+    def fail_stop_subscriber(_stop: Bool) -> None:
+        raise RuntimeError("semantic stop subscriber failed")
+
+    unsub_twist = server.tele_cmd_vel.subscribe(received_twists.append)
+    unsub_stop = server.teleop_stop.subscribe(fail_stop_subscriber)
+    try:
+        with pytest.raises(RuntimeError, match="semantic stop subscriber failed"):
+            server._dispatch(json.dumps({"type": "stop"}))
+    finally:
+        unsub_twist()
+        unsub_stop()
+
+    assert len(received_twists) == 1
+    assert received_twists[0].is_zero()
+
+
+def test_controlling_client_disconnect_publishes_stop_and_zero(
+    server: RerunWebSocketServer,
+) -> None:
+    received_twists: list[Twist] = []
+    received_stops: list[Bool] = []
+    moving = threading.Event()
+    stopped = threading.Event()
+
+    def capture_twist(twist: Twist) -> None:
+        received_twists.append(twist)
+        if twist.is_zero():
+            stopped.set()
+        else:
+            moving.set()
+
+    unsub_twist = server.tele_cmd_vel.subscribe(capture_twist)
+    unsub_stop = server.teleop_stop.subscribe(received_stops.append)
+    try:
+        with MockViewerPublisher(f"ws://127.0.0.1:{_TEST_PORT}/ws") as client:
+            client.send_twist(0.5, 0.0, 0.0, 0.0, 0.0, 0.0)
+            assert moving.wait(timeout=2.0)
+        assert stopped.wait(timeout=2.0)
+    finally:
+        unsub_twist()
+        unsub_stop()
+
+    assert len(received_stops) == 1
+    assert received_stops[0].data
+    assert len(received_twists) == 2
+    assert received_twists[0].linear.x == pytest.approx(0.5)
+    assert received_twists[1].is_zero()
 
 
 def test_invalid_json_does_not_crash(server: RerunWebSocketServer) -> None:
@@ -212,9 +278,14 @@ def test_mixed_message_sequence(
     server: RerunWebSocketServer, publisher: MockViewerPublisher
 ) -> None:
     """Realistic session: heartbeat, click, twist, stop — only the click produces a point."""
-    received: list[Any] = []
+    received: list[PointStamped] = []
     done = threading.Event()
-    unsub = server.clicked_point.subscribe(lambda point: (received.append(point), done.set()))
+
+    def capture_point(point: PointStamped) -> None:
+        received.append(point)
+        done.set()
+
+    unsub = server.clicked_point.subscribe(capture_point)
 
     publisher.send_click(7.0, 8.0, 9.0, "/map", timestamp_ms=1100)
     publisher.send_twist(0.3, 0.0, 0.0, 0.0, 0.0, 0.2)
