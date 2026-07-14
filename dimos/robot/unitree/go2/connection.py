@@ -15,7 +15,7 @@
 from enum import Enum
 from importlib import resources
 import sys
-from threading import Thread
+from threading import Event, Thread
 import time
 from typing import Any, Protocol
 
@@ -149,12 +149,13 @@ def make_connection(
         raise ValueError(f"Unknown simulator {cfg.simulation!r}. Choose from: mujoco, dimsim")
 
 
-class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
+class ReplayConnection(CompositeResource):
     def __init__(  # type: ignore[no-untyped-def]
         self,
         dataset: str = "go2_china_office",
         **kwargs,
     ) -> None:
+        self._disposables = None
         self.dataset = dataset
         self._loop = kwargs.get("loop", False)
         self._seek = kwargs.get("seek")
@@ -175,6 +176,12 @@ class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
 
     def start(self) -> None:
         pass
+
+    def stop(self) -> None:
+        super().stop()
+
+    def disconnect(self) -> None:
+        self.stop()
 
     def standup(self) -> bool:
         return True
@@ -252,6 +259,7 @@ class GO2Connection(Module, Camera, Pointcloud):
     connection: Go2ConnectionProtocol
     camera_info_static: CameraInfo = _camera_info_static()
     _camera_info_thread: Thread | None = None
+    _camera_info_stop_event: Event
     _latest_video_frame: Image | None = None
     _latest_lowstate: LowStateMsg | None = None
 
@@ -267,6 +275,7 @@ class GO2Connection(Module, Camera, Pointcloud):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self._camera_info_stop_event = Event()
         self.connection = make_connection(
             self.config.ip,
             self.config.g,
@@ -296,6 +305,7 @@ class GO2Connection(Module, Camera, Pointcloud):
 
         if self.config.camera:
             self.register_disposable(self.connection.video_stream().subscribe(onimage))
+            self._camera_info_stop_event.clear()
             self._camera_info_thread = Thread(
                 target=self.publish_camera_info,
                 daemon=True,
@@ -318,13 +328,17 @@ class GO2Connection(Module, Camera, Pointcloud):
     def stop(self) -> None:
         self.liedown()
 
-        if self.connection:
-            self.connection.stop()
-
+        self._camera_info_stop_event.set()
         if self._camera_info_thread and self._camera_info_thread.is_alive():
             self._camera_info_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
 
-        super().stop()
+        try:
+            # Stream subscriptions may still own scheduled reads or callbacks
+            # against the connection. Dispose them before closing either the
+            # replay store or the live transport.
+            super().stop()
+        finally:
+            self.connection.stop()
 
     @classmethod
     def _odom_to_tf(cls, odom: PoseStamped) -> list[Transform]:
@@ -358,9 +372,9 @@ class GO2Connection(Module, Camera, Pointcloud):
             self.odom.publish(msg)
 
     def publish_camera_info(self) -> None:
-        while True:
+        while not self._camera_info_stop_event.is_set():
             self.camera_info.publish(self.camera_info_static)
-            time.sleep(1.0)
+            self._camera_info_stop_event.wait(1.0)
 
     @rpc
     def move(self, twist: Twist, duration: float = 0.0) -> bool:
