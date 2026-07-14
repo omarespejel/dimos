@@ -231,10 +231,9 @@ def test_latched_teleop_stop_requires_new_valid_goal(
         _click(x=1.0, y=2.0, ts=100.0),
         _click(x=3.0, ts=100.0),
         _click(x=3.0, ts=float("nan")),
-        _click(x=3.0, ts=101.0, frame_id="odom"),
     ],
 )
-def test_latched_stop_rejects_stale_replayed_or_mismatched_goal(
+def test_latched_stop_rejects_stale_replayed_or_invalid_goal(
     manager_and_captured: tuple[MovementManager, Captured],
     replacement: PointStamped,
 ) -> None:
@@ -255,7 +254,7 @@ def test_latched_stop_rejects_stale_replayed_or_mismatched_goal(
     assert manager._operator_stop_latched
 
 
-def test_latched_stop_accepts_canonical_frame_and_missing_timestamp(
+def test_latched_stop_accepts_missing_timestamp(
     manager_and_captured: tuple[MovementManager, Captured],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -271,6 +270,25 @@ def test_latched_stop_accepts_canonical_frame_and_missing_timestamp(
     manager._on_nav(_twist(lx=0.9))
 
     assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
+
+
+def test_latched_stop_accepts_newer_click_on_different_viewer_entity(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager.config.tele_cooldown_sec = 0.0
+
+    # dimos-viewer reports the selected Rerun entity path, not a coordinate
+    # frame. A new click can therefore have a different path while still being
+    # a valid, newer operator action in the same spatial view.
+    manager._on_click(_click(ts=100.0, frame_id="world/global_map"))
+    manager._on_teleop_stop(Bool(data=True))
+    manager._on_click(_click(x=3.0, ts=101.0, frame_id="world/lidar"))
+    manager._on_nav(_twist(lx=0.9))
+
+    assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
+    assert not manager._operator_stop_latched
 
 
 def test_reentrant_stop_wins_over_replacement_goal(
