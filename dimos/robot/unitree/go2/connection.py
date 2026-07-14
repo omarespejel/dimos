@@ -326,19 +326,20 @@ class GO2Connection(Module, Camera, Pointcloud):
 
     @rpc
     def stop(self) -> None:
-        self.liedown()
-
-        self._camera_info_stop_event.set()
-        if self._camera_info_thread and self._camera_info_thread.is_alive():
-            self._camera_info_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-
         try:
-            # Stream subscriptions may still own scheduled reads or callbacks
-            # against the connection. Dispose them before closing either the
-            # replay store or the live transport.
-            super().stop()
+            self.liedown()
         finally:
-            self.connection.stop()
+            self._camera_info_stop_event.set()
+            if self._camera_info_thread and self._camera_info_thread.is_alive():
+                self._camera_info_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+            try:
+                # Stream subscriptions may still own scheduled reads or callbacks
+                # against the connection. Dispose them before closing either the
+                # replay store or the live transport.
+                super().stop()
+            finally:
+                self.connection.stop()
 
     @classmethod
     def _odom_to_tf(cls, odom: PoseStamped) -> list[Transform]:
