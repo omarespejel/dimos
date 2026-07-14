@@ -261,6 +261,7 @@ class GO2Connection(Module, Camera, Pointcloud):
     _camera_info_thread: Thread | None = None
     _camera_info_stop_event: Event
     _motion_lock: RLock
+    _stop_lock: RLock
     _stopping: Event
     _latest_video_frame: Image | None = None
     _latest_lowstate: LowStateMsg | None = None
@@ -279,6 +280,7 @@ class GO2Connection(Module, Camera, Pointcloud):
         super().__init__(**kwargs)
         self._camera_info_stop_event = Event()
         self._motion_lock = RLock()
+        self._stop_lock = RLock()
         self._stopping = Event()
         self.connection = make_connection(
             self.config.ip,
@@ -292,7 +294,8 @@ class GO2Connection(Module, Camera, Pointcloud):
 
     @rpc
     def start(self) -> None:
-        self._stopping.clear()
+        with self._stop_lock:
+            self._stopping.clear()
         super().start()
         if not hasattr(self, "connection"):
             return
@@ -331,7 +334,10 @@ class GO2Connection(Module, Camera, Pointcloud):
 
     @rpc
     def stop(self) -> None:
-        self._stopping.set()
+        with self._stop_lock:
+            if self._stopping.is_set():
+                return
+            self._stopping.set()
         self._camera_info_stop_event.set()
         if self._camera_info_thread and self._camera_info_thread.is_alive():
             self._camera_info_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)

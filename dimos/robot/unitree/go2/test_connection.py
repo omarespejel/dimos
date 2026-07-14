@@ -162,6 +162,19 @@ def test_go2_shutdown_disposes_subscriptions_before_liedown(
     assert events == ["subscriptions", "liedown", "connection"]
 
 
+def test_go2_shutdown_is_idempotent(
+    make_go2_module: Callable[[Go2ConnectionProtocol], GO2Connection],
+) -> None:
+    connection = MagicMock(spec=Go2ConnectionProtocol)
+    module = make_go2_module(connection)
+
+    module.stop()
+    module.stop()
+
+    connection.liedown.assert_called_once_with()
+    connection.stop.assert_called_once_with()
+
+
 def test_go2_shutdown_serializes_inflight_move_before_liedown(
     make_go2_module: Callable[[Go2ConnectionProtocol], GO2Connection],
 ) -> None:
