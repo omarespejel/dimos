@@ -66,6 +66,20 @@ def test_plan_path_during_shutdown_does_not_cancel_again(
     cancel_goal.assert_not_called()
 
 
+def test_goal_request_during_shutdown_is_ignored(
+    planner: GlobalPlanner, mocker: MockerFixture
+) -> None:
+    planner._stop_planner.set()
+    goal = MagicMock()
+    plan_path = mocker.patch.object(planner, "_plan_path")
+
+    planner.handle_goal_request(goal)
+
+    assert planner._current_goal is None
+    cast("MagicMock", planner._replan_limiter.reset).assert_not_called()
+    plan_path.assert_not_called()
+
+
 def test_plan_path_discards_result_if_goal_is_cancelled_while_planning(
     planner: GlobalPlanner, mocker: MockerFixture
 ) -> None:

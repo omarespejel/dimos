@@ -135,10 +135,14 @@ class GlobalPlanner(Resource):
         self._navigation_map_near.update(msg)
 
     def handle_goal_request(self, goal: PoseStamped) -> None:
-        logger.info("Got new goal", goal=str(goal))
-        with self._lock:
-            self._current_goal = goal
-            self._goal_reached = False
+        with self._activation_lock:
+            if self._stop_planner.is_set():
+                logger.debug("Ignoring goal request during planner shutdown.")
+                return
+            logger.info("Got new goal", goal=str(goal))
+            with self._lock:
+                self._current_goal = goal
+                self._goal_reached = False
         self._replan_limiter.reset()
         self._plan_path()
 
