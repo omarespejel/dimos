@@ -66,8 +66,8 @@ def built_connection(monkeypatch: pytest.MonkeyPatch) -> Any:
     try:
         yield conn, driver
     finally:
-        conn.loop.call_soon_threadsafe(conn.loop.stop)
-        conn.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        conn.stop()
+        assert not conn.thread.is_alive()
 
 
 def test_connect_success_completes_setup(built_connection: Any) -> None:
@@ -83,10 +83,10 @@ def connection_factory(monkeypatch: pytest.MonkeyPatch) -> Any:
     """Create stubbed connections and always stop their loop/thread."""
     connections: list[UnitreeWebRTCConnection] = []
 
-    def build(**connection_options: bool) -> tuple[UnitreeWebRTCConnection, MagicMock]:
+    def build(*, velocity_api: bool = False) -> tuple[UnitreeWebRTCConnection, MagicMock]:
         driver = _stub_driver()
         monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
-        connection = UnitreeWebRTCConnection(ip="10.0.0.99", **connection_options)
+        connection = UnitreeWebRTCConnection(ip="10.0.0.99", velocity_api=velocity_api)
         connections.append(connection)
         return connection, driver
 
@@ -94,10 +94,8 @@ def connection_factory(monkeypatch: pytest.MonkeyPatch) -> Any:
         yield build
     finally:
         for connection in connections:
-            if connection.loop.is_running():
-                connection.stop_movement()
-                connection.loop.call_soon_threadsafe(connection.loop.stop)
-            connection.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+            connection.stop()
+            assert not connection.thread.is_alive()
 
 
 def _run_on_connection_loop(
@@ -350,6 +348,70 @@ def test_stop_from_connection_loop_disconnects_before_stopping(
     assert disconnected.is_set()
     driver.disconnect.assert_awaited_once_with()
     assert not connection.thread.is_alive()
+
+
+def test_stop_logs_disconnect_failure_and_still_stops_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory()
+    error = RuntimeError("peer did not close")
+    driver.disconnect.side_effect = error
+    warning = MagicMock()
+    monkeypatch.setattr(conn_mod.logger, "warning", warning)
+
+    connection.stop()
+
+    warning.assert_any_call("Failed to disconnect Unitree WebRTC connection: %s", error)
+    assert not connection.thread.is_alive()
+
+
+def test_stop_disconnects_when_loop_stopped_unexpectedly(
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory()
+    connection.loop.call_soon_threadsafe(connection.loop.stop)
+    connection.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+    assert not connection.loop.is_running()
+
+    connection.stop()
+
+    driver.disconnect.assert_awaited_once_with()
+    assert not connection.thread.is_alive()
+
+
+def test_failed_zero_rearms_watchdog_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory(velocity_api=True)
+    timer_handles = [MagicMock(), MagicMock()]
+    scheduled: list[tuple[Any, tuple[Any, ...]]] = []
+
+    def call_later(_delay: float, callback: Any, *args: Any) -> MagicMock:
+        scheduled.append((callback, args))
+        return timer_handles[len(scheduled) - 1]
+
+    monkeypatch.setattr(connection.loop, "call_later", call_later)
+    assert connection.move(Twist(linear=Vector3(x=0.2)))
+    driver.datachannel.pub_sub.publish_without_callback.side_effect = RuntimeError(
+        "data channel unavailable"
+    )
+
+    with pytest.raises(RuntimeError, match="data channel unavailable"):
+        connection.stop_movement()
+
+    assert connection.stop_timer is timer_handles[1]
+    timer_handles[0].cancel.assert_called_once_with()
+    retry, retry_args = scheduled[1]
+    driver.datachannel.pub_sub.publish_without_callback.side_effect = None
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+    _run_on_connection_loop(connection, retry, *retry_args)
+
+    driver.datachannel.pub_sub.publish_without_callback.assert_called_once()
+    assert connection.stop_timer is None
+    timer_handles[1].cancel.assert_called_once_with()
 
 
 def test_stale_watchdog_cannot_stop_replacement_command(
