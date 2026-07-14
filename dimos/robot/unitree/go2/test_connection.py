@@ -175,6 +175,104 @@ def test_go2_shutdown_is_idempotent(
     connection.stop.assert_called_once_with()
 
 
+@pytest.mark.parametrize(
+    "teardown_error",
+    [None, RuntimeError("disconnect failed")],
+    ids=["success", "failure"],
+)
+def test_go2_concurrent_shutdown_waits_for_teardown(
+    make_go2_module: Callable[[Go2ConnectionProtocol], GO2Connection],
+    teardown_error: RuntimeError | None,
+) -> None:
+    teardown_started = Event()
+    release_teardown = Event()
+    second_started = Event()
+    second_returned = Event()
+    first_errors: list[Exception] = []
+    second_errors: list[Exception] = []
+    connection = MagicMock(spec=Go2ConnectionProtocol)
+
+    def stop_connection() -> None:
+        teardown_started.set()
+        assert release_teardown.wait(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        if teardown_error is not None:
+            raise teardown_error
+
+    connection.stop.side_effect = stop_connection
+    module = make_go2_module(connection)
+
+    def stop_first() -> None:
+        try:
+            module.stop()
+        except Exception as error:
+            first_errors.append(error)
+
+    def stop_again() -> None:
+        second_started.set()
+        try:
+            module.stop()
+        except Exception as error:
+            second_errors.append(error)
+        finally:
+            second_returned.set()
+
+    first = Thread(target=stop_first, daemon=True)
+    second = Thread(target=stop_again, daemon=True)
+    first.start()
+    assert teardown_started.wait(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+    second.start()
+    assert second_started.wait(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+    try:
+        assert not second_returned.wait(timeout=0.25)
+    finally:
+        release_teardown.set()
+
+    first.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+    second.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert second_returned.is_set()
+    assert first_errors == ([] if teardown_error is None else [teardown_error])
+    assert second_errors == ([] if teardown_error is None else [teardown_error])
+    connection.liedown.assert_called_once_with()
+    connection.stop.assert_called_once_with()
+
+    if teardown_error is not None:
+        with pytest.raises(RuntimeError, match="disconnect failed"):
+            module.stop()
+        connection.stop.assert_called_once_with()
+
+
+def test_go2_shutdown_allows_same_thread_reentry(
+    make_go2_module: Callable[[Go2ConnectionProtocol], GO2Connection],
+) -> None:
+    errors: list[Exception] = []
+    connection = MagicMock(spec=Go2ConnectionProtocol)
+    module = make_go2_module(connection)
+
+    def liedown_and_reenter() -> bool:
+        module.stop()
+        return True
+
+    def stop_module() -> None:
+        try:
+            module.stop()
+        except Exception as error:
+            errors.append(error)
+
+    connection.liedown.side_effect = liedown_and_reenter
+    stop_thread = Thread(target=stop_module, daemon=True)
+    stop_thread.start()
+    stop_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+    assert not stop_thread.is_alive()
+    assert errors == []
+    connection.liedown.assert_called_once_with()
+    connection.stop.assert_called_once_with()
+
+
 def test_go2_shutdown_serializes_inflight_move_before_liedown(
     make_go2_module: Callable[[Go2ConnectionProtocol], GO2Connection],
 ) -> None:

@@ -263,6 +263,7 @@ class GO2Connection(Module, Camera, Pointcloud):
     _motion_lock: RLock
     _stop_lock: RLock
     _stopping: Event
+    _stop_error: BaseException | None
     _latest_video_frame: Image | None = None
     _latest_lowstate: LowStateMsg | None = None
 
@@ -282,6 +283,7 @@ class GO2Connection(Module, Camera, Pointcloud):
         self._motion_lock = RLock()
         self._stop_lock = RLock()
         self._stopping = Event()
+        self._stop_error = None
         self.connection = make_connection(
             self.config.ip,
             self.config.g,
@@ -296,6 +298,7 @@ class GO2Connection(Module, Camera, Pointcloud):
     def start(self) -> None:
         with self._stop_lock:
             self._stopping.clear()
+            self._stop_error = None
         super().start()
         if not hasattr(self, "connection"):
             return
@@ -336,21 +339,30 @@ class GO2Connection(Module, Camera, Pointcloud):
     def stop(self) -> None:
         with self._stop_lock:
             if self._stopping.is_set():
+                # Concurrent callers wait on _stop_lock until the owning
+                # teardown exits. Preserve a failed teardown as a sticky
+                # result: retrying an ambiguously partial shutdown is unsafe.
+                if self._stop_error is not None:
+                    raise self._stop_error
                 return
             self._stopping.set()
-        self._camera_info_stop_event.set()
-        if self._camera_info_thread and self._camera_info_thread.is_alive():
-            self._camera_info_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-
-        try:
             try:
-                # Quiesce cmd_vel and sensor callbacks before changing posture.
-                # The Unitree transport remains alive until connection.stop().
-                super().stop()
-            finally:
-                self.liedown()
-        finally:
-            self.connection.stop()
+                self._camera_info_stop_event.set()
+                if self._camera_info_thread and self._camera_info_thread.is_alive():
+                    self._camera_info_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+                try:
+                    try:
+                        # Quiesce cmd_vel and sensor callbacks before changing posture.
+                        # The Unitree transport remains alive until connection.stop().
+                        super().stop()
+                    finally:
+                        self.liedown()
+                finally:
+                    self.connection.stop()
+            except BaseException as error:
+                self._stop_error = error
+                raise
 
     @classmethod
     def _odom_to_tf(cls, odom: PoseStamped) -> list[Transform]:
