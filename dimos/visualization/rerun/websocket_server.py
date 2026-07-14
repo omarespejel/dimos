@@ -89,6 +89,8 @@ class RerunWebSocketServer(Module):
         self._stop_event: asyncio.Event | None = None
         self._serve_future: Future[None] | None = None
         self._server_ready = threading.Event()
+        self._serve_teardown_complete = threading.Event()
+        self._serve_teardown_complete.set()
         # Set on the first WebSocket client connection. Tests use this to verify
         # an external client (e.g. dimos-viewer --connect) actually connected.
         self.client_connected = threading.Event()
@@ -107,6 +109,7 @@ class RerunWebSocketServer(Module):
         super().start()
         assert self._loop is not None
         self._server_ready.clear()
+        self._serve_teardown_complete.clear()
         try:
             self._serve_future = asyncio.run_coroutine_threadsafe(self._serve(), self._loop)
             deadline = time.monotonic() + DEFAULT_THREAD_JOIN_TIMEOUT
@@ -118,23 +121,35 @@ class RerunWebSocketServer(Module):
                 if time.monotonic() >= deadline:
                     raise TimeoutError("WebSocket server did not become ready")
         except BaseException:
-            future = self._serve_future
-            if future is not None and not future.done():
-                future.cancel()
-                if threading.current_thread() is not self._loop_thread:
-                    try:
-                        future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-                    except BaseException:
-                        pass
+            if not self._cancel_serve_and_wait():
+                # Closing the event loop while _serve() is still unwinding can
+                # strand the listening socket and pending client tasks. Preserve
+                # the startup exception without racing loop teardown.
+                logger.error("WebSocket server teardown did not complete after startup error")
+                raise
             try:
                 super().stop()
             except BaseException:
                 logger.exception("Failed to tear down WebSocket server after startup error")
             raise
 
+    def _cancel_serve_and_wait(self) -> bool:
+        future = self._serve_future
+        if future is None:
+            return True
+        if not future.done():
+            future.cancel()
+        if self._serve_teardown_complete.is_set():
+            return True
+        if threading.current_thread() is self._loop_thread:
+            return False
+        return self._serve_teardown_complete.wait(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
     @rpc
     def stop(self) -> None:
         if not self._server_ready.is_set():
+            if not self._cancel_serve_and_wait():
+                raise TimeoutError("WebSocket server teardown did not complete during stop")
             super().stop()
             return
         try:
@@ -154,20 +169,23 @@ class RerunWebSocketServer(Module):
 
     async def _serve(self) -> None:
         self._stop_event = asyncio.Event()
+        try:
+            ws_logger = logging.getLogger("websockets.server")
+            ws_logger.addFilter(_handshake_noise_filter)
 
-        ws_logger = logging.getLogger("websockets.server")
-        ws_logger.addFilter(_handshake_noise_filter)
-
-        async with ws_server.serve(
-            self._handle_client,
-            host=self.host,
-            port=self.port,
-            ping_interval=30,
-            ping_timeout=30,
-            logger=ws_logger,
-        ):
-            self._server_ready.set()
-            await self._stop_event.wait()
+            async with ws_server.serve(
+                self._handle_client,
+                host=self.host,
+                port=self.port,
+                ping_interval=30,
+                ping_timeout=30,
+                logger=ws_logger,
+            ):
+                self._server_ready.set()
+                await self._stop_event.wait()
+        finally:
+            self._server_ready.clear()
+            self._serve_teardown_complete.set()
 
     async def _handle_client(self, websocket: Any) -> None:
         if hasattr(websocket, "request") and websocket.request.path != "/ws":

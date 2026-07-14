@@ -17,8 +17,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Coroutine, Generator
-from concurrent.futures import Future
+from collections.abc import Generator
 import json
 import threading
 import time
@@ -27,10 +26,12 @@ from typing import Any
 from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 import pytest
 import websockets.asyncio.client as ws_client
+import websockets.asyncio.server as ws_server
 
 from dimos.core.global_config import global_config
 from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
+import dimos.visualization.rerun.websocket_server as websocket_server_module
 from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
 
 _TEST_PORT = 13031
@@ -307,25 +308,50 @@ def test_mixed_message_sequence(
 
 def test_start_propagates_serve_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     module = RerunWebSocketServer()
-    failed_future: Future[None] = Future()
-    failed_future.set_exception(OSError("bind failed"))
 
-    def schedule(
-        coroutine: Coroutine[Any, Any, None], _loop: asyncio.AbstractEventLoop
-    ) -> Future[None]:
-        coroutine.close()
-        return failed_future
+    def fail_serve(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("bind failed")
 
-    def never_ready(timeout: float | None = None) -> bool:
-        del timeout
-        return False
-
-    module._server_ready.set()
-    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", schedule)
-    monkeypatch.setattr(module._server_ready, "wait", never_ready)
+    monkeypatch.setattr(ws_server, "serve", fail_serve)
     try:
         with pytest.raises(OSError, match="bind failed"):
             module.start()
+        assert not module._server_ready.is_set()
+        assert module._serve_teardown_complete.is_set()
+        assert module._loop is None
+        assert module._loop_thread is None
+    finally:
+        module.stop()
+
+
+def test_start_waits_for_serve_teardown_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = RerunWebSocketServer()
+    server_context_exited = threading.Event()
+
+    class SlowServerContext:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *_args: Any) -> None:
+            await asyncio.sleep(0.02)
+            server_context_exited.set()
+
+    def slow_serve(*_args: Any, **_kwargs: Any) -> SlowServerContext:
+        return SlowServerContext()
+
+    def never_ready(timeout: float | None = None) -> bool:
+        if timeout:
+            time.sleep(timeout)
+        return False
+
+    monkeypatch.setattr(ws_server, "serve", slow_serve)
+    monkeypatch.setattr(websocket_server_module, "DEFAULT_THREAD_JOIN_TIMEOUT", 0.1)
+    monkeypatch.setattr(module._server_ready, "wait", never_ready)
+    try:
+        with pytest.raises(TimeoutError, match="did not become ready"):
+            module.start()
+        assert server_context_exited.is_set()
+        assert module._serve_teardown_complete.is_set()
         assert not module._server_ready.is_set()
         assert module._loop is None
         assert module._loop_thread is None
@@ -333,35 +359,16 @@ def test_start_propagates_serve_exception(monkeypatch: pytest.MonkeyPatch) -> No
         module.stop()
 
 
-def test_start_cancels_serve_future_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stop_reports_incomplete_serve_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
     module = RerunWebSocketServer()
-    pending_future: Future[None] = Future()
-
-    def schedule(
-        coroutine: Coroutine[Any, Any, None], _loop: asyncio.AbstractEventLoop
-    ) -> Future[None]:
-        coroutine.close()
-        return pending_future
-
-    def never_ready(timeout: float | None = None) -> bool:
-        del timeout
-        return False
-
-    monotonic_calls = 0
-
-    def monotonic() -> float:
-        nonlocal monotonic_calls
-        monotonic_calls += 1
-        return 0.0 if monotonic_calls == 1 else 3.0
-
-    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", schedule)
-    monkeypatch.setattr(module._server_ready, "wait", never_ready)
-    monkeypatch.setattr(time, "monotonic", monotonic)
+    cancel_serve_and_wait = module._cancel_serve_and_wait
+    monkeypatch.setattr(module, "_cancel_serve_and_wait", lambda: False)
     try:
-        with pytest.raises(TimeoutError, match="did not become ready"):
-            module.start()
-        assert pending_future.cancelled()
-        assert module._loop is None
-        assert module._loop_thread is None
+        with pytest.raises(TimeoutError, match="teardown did not complete"):
+            module.stop()
+        assert module._loop is not None
+        assert module._loop_thread is not None
+        assert module._loop_thread.is_alive()
     finally:
+        monkeypatch.setattr(module, "_cancel_serve_and_wait", cancel_serve_and_wait)
         module.stop()

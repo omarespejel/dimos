@@ -121,7 +121,18 @@ def _click(
     ts: float | None = None,
     frame_id: str = "map",
 ) -> PointStamped:
-    return PointStamped(ts=time.time() if ts is None else ts, frame_id=frame_id, x=x, y=y, z=z)
+    click_ts = time.time() if ts is None else ts
+    # PointStamped treats zero as "stamp this now". Build with a sentinel and
+    # restore explicit zero when a test needs to exercise the receiver fallback.
+    point = PointStamped(
+        ts=1.0 if click_ts == 0.0 else click_ts,
+        frame_id=frame_id,
+        x=x,
+        y=y,
+        z=z,
+    )
+    point.ts = click_ts
+    return point
 
 
 def test_teleop_suppresses_nav_and_cancels_goal(
@@ -181,6 +192,40 @@ def test_manual_only_mode_still_forwards_teleop(
     assert captured.cmd_vel == [_twist(lx=0.3)]
 
 
+@pytest.mark.parametrize(
+    ("linear", "angular"),
+    [
+        (Vector3(float("nan"), 0, 0), Vector3()),
+        (Vector3(0, float("inf"), 0), Vector3()),
+        (Vector3(0, 0, float("-inf")), Vector3()),
+        (Vector3(), Vector3(float("nan"), 0, 0)),
+        (Vector3(), Vector3(0, float("inf"), 0)),
+        (Vector3(), Vector3(0, 0, float("-inf"))),
+    ],
+)
+def test_non_finite_navigation_is_rejected(
+    manager_and_captured: tuple[MovementManager, Captured],
+    linear: Vector3,
+    angular: Vector3,
+) -> None:
+    manager, captured = manager_and_captured
+
+    manager._on_nav(Twist(linear, angular))
+
+    assert captured.cmd_vel == []
+
+
+def test_finite_navigation_keeps_planner_owned_speed_envelope(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
+    manager, captured = manager_and_captured
+    planner_twist = _twist(lx=10.0)
+
+    manager._on_nav(planner_twist)
+
+    assert captured.cmd_vel == [planner_twist]
+
+
 def test_idle_zero_teleop_does_not_latch_operator_stop(
     manager_and_captured: tuple[MovementManager, Captured],
 ) -> None:
@@ -225,6 +270,32 @@ def test_latched_teleop_stop_requires_new_valid_goal(
     assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
 
 
+def test_stop_before_first_goal_rejects_replayed_clicks(
+    manager_and_captured: tuple[MovementManager, Captured],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager.config.tele_cooldown_sec = 0.0
+    monkeypatch.setattr(time, "time", lambda: 100.0)
+
+    manager._on_teleop_stop(Bool(data=True))
+    goal_count = len(captured.goal)
+    way_point_count = len(captured.way_point)
+    manager._on_click(_click(x=2.0, ts=99.0))
+    manager._on_click(_click(x=3.0, ts=100.0))
+    manager._on_click(_click(x=4.0, ts=101.0))
+    manager._on_nav(_twist(lx=0.9))
+
+    assert len(captured.goal) == goal_count + 1
+    assert len(captured.way_point) == way_point_count + 1
+    assert captured.goal[-1].x == 4.0
+    assert captured.way_point[-1].x == 4.0
+    assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
+    assert not manager._operator_stop_latched
+    assert manager._operator_stop_ts is None
+
+
 @pytest.mark.parametrize(
     "replacement",
     [
@@ -262,7 +333,7 @@ def test_latched_stop_accepts_missing_timestamp(
     manager, captured = manager_and_captured
     manager.config.latch_teleop_stop = True
     manager.config.tele_cooldown_sec = 0.0
-    timestamps = iter((100.0, 100.5, 101.0))
+    timestamps = iter((100.0, 100.5, 101.0, 101.5))
     monkeypatch.setattr(time, "time", lambda: next(timestamps))
 
     manager._on_click(_click(ts=0.0, frame_id="/map"))
@@ -295,9 +366,11 @@ def test_latched_stop_rejects_goal_from_mismatched_coordinate_frame(
 
 def test_reentrant_stop_wins_over_replacement_goal(
     manager_and_captured: tuple[MovementManager, Captured],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, captured = manager_and_captured
     manager.config.latch_teleop_stop = True
+    monkeypatch.setattr(time, "time", lambda: 100.5)
     manager._on_click(_click(ts=100.0))
     manager._on_teleop_stop(Bool(data=True))
     stop_sent = False
@@ -449,8 +522,10 @@ def test_stop_zero_is_final_and_suppresses_waiting_callback(
 
     manager._on_nav(_twist(lx=0.9))
     manager._on_click(_click(x=3.0))
+    manager.config.latch_teleop_stop = True
     manager._on_teleop_stop(Bool(data=True))
 
+    assert manager._stopping
     assert not stop_thread.is_alive()
     assert not waiting_callback.is_alive()
     assert captured.cmd_vel == [_twist(lx=0.3), _twist()]

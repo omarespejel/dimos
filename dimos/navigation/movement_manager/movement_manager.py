@@ -50,6 +50,15 @@ def _canonical_frame_id(frame_id: str) -> str:
     return frame_id.strip("/")
 
 
+def _twist_is_finite(twist: Twist) -> bool:
+    """Return whether every Twist component is finite."""
+    return all(
+        math.isfinite(value)
+        for vector in (twist.linear, twist.angular)
+        for value in vector.as_tuple
+    )
+
+
 def _twist_within_limits(twist: Twist, linear_limit: float, angular_limit: float) -> bool:
     """Return whether every Twist component is finite and within its limit."""
     if (
@@ -59,8 +68,8 @@ def _twist_within_limits(twist: Twist, linear_limit: float, angular_limit: float
         or angular_limit < 0.0
     ):
         return False
-    return all(
-        math.isfinite(value) and abs(value) <= limit
+    return _twist_is_finite(twist) and all(
+        abs(value) <= limit
         for vector, limit in (
             (twist.linear, linear_limit),
             (twist.angular, angular_limit),
@@ -104,6 +113,7 @@ class MovementManager(Module):
         self._teleop_active = False
         self._last_teleop_time = 0.0
         self._operator_stop_latched = False
+        self._operator_stop_ts: float | None = None
         self._last_goal: tuple[float, float, float, float] | None = None
         self._transition_generation = 0
         self._stop_transition_active = False
@@ -134,6 +144,7 @@ class MovementManager(Module):
                 first_stop = True
                 self._teleop_active = False
                 self._operator_stop_latched = False
+                self._operator_stop_ts = None
                 self._last_goal = None
                 self._transition_generation += 1
                 self._stop_transition_active = False
@@ -171,7 +182,9 @@ class MovementManager(Module):
             return
         if msg.frame_id != self._planning_frame_id:
             msg = PointStamped(
-                ts=msg.ts,
+                # Use the resolved receipt timestamp so PointStamped does not
+                # independently normalize an explicit zero a second time.
+                ts=click_ts,
                 frame_id=self._planning_frame_id,
                 x=msg.x,
                 y=msg.y,
@@ -185,15 +198,20 @@ class MovementManager(Module):
                 logger.warning("Ignored replacement goal during STOP transition")
                 return
             if self._operator_stop_latched:
+                baseline_ts = self._operator_stop_ts
                 if self._last_goal is not None:
-                    last_ts = self._last_goal[0]
-                    if click_ts <= last_ts:
-                        logger.warning(
-                            "Ignored stale or replayed replacement goal",
-                            received_ts=click_ts,
-                            last_ts=last_ts,
-                        )
-                        return
+                    baseline_ts = (
+                        self._last_goal[0]
+                        if baseline_ts is None
+                        else max(baseline_ts, self._last_goal[0])
+                    )
+                if baseline_ts is not None and click_ts <= baseline_ts:
+                    logger.warning(
+                        "Ignored stale or replayed replacement goal",
+                        received_ts=click_ts,
+                        last_ts=baseline_ts,
+                    )
+                    return
 
             self._transition_generation += 1
             transition_generation = self._transition_generation
@@ -212,6 +230,7 @@ class MovementManager(Module):
             # rejected, then release it only after the goal has reached subscribers.
             if self._operator_stop_latched:
                 self._operator_stop_latched = False
+                self._operator_stop_ts = None
                 self._teleop_active = False
 
     def _cancel_goal(self) -> None:
@@ -235,6 +254,11 @@ class MovementManager(Module):
             if self._stopping:
                 return
             if self.config.control_mode == "manual_only" or self._operator_stop_latched:
+                return
+            # Navigation owns a different speed envelope than keyboard teleop,
+            # but no planner should be able to forward NaN or infinity to cmd_vel.
+            if not _twist_is_finite(msg):
+                logger.warning("Ignored non-finite navigation command")
                 return
             if self._teleop_active:
                 # check if cooldown has expired
@@ -293,6 +317,9 @@ class MovementManager(Module):
                 return
             self._transition_generation += 1
             self._operator_stop_latched = True
+            # dimos-viewer click timestamps and time.time() both use Unix epoch
+            # seconds, so this is a comparable stale-message boundary.
+            self._operator_stop_ts = time.time()
             self._teleop_active = True
             self._last_teleop_time = time.monotonic()
             self._stop_transition_active = True
