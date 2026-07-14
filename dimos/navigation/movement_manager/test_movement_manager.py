@@ -322,6 +322,29 @@ def test_reentrant_goal_during_stop_is_rejected(
     assert manager._operator_stop_latched
 
 
+def test_reentrant_stop_wins_over_teleop_command(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    stop_sent = False
+
+    def stop_during_teleop_cancel(_msg: Bool) -> None:
+        nonlocal stop_sent
+        if not stop_sent:
+            stop_sent = True
+            manager._on_teleop_stop(Bool(data=True))
+
+    unsubscribe = manager.stop_movement.subscribe(stop_during_teleop_cancel)
+    try:
+        manager._on_teleop(_twist(lx=0.3))
+    finally:
+        unsubscribe()
+
+    assert captured.cmd_vel == [_twist()]
+    assert manager._operator_stop_latched
+
+
 def test_stop_publishes_zero_when_goal_cancellation_fails(
     manager_and_captured: tuple[MovementManager, Captured],
 ) -> None:
