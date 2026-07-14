@@ -110,6 +110,7 @@ class UnitreeWebRTCConnection(Resource):
         self.mode = mode
         self.stop_timer: asyncio.TimerHandle | None = None
         self._movement_generation = 0
+        self._disconnect_complete = False
         self.cmd_vel_timeout = 0.2
         self._velocity_api = velocity_api
         self._move_ids = SequentialIds()
@@ -151,34 +152,63 @@ class UnitreeWebRTCConnection(Resource):
         pass
 
     def stop(self) -> None:
-        self.stop_movement()
+        if self._disconnect_complete and not self.thread.is_alive():
+            return
+
+        movement_error: Exception | None = None
+        try:
+            self.stop_movement()
+        except Exception as e:
+            movement_error = e
 
         async def async_disconnect() -> None:
-            try:
-                await self.conn.disconnect()
-            except Exception:
-                pass
+            await self.conn.disconnect()
+            self._disconnect_complete = True
 
         if self.loop.is_running():
             if threading.current_thread() is self.thread:
 
                 async def disconnect_then_stop() -> None:
-                    await async_disconnect()
-                    self.loop.stop()
+                    try:
+                        await async_disconnect()
+                    except Exception as e:
+                        logger.warning("Failed to disconnect Unitree WebRTC connection: %s", e)
+                    finally:
+                        self.loop.stop()
 
                 self.loop.create_task(disconnect_then_stop())
+                if movement_error is not None:
+                    raise movement_error
                 return
 
             future = asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
             try:
                 future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-            except Exception:
-                pass
+            except TimeoutError:
+                logger.warning(
+                    "Timed out waiting for Unitree WebRTC disconnect after %.1f seconds",
+                    DEFAULT_THREAD_JOIN_TIMEOUT,
+                )
+            except Exception as e:
+                logger.warning("Failed to disconnect Unitree WebRTC connection: %s", e)
             finally:
                 self.loop.call_soon_threadsafe(self.loop.stop)
 
+        elif not self.loop.is_closed():
+            if self.thread.is_alive():
+                self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+            try:
+                self.loop.run_until_complete(async_disconnect())
+            except Exception as e:
+                logger.warning("Failed to disconnect stopped Unitree WebRTC loop: %s", e)
+        else:
+            logger.warning("Cannot disconnect Unitree WebRTC connection: event loop is closed")
+
         if self.thread.is_alive():
             self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+        if movement_error is not None:
+            raise movement_error
 
     def _publish_movement(self, x: float, y: float, yaw: float) -> None:
         if self._velocity_api:
@@ -489,6 +519,7 @@ class UnitreeWebRTCConnection(Resource):
             future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
         except Exception as e:
             logger.warning("Failed to send movement stop: %s", e)
+            raise
 
     def _cancel_movement_watchdog(self) -> None:
         """Invalidate the current watchdog. Must run on the WebRTC event loop."""
@@ -515,12 +546,22 @@ class UnitreeWebRTCConnection(Resource):
         """Stop only if this callback still owns the active command generation."""
         if generation != self._movement_generation:
             return
-        self._stop_movement_on_loop()
+        try:
+            self._stop_movement_on_loop()
+        except Exception as e:
+            logger.warning("Failed to publish watchdog stop; retry remains armed: %s", e)
 
     def _stop_movement_on_loop(self) -> None:
-        """Invalidate the active watchdog and publish zero velocity."""
+        """Publish zero velocity before retiring the active watchdog."""
+        try:
+            self._publish_movement(0.0, 0.0, 0.0)
+        except Exception:
+            # Keep a bounded-delay fail-safe alive if the transport rejects the
+            # zero command. _arm_movement_watchdog preserves the current handle
+            # when scheduling the replacement itself fails.
+            self._arm_movement_watchdog()
+            raise
         self._cancel_movement_watchdog()
-        self._publish_movement(0.0, 0.0, 0.0)
 
     def disconnect(self) -> None:
         """Disconnect from the robot and clean up resources."""
