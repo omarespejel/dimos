@@ -18,7 +18,9 @@ Pure-Python test suite with no hardware or network. Covers connect() error propa
 aes_128_key forwarding, and the UNITREE_AES_128_KEY env var via GlobalConfig.
 """
 
+import asyncio
 import json
+from threading import Event
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call
 
@@ -37,6 +39,7 @@ def _stub_driver(connect_exc: Exception | None = None) -> MagicMock:
     """A LegionConnection instance double covering everything connect() touches."""
     driver = MagicMock(name="LegionConnection-instance")
     driver.connect = AsyncMock(side_effect=connect_exc)
+    driver.disconnect = AsyncMock()
     driver.datachannel.disableTrafficSaving = AsyncMock()
     driver.datachannel.set_decoder = MagicMock()
     driver.datachannel.pub_sub.publish_request_new = AsyncMock()
@@ -75,6 +78,40 @@ def test_connect_success_completes_setup(built_connection: Any) -> None:
     driver.datachannel.pub_sub.publish_request_new.assert_awaited_once()
 
 
+@pytest.fixture
+def connection_factory(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Create stubbed connections and always stop their loop/thread."""
+    connections: list[UnitreeWebRTCConnection] = []
+
+    def build(**connection_options: bool) -> tuple[UnitreeWebRTCConnection, MagicMock]:
+        driver = _stub_driver()
+        monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
+        connection = UnitreeWebRTCConnection(ip="10.0.0.99", **connection_options)
+        connections.append(connection)
+        return connection, driver
+
+    try:
+        yield build
+    finally:
+        for connection in connections:
+            if connection.loop.is_running():
+                connection.stop_movement()
+                connection.loop.call_soon_threadsafe(connection.loop.stop)
+            connection.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+
+def _run_on_connection_loop(
+    connection: UnitreeWebRTCConnection,
+    callback: Any,
+    *args: Any,
+) -> None:
+    async def run_callback() -> None:
+        callback(*args)
+
+    future = asyncio.run_coroutine_threadsafe(run_callback(), connection.loop)
+    future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+
 @pytest.mark.parametrize(
     ("connection_options", "expected_call"),
     [
@@ -106,26 +143,254 @@ def test_connect_success_completes_setup(built_connection: Any) -> None:
     ],
 )
 def test_move_api_toggle_sends_selected_wire_command(
-    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
     connection_options: dict[str, bool],
     expected_call: Any,
 ) -> None:
-    driver = _stub_driver()
-    monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
+    connection, driver = connection_factory(**connection_options)
     twist = Twist(
         linear=Vector3(1.5, -0.4, 0.0),
         angular=Vector3(0.0, 0.0, 0.8),
     )
 
-    connection = UnitreeWebRTCConnection(ip="10.0.0.99", **connection_options)
-    try:
-        driver.datachannel.pub_sub.publish_without_callback.reset_mock()
-        assert connection.move(twist)
-        assert driver.datachannel.pub_sub.publish_without_callback.call_args == expected_call
-    finally:
-        connection.stop_movement()
-        connection.loop.call_soon_threadsafe(connection.loop.stop)
-        connection.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+    assert connection.move(twist)
+    driver.datachannel.pub_sub.publish_without_callback.assert_called_once_with(
+        *expected_call.args,
+        **expected_call.kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("connection_options", "expected_call"),
+    [
+        pytest.param(
+            {},
+            call(
+                RTC_TOPIC["WIRELESS_CONTROLLER"],
+                data={"lx": -0.0, "ly": 0.0, "rx": -0.0, "ry": 0},
+            ),
+            id="joystick",
+        ),
+        pytest.param(
+            {"velocity_api": True},
+            call(
+                RTC_TOPIC["SPORT_MOD"],
+                data={
+                    "header": {
+                        "identity": {
+                            "id": ANY,
+                            "api_id": SPORT_CMD["Move"],
+                        }
+                    },
+                    "parameter": json.dumps({"x": 0.0, "y": 0.0, "z": 0.0}),
+                },
+                msg_type=DATA_CHANNEL_TYPE["REQUEST"],
+            ),
+            id="velocity",
+        ),
+    ],
+)
+def test_move_watchdog_sends_zero_command(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+    connection_options: dict[str, bool],
+    expected_call: Any,
+) -> None:
+    connection, driver = connection_factory(**connection_options)
+    timer_handle = MagicMock()
+    scheduled: list[tuple[Any, tuple[Any, ...]]] = []
+
+    def call_later(_delay: float, callback: Any, *args: Any) -> MagicMock:
+        scheduled.append((callback, args))
+        return timer_handle
+
+    monkeypatch.setattr(connection.loop, "call_later", call_later)
+    assert connection.move(Twist(linear=Vector3(x=0.4)))
+    watchdog, args = scheduled.pop()
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+    _run_on_connection_loop(connection, watchdog, *args)
+
+    driver.datachannel.pub_sub.publish_without_callback.assert_called_once_with(
+        *expected_call.args,
+        **expected_call.kwargs,
+    )
+
+
+def test_move_is_not_published_when_watchdog_cannot_arm(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory(velocity_api=True)
+    monkeypatch.setattr(
+        connection.loop,
+        "call_later",
+        MagicMock(side_effect=RuntimeError("event loop is closing")),
+    )
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+    assert not connection.move(Twist(linear=Vector3(x=0.4)))
+
+    driver.datachannel.pub_sub.publish_without_callback.assert_not_called()
+
+
+def test_rearming_failure_preserves_active_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory(velocity_api=True)
+    timer_handle = MagicMock()
+    scheduled: list[tuple[Any, tuple[Any, ...]]] = []
+
+    def arm_once(_delay: float, callback: Any, *args: Any) -> MagicMock:
+        scheduled.append((callback, args))
+        return timer_handle
+
+    monkeypatch.setattr(connection.loop, "call_later", arm_once)
+    assert connection.move(Twist(linear=Vector3(x=0.2)))
+    watchdog, watchdog_args = scheduled[0]
+    generation = connection._movement_generation
+    monkeypatch.setattr(
+        connection.loop,
+        "call_later",
+        MagicMock(side_effect=RuntimeError("event loop is closing")),
+    )
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+    assert not connection.move(Twist(linear=Vector3(x=0.4)))
+    assert connection.stop_timer is timer_handle
+    assert connection._movement_generation == generation
+    timer_handle.cancel.assert_not_called()
+    driver.datachannel.pub_sub.publish_without_callback.assert_not_called()
+
+    _run_on_connection_loop(connection, watchdog, *watchdog_args)
+
+    timer_handle.cancel.assert_called_once_with()
+    parameter = json.dumps({"x": 0.0, "y": 0.0, "z": 0.0})
+    driver.datachannel.pub_sub.publish_without_callback.assert_called_once_with(
+        RTC_TOPIC["SPORT_MOD"],
+        data={
+            "header": {
+                "identity": {
+                    "id": ANY,
+                    "api_id": SPORT_CMD["Move"],
+                }
+            },
+            "parameter": parameter,
+        },
+        msg_type=DATA_CHANNEL_TYPE["REQUEST"],
+    )
+
+
+def test_stop_movement_from_connection_loop_publishes_zero(
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory(velocity_api=True)
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+    _run_on_connection_loop(connection, connection.stop_movement)
+
+    parameter = json.dumps({"x": 0.0, "y": 0.0, "z": 0.0})
+    driver.datachannel.pub_sub.publish_without_callback.assert_called_once_with(
+        RTC_TOPIC["SPORT_MOD"],
+        data={
+            "header": {
+                "identity": {
+                    "id": ANY,
+                    "api_id": SPORT_CMD["Move"],
+                }
+            },
+            "parameter": parameter,
+        },
+        msg_type=DATA_CHANNEL_TYPE["REQUEST"],
+    )
+
+
+def test_stop_waits_for_disconnect_before_stopping_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory()
+    events: list[str] = []
+
+    async def disconnect() -> None:
+        events.append("disconnect")
+
+    driver.disconnect.side_effect = disconnect
+    original_stop = connection.loop.stop
+
+    def stop_loop() -> None:
+        events.append("loop_stop")
+        original_stop()
+
+    monkeypatch.setattr(connection.loop, "stop", stop_loop)
+
+    connection.stop()
+
+    assert events == ["disconnect", "loop_stop"]
+    driver.disconnect.assert_awaited_once_with()
+    assert not connection.thread.is_alive()
+
+
+def test_stop_from_connection_loop_disconnects_before_stopping(
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory()
+    disconnected = Event()
+
+    async def disconnect() -> None:
+        disconnected.set()
+
+    driver.disconnect.side_effect = disconnect
+
+    connection.loop.call_soon_threadsafe(connection.stop)
+    connection.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+    assert disconnected.is_set()
+    driver.disconnect.assert_awaited_once_with()
+    assert not connection.thread.is_alive()
+
+
+def test_stale_watchdog_cannot_stop_replacement_command(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_factory: Any,
+) -> None:
+    connection, driver = connection_factory(velocity_api=True)
+    timer_handles = [MagicMock(), MagicMock()]
+    scheduled: list[tuple[Any, tuple[Any, ...]]] = []
+
+    def call_later(_delay: float, callback: Any, *args: Any) -> MagicMock:
+        scheduled.append((callback, args))
+        return timer_handles[len(scheduled) - 1]
+
+    monkeypatch.setattr(connection.loop, "call_later", call_later)
+    assert connection.move(Twist(linear=Vector3(x=0.2)))
+    stale_watchdog, stale_args = scheduled[0]
+    assert connection.move(Twist(linear=Vector3(x=0.4)))
+    timer_handles[0].cancel.assert_called_once_with()
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+    _run_on_connection_loop(connection, stale_watchdog, *stale_args)
+
+    driver.datachannel.pub_sub.publish_without_callback.assert_not_called()
+    assert connection.stop_timer is timer_handles[1]
+
+
+def test_duration_refreshes_watchdog_until_final_zero(connection_factory: Any) -> None:
+    connection, driver = connection_factory(velocity_api=True)
+    connection.cmd_vel_timeout = 0.1
+    expected_stop = json.dumps({"x": 0.0, "y": 0.0, "z": 0.0})
+    driver.datachannel.pub_sub.publish_without_callback.reset_mock()
+
+    assert connection.move(Twist(linear=Vector3(x=0.2)), duration=0.25)
+
+    parameters = [
+        mock_call.kwargs["data"]["parameter"]
+        for mock_call in driver.datachannel.pub_sub.publish_without_callback.call_args_list
+    ]
+    assert parameters[-1] == expected_stop
+    assert parameters.count(expected_stop) == 1
 
 
 @pytest.fixture

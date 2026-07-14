@@ -108,7 +108,8 @@ class UnitreeWebRTCConnection(Resource):
     ) -> None:
         self.ip = ip
         self.mode = mode
-        self.stop_timer: threading.Timer | None = None
+        self.stop_timer: asyncio.TimerHandle | None = None
+        self._movement_generation = 0
         self.cmd_vel_timeout = 0.2
         self._velocity_api = velocity_api
         self._move_ids = SequentialIds()
@@ -150,22 +151,31 @@ class UnitreeWebRTCConnection(Resource):
         pass
 
     def stop(self) -> None:
-        # Cancel timer
-        if self.stop_timer:
-            self.stop_timer.cancel()
-            self.stop_timer = None
+        self.stop_movement()
 
         async def async_disconnect() -> None:
             try:
-                self._publish_movement(0, 0, 0)
                 await self.conn.disconnect()
             except Exception:
                 pass
 
         if self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
+            if threading.current_thread() is self.thread:
 
-            self.loop.call_soon_threadsafe(self.loop.stop)
+                async def disconnect_then_stop() -> None:
+                    await async_disconnect()
+                    self.loop.stop()
+
+                self.loop.create_task(disconnect_then_stop())
+                return
+
+            future = asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
+            try:
+                future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+            except Exception:
+                pass
+            finally:
+                self.loop.call_soon_threadsafe(self.loop.stop)
 
         if self.thread.is_alive():
             self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
@@ -205,6 +215,7 @@ class UnitreeWebRTCConnection(Resource):
         x, y, yaw = twist.linear.x, twist.linear.y, twist.angular.z
 
         async def async_move() -> None:
+            self._arm_movement_watchdog()
             self._publish_movement(x, y, yaw)
 
         async def async_move_duration() -> None:
@@ -215,15 +226,6 @@ class UnitreeWebRTCConnection(Resource):
             while time.time() - start_time < duration:
                 await async_move()
                 await asyncio.sleep(sleep_time)
-
-        # Cancel existing timer and start a new one
-        if self.stop_timer:
-            self.stop_timer.cancel()
-
-        # Auto-stop after 0.5 seconds if no new commands
-        self.stop_timer = threading.Timer(self.cmd_vel_timeout, self.stop_movement)
-        self.stop_timer.daemon = True
-        self.stop_timer.start()
 
         try:
             if duration > 0:
@@ -471,31 +473,55 @@ class UnitreeWebRTCConnection(Resource):
         return self.video_stream()
 
     def stop_movement(self) -> None:
-        """Cancel the auto-stop timer (used by move() for continuous commands)."""
+        """Cancel the watchdog and publish zero velocity on the active wire API."""
+        if threading.current_thread() is self.thread:
+            self._stop_movement_on_loop()
+            return
+        if not self.loop.is_running():
+            logger.warning("Cannot send movement stop: WebRTC event loop is not running")
+            return
+
+        async def async_stop() -> None:
+            self._stop_movement_on_loop()
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(async_stop(), self.loop)
+            future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        except Exception as e:
+            logger.warning("Failed to send movement stop: %s", e)
+
+    def _cancel_movement_watchdog(self) -> None:
+        """Invalidate the current watchdog. Must run on the WebRTC event loop."""
+        self._movement_generation += 1
         if self.stop_timer:
             self.stop_timer.cancel()
             self.stop_timer = None
+
+    def _arm_movement_watchdog(self) -> None:
+        """Refresh the command-scoped watchdog on the WebRTC event loop."""
+        generation = self._movement_generation + 1
+        replacement = self.loop.call_later(
+            self.cmd_vel_timeout,
+            self._movement_watchdog_expired,
+            generation,
+        )
+        previous = self.stop_timer
+        self._movement_generation = generation
+        self.stop_timer = replacement
+        if previous:
+            previous.cancel()
+
+    def _movement_watchdog_expired(self, generation: int) -> None:
+        """Stop only if this callback still owns the active command generation."""
+        if generation != self._movement_generation:
+            return
+        self._stop_movement_on_loop()
+
+    def _stop_movement_on_loop(self) -> None:
+        """Invalidate the active watchdog and publish zero velocity."""
+        self._cancel_movement_watchdog()
+        self._publish_movement(0.0, 0.0, 0.0)
 
     def disconnect(self) -> None:
         """Disconnect from the robot and clean up resources."""
-        # Cancel timer
-        if self.stop_timer:
-            self.stop_timer.cancel()
-            self.stop_timer = None
-
-        if hasattr(self, "conn"):
-
-            async def async_disconnect() -> None:
-                try:
-                    await self.conn.disconnect()
-                except:
-                    pass
-
-            if hasattr(self, "loop") and self.loop.is_running():
-                asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
-
-        if hasattr(self, "loop") and self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
-
-        if hasattr(self, "thread") and self.thread.is_alive():
-            self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        self.stop()
