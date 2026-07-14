@@ -18,6 +18,7 @@ from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 import math
 import time
+from typing import Any
 
 from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 import pytest
@@ -36,10 +37,10 @@ from dimos.navigation.movement_manager.movement_manager import (
 class Captured:
     """Captures messages published by a MovementManager via real subscribers."""
 
-    cmd_vel: list = field(default_factory=list)
-    stop_movement: list = field(default_factory=list)
-    goal: list = field(default_factory=list)
-    way_point: list = field(default_factory=list)
+    cmd_vel: list[Twist] = field(default_factory=list)
+    stop_movement: list[Bool] = field(default_factory=list)
+    goal: list[PointStamped] = field(default_factory=list)
+    way_point: list[PointStamped] = field(default_factory=list)
 
 
 class _DirectTransport(Transport):  # type: ignore[type-arg]
@@ -68,7 +69,7 @@ class _DirectTransport(Transport):  # type: ignore[type-arg]
         self._subscribers.clear()
 
 
-def _attach(module):
+def _attach(module: MovementManager) -> tuple[Captured, list[Callable[[], None]]]:
     """Subscribe to every Out port; return (captured, unsubscribers)."""
     captured = Captured()
     unsubs = [
@@ -107,15 +108,24 @@ def started_manager_and_captured() -> Generator[tuple[MovementManager, Captured]
         module.stop()
 
 
-def _twist(lx=0.0):
+def _twist(lx: float = 0.0) -> Twist:
     return Twist(linear=Vector3(lx, 0, 0), angular=Vector3(0, 0, 0))
 
 
-def _click(x=1.0, y=2.0, z=0.0, *, ts=None, frame_id="map"):
+def _click(
+    x: float = 1.0,
+    y: float = 2.0,
+    z: float = 0.0,
+    *,
+    ts: float | None = None,
+    frame_id: str = "map",
+) -> PointStamped:
     return PointStamped(ts=time.time() if ts is None else ts, frame_id=frame_id, x=x, y=y, z=z)
 
 
-def test_teleop_suppresses_nav_and_cancels_goal(manager_and_captured):
+def test_teleop_suppresses_nav_and_cancels_goal(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     """Teleop arriving should suppress nav, publish stop_movement, and cancel the goal with NaN."""
     manager, captured = manager_and_captured
     manager.config.tele_cooldown_sec = 10.0
@@ -134,7 +144,9 @@ def test_teleop_suppresses_nav_and_cancels_goal(manager_and_captured):
     assert math.isnan(captured.goal[0].x)
 
 
-def test_nav_resumes_after_cooldown(manager_and_captured):
+def test_nav_resumes_after_cooldown(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     """After the cooldown expires, nav commands pass through again."""
     manager, captured = manager_and_captured
     manager.config.tele_cooldown_sec = 0.05
@@ -146,7 +158,9 @@ def test_nav_resumes_after_cooldown(manager_and_captured):
     assert len(captured.cmd_vel) == cmd_count_before + 1
 
 
-def test_manual_only_mode_never_forwards_navigation(manager_and_captured):
+def test_manual_only_mode_never_forwards_navigation(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     manager, captured = manager_and_captured
     manager.config.control_mode = "manual_only"
 
@@ -155,7 +169,9 @@ def test_manual_only_mode_never_forwards_navigation(manager_and_captured):
     assert captured.cmd_vel == []
 
 
-def test_manual_only_mode_still_forwards_teleop(manager_and_captured):
+def test_manual_only_mode_still_forwards_teleop(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     manager, captured = manager_and_captured
     manager.config.control_mode = "manual_only"
 
@@ -164,7 +180,9 @@ def test_manual_only_mode_still_forwards_teleop(manager_and_captured):
     assert captured.cmd_vel == [_twist(lx=0.3)]
 
 
-def test_idle_zero_teleop_does_not_latch_operator_stop(manager_and_captured):
+def test_idle_zero_teleop_does_not_latch_operator_stop(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     manager, captured = manager_and_captured
     manager.config.latch_teleop_stop = True
     manager.config.tele_cooldown_sec = 0.0
@@ -175,7 +193,9 @@ def test_idle_zero_teleop_does_not_latch_operator_stop(manager_and_captured):
     assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
 
 
-def test_explicit_stop_is_opt_in(manager_and_captured):
+def test_explicit_stop_is_opt_in(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     manager, captured = manager_and_captured
     manager.config.tele_cooldown_sec = 0.0
 
@@ -185,7 +205,9 @@ def test_explicit_stop_is_opt_in(manager_and_captured):
     assert captured.cmd_vel == [_twist(lx=0.9)]
 
 
-def test_latched_teleop_stop_requires_new_valid_goal(manager_and_captured):
+def test_latched_teleop_stop_requires_new_valid_goal(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     manager, captured = manager_and_captured
     manager.config.latch_teleop_stop = True
     manager.config.tele_cooldown_sec = 0.0
@@ -207,35 +229,60 @@ def test_latched_teleop_stop_requires_new_valid_goal(manager_and_captured):
     [
         _click(x=3.0, ts=99.0),
         _click(x=1.0, y=2.0, ts=100.0),
+        _click(x=3.0, ts=100.0),
+        _click(x=3.0, ts=float("nan")),
         _click(x=3.0, ts=101.0, frame_id="odom"),
     ],
 )
 def test_latched_stop_rejects_stale_replayed_or_mismatched_goal(
-    manager_and_captured,
-    replacement,
-):
+    manager_and_captured: tuple[MovementManager, Captured],
+    replacement: PointStamped,
+) -> None:
     manager, captured = manager_and_captured
     manager.config.latch_teleop_stop = True
     manager.config.tele_cooldown_sec = 0.0
     manager._on_click(_click(ts=100.0))
     manager._on_teleop_stop(Bool(data=True))
     goal_count = len(captured.goal)
+    way_point_count = len(captured.way_point)
 
     manager._on_click(replacement)
     manager._on_nav(_twist(lx=0.9))
 
     assert len(captured.goal) == goal_count
+    assert len(captured.way_point) == way_point_count
     assert captured.cmd_vel == [_twist()]
+    assert manager._operator_stop_latched
 
 
-def test_reentrant_stop_wins_over_replacement_goal(manager_and_captured):
+def test_latched_stop_accepts_canonical_frame_and_missing_timestamp(
+    manager_and_captured: tuple[MovementManager, Captured],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager.config.tele_cooldown_sec = 0.0
+    timestamps = iter((100.0, 100.5, 101.0))
+    monkeypatch.setattr(time, "time", lambda: next(timestamps))
+
+    manager._on_click(_click(ts=0.0, frame_id="/map"))
+    manager._on_teleop_stop(Bool(data=True))
+    manager._on_click(_click(ts=0.0, frame_id="map"))
+    manager._on_nav(_twist(lx=0.9))
+
+    assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
+
+
+def test_reentrant_stop_wins_over_replacement_goal(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     manager, captured = manager_and_captured
     manager.config.latch_teleop_stop = True
     manager._on_click(_click(ts=100.0))
     manager._on_teleop_stop(Bool(data=True))
     stop_sent = False
 
-    def stop_during_goal(_msg):
+    def stop_during_goal(_msg: PointStamped) -> None:
         nonlocal stop_sent
         if not stop_sent:
             stop_sent = True
@@ -253,7 +300,51 @@ def test_reentrant_stop_wins_over_replacement_goal(manager_and_captured):
     assert manager._operator_stop_latched
 
 
-def test_started_manager_latches_explicit_stop(started_manager_and_captured):
+def test_reentrant_goal_during_stop_is_rejected(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager._on_click(_click(ts=100.0))
+
+    def goal_during_stop(_msg: Bool) -> None:
+        manager._on_click(_click(x=3.0, ts=101.0))
+
+    unsubscribe = manager.stop_movement.subscribe(goal_during_stop)
+    try:
+        manager._on_teleop_stop(Bool(data=True))
+    finally:
+        unsubscribe()
+
+    assert math.isnan(captured.goal[-1].x)
+    assert all(goal.x != 3.0 for goal in captured.goal)
+    assert captured.cmd_vel == [_twist()]
+    assert manager._operator_stop_latched
+
+
+def test_stop_publishes_zero_when_goal_cancellation_fails(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+
+    def fail_stop_subscriber(_msg: Bool) -> None:
+        raise RuntimeError("planner subscriber failed")
+
+    unsubscribe = manager.stop_movement.subscribe(fail_stop_subscriber)
+    try:
+        with pytest.raises(RuntimeError, match="planner subscriber failed"):
+            manager._on_teleop_stop(Bool(data=True))
+    finally:
+        unsubscribe()
+
+    assert captured.cmd_vel == [_twist()]
+    assert manager._operator_stop_latched
+
+
+def test_started_manager_latches_explicit_stop(
+    started_manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     manager, captured = started_manager_and_captured
 
     manager.teleop_stop.transport.publish(Bool(data=True))
@@ -262,7 +353,9 @@ def test_started_manager_latches_explicit_stop(started_manager_and_captured):
     assert captured.cmd_vel == [_twist()]
 
 
-def test_stop_clears_operator_stop_latch(manager_and_captured):
+def test_stop_clears_operator_stop_latch(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     manager, _captured = manager_and_captured
     manager.config.latch_teleop_stop = True
     manager._on_teleop_stop(Bool(data=True))
@@ -272,7 +365,9 @@ def test_stop_clears_operator_stop_latch(manager_and_captured):
     assert not manager._operator_stop_latched
 
 
-def test_valid_click_publishes_goal(manager_and_captured):
+def test_valid_click_publishes_goal(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     """A valid click should publish to both goal and way_point."""
     manager, captured = manager_and_captured
     click = _click(x=5.0, y=3.0, z=0.1)
@@ -281,7 +376,9 @@ def test_valid_click_publishes_goal(manager_and_captured):
     assert captured.way_point == [click]
 
 
-def test_invalid_clicks_rejected(manager_and_captured):
+def test_invalid_clicks_rejected(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     """NaN, Inf, and out-of-range clicks should not publish."""
     manager, captured = manager_and_captured
     for bad_click in [
@@ -293,7 +390,9 @@ def test_invalid_clicks_rejected(manager_and_captured):
     assert captured.goal == []
 
 
-def test_tele_cmd_vel_scaling(manager_and_captured):
+def test_tele_cmd_vel_scaling(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
     """tele_cmd_vel_scaling multiplies each teleop twist component independently."""
     manager, captured = manager_and_captured
     scaling = Twist(Vector3(0.5, 2.0, 0.0), Vector3(1.0, 1.0, 0.25))

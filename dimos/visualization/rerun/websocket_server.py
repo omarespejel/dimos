@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future
 import json
 import logging
 import threading
@@ -24,6 +25,7 @@ from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 import websockets
 import websockets.asyncio.server as ws_server
 
+from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
 from dimos.core.module import Module
 from dimos.core.stream import Out
@@ -82,10 +84,12 @@ class RerunWebSocketServer(Module):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._stop_event: asyncio.Event | None = None
+        self._serve_future: Future[None] | None = None
         self._server_ready = threading.Event()
         # Set on the first WebSocket client connection. Tests use this to verify
         # an external client (e.g. dimos-viewer --connect) actually connected.
         self.client_connected = threading.Event()
+        self._controlling_client: Any | None = None
 
     @property
     def host(self) -> str:
@@ -99,7 +103,7 @@ class RerunWebSocketServer(Module):
     def start(self) -> None:
         super().start()
         assert self._loop is not None
-        asyncio.run_coroutine_threadsafe(self._serve(), self._loop)
+        self._serve_future = asyncio.run_coroutine_threadsafe(self._serve(), self._loop)
         self._server_ready.wait()
 
     @rpc
@@ -107,9 +111,20 @@ class RerunWebSocketServer(Module):
         if not self._server_ready.is_set():
             super().stop()
             return
-        if self._loop is not None and not self._loop.is_closed() and self._stop_event is not None:
-            self._loop.call_soon_threadsafe(self._stop_event.set)
-        super().stop()
+        try:
+            if (
+                self._loop is not None
+                and not self._loop.is_closed()
+                and self._stop_event is not None
+            ):
+                self._loop.call_soon_threadsafe(self._stop_event.set)
+                if (
+                    self._serve_future is not None
+                    and threading.current_thread() is not self._loop_thread
+                ):
+                    self._serve_future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        finally:
+            super().stop()
 
     async def _serve(self) -> None:
         self._stop_event = asyncio.Event()
@@ -137,11 +152,21 @@ class RerunWebSocketServer(Module):
         self.client_connected.set()
         try:
             async for raw in websocket:
-                self._dispatch(raw)
+                self._dispatch(raw, source=websocket)
         except websockets.ConnectionClosed:
             pass
+        finally:
+            if self._controlling_client is websocket:
+                self._controlling_client = None
+                self._publish_stop()
 
-    def _dispatch(self, raw: str | bytes) -> None:
+    def _publish_stop(self) -> None:
+        try:
+            self.teleop_stop.publish(Bool(data=True))
+        finally:
+            self.tele_cmd_vel.publish(Twist.zero())
+
+    def _dispatch(self, raw: str | bytes, source: Any | None = None) -> None:
         try:
             msg: dict[str, Any] = json.loads(raw)
         except json.JSONDecodeError:
@@ -171,6 +196,7 @@ class RerunWebSocketServer(Module):
             )
 
         elif msg_type == "twist":
+            self._controlling_client = source
             self.tele_cmd_vel.publish(
                 Twist(
                     linear=Vector3(
@@ -187,5 +213,6 @@ class RerunWebSocketServer(Module):
             )
 
         elif msg_type == "stop":
-            self.teleop_stop.publish(Bool(data=True))
-            self.tele_cmd_vel.publish(Twist.zero())
+            if self._controlling_client is source:
+                self._controlling_client = None
+            self._publish_stop()
