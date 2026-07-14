@@ -155,6 +155,10 @@ class GlobalPlanner(Resource):
 
     def cancel_goal(self, *, but_will_try_again: bool = False, arrived: bool = False) -> None:
         with self._activation_lock:
+            # Keep the complete cancellation transition serialized with goal
+            # requests. Subject callbacks are synchronous, but releasing this
+            # lock before the empty-path publication and local stop would let a
+            # new goal activate and then be stopped by stale cancellation work.
             # return silently so we don't flood the logs.
             with self._lock:
                 no_goal = self._current_goal is None
@@ -360,6 +364,11 @@ class GlobalPlanner(Resource):
         resampled_path = smooth_resample_path(path, current_goal, 0.1)
 
         with self._activation_lock:
+            # This is intentionally one activation transition. A concurrent
+            # cancel waits and then stops the newly activated path; a reentrant
+            # cancel from a synchronous path subscriber clears the goal and is
+            # detected by the validation below. Publishing or activating after
+            # releasing this lock would allow motion to restart after cancel.
             with self._lock:
                 goal_is_current = self._current_goal is current_goal
             if self._stop_planner.is_set() or not goal_is_current:

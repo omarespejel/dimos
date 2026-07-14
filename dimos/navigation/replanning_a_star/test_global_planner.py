@@ -174,6 +174,50 @@ def test_cancel_cannot_finish_before_inflight_path_activation(
     assert lifecycle.mock_calls == [call.start(resampled_path), call.stop()]
 
 
+def test_new_goal_waits_for_prior_cancel_cleanup(
+    planner: GlobalPlanner, mocker: MockerFixture
+) -> None:
+    planner._current_goal = MagicMock()
+    cancel_publish_started = Event()
+    release_cancel_publish = Event()
+    goal_request_started = Event()
+    goal_request_finished = Event()
+    planner.path = MagicMock()
+    planner.goal_reached = MagicMock()
+    plan_path = mocker.patch.object(planner, "_plan_path")
+    lifecycle = MagicMock()
+    lifecycle.attach_mock(cast("MagicMock", planner._local_planner.stop_planning), "stop")
+    lifecycle.attach_mock(plan_path, "plan")
+    replacement_goal = MagicMock()
+
+    def pause_cancel_publication(_path: Any) -> None:
+        cancel_publish_started.set()
+        release_cancel_publish.wait(timeout=1.0)
+
+    def request_replacement_goal() -> None:
+        goal_request_started.set()
+        planner.handle_goal_request(replacement_goal)
+        goal_request_finished.set()
+
+    planner.path.on_next.side_effect = pause_cancel_publication
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cancel_future = executor.submit(planner.cancel_goal)
+        cancel_reached_publication = cancel_publish_started.wait(timeout=1.0)
+        goal_future = executor.submit(request_replacement_goal)
+        goal_request_was_started = goal_request_started.wait(timeout=1.0)
+        goal_finished_before_cancel = goal_request_finished.wait(timeout=0.2)
+        release_cancel_publish.set()
+        cancel_future.result(timeout=1.0)
+        goal_future.result(timeout=1.0)
+
+    assert cancel_reached_publication
+    assert goal_request_was_started
+    assert not goal_finished_before_cancel
+    assert planner._current_goal is replacement_goal
+    assert lifecycle.mock_calls == [call.stop(), call.plan()]
+
+
 def test_stopped_navigating_is_ignored_during_shutdown(planner: GlobalPlanner) -> None:
     planner._replan_reason = None
     planner._stop_planner.set()
