@@ -161,22 +161,38 @@ def test_twist_publishes_on_tele_cmd_vel(
     assert received[0].angular.z == pytest.approx(0.8)
 
 
-def test_stop_publishes_zero_twist(
+def test_stop_publishes_explicit_signal_and_zero_twist(
     server: RerunWebSocketServer, publisher: MockViewerPublisher
 ) -> None:
-    """Stop event publishes a zero Twist on tele_cmd_vel."""
-    received: list[Any] = []
+    """Stop event preserves its semantic and publishes zero velocity."""
+    received_twists: list[Any] = []
+    received_stops: list[Any] = []
     done = threading.Event()
 
-    unsub = server.tele_cmd_vel.subscribe(lambda twist: (received.append(twist), done.set()))
+    def mark_done() -> None:
+        if received_twists and received_stops:
+            done.set()
+
+    def capture_twist(twist: Any) -> None:
+        received_twists.append(twist)
+        mark_done()
+
+    def capture_stop(stop: Any) -> None:
+        received_stops.append(stop)
+        mark_done()
+
+    unsub_twist = server.tele_cmd_vel.subscribe(capture_twist)
+    unsub_stop = server.teleop_stop.subscribe(capture_stop)
 
     publisher.send_stop()
-    publisher.flush()
     done.wait(timeout=2.0)
-    unsub()
+    unsub_twist()
+    unsub_stop()
 
-    assert len(received) == 1
-    assert received[0].is_zero()
+    assert len(received_twists) == 1
+    assert received_twists[0].is_zero()
+    assert len(received_stops) == 1
+    assert received_stops[0].data
 
 
 def test_invalid_json_does_not_crash(server: RerunWebSocketServer) -> None:

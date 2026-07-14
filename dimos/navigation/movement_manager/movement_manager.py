@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from typing import Any
+from typing import Any, Literal
 
 from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 from reactivex.disposable import Disposable
@@ -46,6 +46,10 @@ MAX_CLICK_VERTICAL_M = 50.0
 class MovementManagerConfig(ModuleConfig):
     tele_cooldown_sec: float = 1.0
     tele_cmd_vel_scaling: Twist = Twist(Vector3(1, 1, 1), Vector3(1, 1, 1))
+    # mixed preserves the teleop cooldown mux; manual_only rejects all planner velocity.
+    control_mode: Literal["mixed", "manual_only"] = "mixed"
+    # Keep an explicit viewer STOP active until the operator publishes a valid new goal.
+    latch_teleop_stop: bool = False
 
 
 class MovementManager(Module):
@@ -56,6 +60,7 @@ class MovementManager(Module):
     clicked_point: In[PointStamped]
     nav_cmd_vel: In[Twist]
     tele_cmd_vel: In[Twist]
+    teleop_stop: In[Bool]
 
     goal: Out[PointStamped]
     way_point: Out[PointStamped]
@@ -64,9 +69,13 @@ class MovementManager(Module):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._teleop_active = False
         self._last_teleop_time = 0.0
+        self._operator_stop_latched = False
+        self._active_goal_frame_id: str | None = None
+        self._last_goal: tuple[float, float, float, float] | None = None
+        self._transition_generation = 0
 
     @rpc
     def start(self) -> None:
@@ -74,11 +83,16 @@ class MovementManager(Module):
         self.register_disposable(Disposable(self.clicked_point.subscribe(self._on_click)))
         self.register_disposable(Disposable(self.nav_cmd_vel.subscribe(self._on_nav)))
         self.register_disposable(Disposable(self.tele_cmd_vel.subscribe(self._on_teleop)))
+        self.register_disposable(Disposable(self.teleop_stop.subscribe(self._on_teleop_stop)))
 
     @rpc
     def stop(self) -> None:
         with self._lock:
             self._teleop_active = False
+            self._operator_stop_latched = False
+            self._active_goal_frame_id = None
+            self._last_goal = None
+            self._transition_generation += 1
         super().stop()
 
     def _on_click(self, msg: PointStamped) -> None:
@@ -93,9 +107,49 @@ class MovementManager(Module):
             logger.warning("Ignored out-of-range click", x=msg.x, y=msg.y, z=msg.z)
             return
 
-        logger.debug("Goal", x=round(msg.x, 1), y=round(msg.y, 1), z=round(msg.z, 1))
-        self.way_point.publish(msg)
-        self.goal.publish(msg)
+        with self._lock:
+            if self._operator_stop_latched:
+                if (
+                    self._active_goal_frame_id is not None
+                    and msg.frame_id != self._active_goal_frame_id
+                ):
+                    logger.warning(
+                        "Ignored replacement goal from a different frame",
+                        expected=self._active_goal_frame_id,
+                        received=msg.frame_id,
+                    )
+                    return
+                if self._last_goal is not None:
+                    last_ts, last_x, last_y, last_z = self._last_goal
+                    if msg.ts < last_ts or (
+                        msg.ts == last_ts and (msg.x, msg.y, msg.z) == (last_x, last_y, last_z)
+                    ):
+                        logger.warning(
+                            "Ignored stale or replayed replacement goal",
+                            received_ts=msg.ts,
+                            last_ts=last_ts,
+                        )
+                        return
+
+            self._transition_generation += 1
+            transition_generation = self._transition_generation
+            logger.debug("Goal", x=round(msg.x, 1), y=round(msg.y, 1), z=round(msg.z, 1))
+            self.way_point.publish(msg)
+            if transition_generation != self._transition_generation:
+                return
+            self.goal.publish(msg)
+            if transition_generation != self._transition_generation:
+                return
+
+            self._active_goal_frame_id = msg.frame_id
+            self._last_goal = (msg.ts, msg.x, msg.y, msg.z)
+
+            # The same lock serializes replacement-goal publication with STOP.
+            # Keep the latch set during publish so reentrant planner traffic is
+            # rejected, then release it only after the goal has reached subscribers.
+            if self._operator_stop_latched:
+                self._operator_stop_latched = False
+                self._teleop_active = False
 
     def _cancel_goal(self) -> None:
         self.stop_movement.publish(Bool(data=True))
@@ -111,6 +165,8 @@ class MovementManager(Module):
 
     def _on_nav(self, msg: Twist) -> None:
         with self._lock:
+            if self.config.control_mode == "manual_only" or self._operator_stop_latched:
+                return
             if self._teleop_active:
                 # check if cooldown has expired
                 elapsed = time.monotonic() - self._last_teleop_time
@@ -140,3 +196,18 @@ class MovementManager(Module):
             ),
         )
         self.cmd_vel.publish(scaled)
+
+    def _on_teleop_stop(self, msg: Bool) -> None:
+        if not self.config.latch_teleop_stop or not msg.data:
+            return
+
+        with self._lock:
+            self._transition_generation += 1
+            self._operator_stop_latched = True
+            self._teleop_active = True
+            self._last_teleop_time = time.monotonic()
+            # Serialize the full STOP transition with replacement-goal
+            # publication. The viewer also publishes a zero Twist for consumers
+            # that do not use MovementManager.
+            self._cancel_goal()
+            self.cmd_vel.publish(Twist.zero())

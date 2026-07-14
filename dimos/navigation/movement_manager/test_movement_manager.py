@@ -14,14 +14,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 import math
 import time
 
+from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 import pytest
 
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
+from dimos.core.stream import Stream, Transport
 from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
@@ -38,6 +40,32 @@ class Captured:
     stop_movement: list = field(default_factory=list)
     goal: list = field(default_factory=list)
     way_point: list = field(default_factory=list)
+
+
+class _DirectTransport(Transport):  # type: ignore[type-arg]
+    """Synchronous transport for exercising subscriptions registered by start()."""
+
+    def __init__(self) -> None:
+        self._subscribers: list[Callable[[Any], Any]] = []
+
+    def broadcast(self, _selfstream: Any, value: Any) -> None:
+        for callback in list(self._subscribers):
+            callback(value)
+
+    def subscribe(
+        self, callback: Callable[[Any], Any], _selfstream: Stream[Any] | None = None
+    ) -> Callable[[], None]:
+        self._subscribers.append(callback)
+
+        def unsubscribe() -> None:
+            self._subscribers.remove(callback)
+
+        return unsubscribe
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None:
+        self._subscribers.clear()
 
 
 def _attach(module):
@@ -64,12 +92,27 @@ def manager_and_captured() -> Generator[tuple[MovementManager, Captured], None, 
         module._close_module()
 
 
+@pytest.fixture()
+def started_manager_and_captured() -> Generator[tuple[MovementManager, Captured], None, None]:
+    module = MovementManager(latch_teleop_stop=True, tele_cooldown_sec=0.0)
+    for input_stream in module.inputs.values():
+        input_stream.transport = _DirectTransport()
+    captured, unsubs = _attach(module)
+    try:
+        module.start()
+        yield module, captured
+    finally:
+        for unsub in unsubs:
+            unsub()
+        module.stop()
+
+
 def _twist(lx=0.0):
     return Twist(linear=Vector3(lx, 0, 0), angular=Vector3(0, 0, 0))
 
 
-def _click(x=1.0, y=2.0, z=0.0):
-    return PointStamped(ts=time.time(), frame_id="map", x=x, y=y, z=z)
+def _click(x=1.0, y=2.0, z=0.0, *, ts=None, frame_id="map"):
+    return PointStamped(ts=time.time() if ts is None else ts, frame_id=frame_id, x=x, y=y, z=z)
 
 
 def test_teleop_suppresses_nav_and_cancels_goal(manager_and_captured):
@@ -101,6 +144,132 @@ def test_nav_resumes_after_cooldown(manager_and_captured):
 
     manager._on_nav(_twist(lx=0.9))
     assert len(captured.cmd_vel) == cmd_count_before + 1
+
+
+def test_manual_only_mode_never_forwards_navigation(manager_and_captured):
+    manager, captured = manager_and_captured
+    manager.config.control_mode = "manual_only"
+
+    manager._on_nav(_twist(lx=0.9))
+
+    assert captured.cmd_vel == []
+
+
+def test_manual_only_mode_still_forwards_teleop(manager_and_captured):
+    manager, captured = manager_and_captured
+    manager.config.control_mode = "manual_only"
+
+    manager._on_teleop(_twist(lx=0.3))
+
+    assert captured.cmd_vel == [_twist(lx=0.3)]
+
+
+def test_idle_zero_teleop_does_not_latch_operator_stop(manager_and_captured):
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager.config.tele_cooldown_sec = 0.0
+
+    manager._on_teleop(_twist())
+    manager._on_nav(_twist(lx=0.9))
+
+    assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
+
+
+def test_explicit_stop_is_opt_in(manager_and_captured):
+    manager, captured = manager_and_captured
+    manager.config.tele_cooldown_sec = 0.0
+
+    manager._on_teleop_stop(Bool(data=True))
+    manager._on_nav(_twist(lx=0.9))
+
+    assert captured.cmd_vel == [_twist(lx=0.9)]
+
+
+def test_latched_teleop_stop_requires_new_valid_goal(manager_and_captured):
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager.config.tele_cooldown_sec = 0.0
+
+    manager._on_teleop_stop(Bool(data=True))
+    manager._on_nav(_twist(lx=0.7))
+    manager._on_click(_click(x=float("nan")))
+    manager._on_nav(_twist(lx=0.8))
+    manager._on_click(_click(x=600.0))
+    manager._on_nav(_twist(lx=0.85))
+    manager._on_click(_click())
+    manager._on_nav(_twist(lx=0.9))
+
+    assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        _click(x=3.0, ts=99.0),
+        _click(x=1.0, y=2.0, ts=100.0),
+        _click(x=3.0, ts=101.0, frame_id="odom"),
+    ],
+)
+def test_latched_stop_rejects_stale_replayed_or_mismatched_goal(
+    manager_and_captured,
+    replacement,
+):
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager.config.tele_cooldown_sec = 0.0
+    manager._on_click(_click(ts=100.0))
+    manager._on_teleop_stop(Bool(data=True))
+    goal_count = len(captured.goal)
+
+    manager._on_click(replacement)
+    manager._on_nav(_twist(lx=0.9))
+
+    assert len(captured.goal) == goal_count
+    assert captured.cmd_vel == [_twist()]
+
+
+def test_reentrant_stop_wins_over_replacement_goal(manager_and_captured):
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager._on_click(_click(ts=100.0))
+    manager._on_teleop_stop(Bool(data=True))
+    stop_sent = False
+
+    def stop_during_goal(_msg):
+        nonlocal stop_sent
+        if not stop_sent:
+            stop_sent = True
+            manager._on_teleop_stop(Bool(data=True))
+
+    unsubscribe = manager.way_point.subscribe(stop_during_goal)
+    try:
+        manager._on_click(_click(x=3.0, ts=101.0))
+        manager._on_nav(_twist(lx=0.9))
+    finally:
+        unsubscribe()
+
+    assert math.isnan(captured.goal[-1].x)
+    assert captured.cmd_vel == [_twist(), _twist()]
+    assert manager._operator_stop_latched
+
+
+def test_started_manager_latches_explicit_stop(started_manager_and_captured):
+    manager, captured = started_manager_and_captured
+
+    manager.teleop_stop.transport.publish(Bool(data=True))
+    manager.nav_cmd_vel.transport.publish(_twist(lx=0.9))
+
+    assert captured.cmd_vel == [_twist()]
+
+
+def test_stop_clears_operator_stop_latch(manager_and_captured):
+    manager, _captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager._on_teleop_stop(Bool(data=True))
+
+    manager.stop()
+
+    assert not manager._operator_stop_latched
 
 
 def test_valid_click_publishes_goal(manager_and_captured):
