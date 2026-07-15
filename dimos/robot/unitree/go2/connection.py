@@ -15,7 +15,7 @@
 from enum import Enum
 from importlib import resources
 import sys
-from threading import Thread
+from threading import Event, RLock, Thread
 import time
 from typing import Any, Protocol
 
@@ -149,12 +149,13 @@ def make_connection(
         raise ValueError(f"Unknown simulator {cfg.simulation!r}. Choose from: mujoco, dimsim")
 
 
-class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
+class ReplayConnection(CompositeResource):
     def __init__(  # type: ignore[no-untyped-def]
         self,
         dataset: str = "go2_china_office",
         **kwargs,
     ) -> None:
+        self._disposables = None
         self.dataset = dataset
         self._loop = kwargs.get("loop", False)
         self._seek = kwargs.get("seek")
@@ -175,6 +176,12 @@ class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
 
     def start(self) -> None:
         pass
+
+    def stop(self) -> None:
+        super().stop()
+
+    def disconnect(self) -> None:
+        self.stop()
 
     def standup(self) -> bool:
         return True
@@ -252,6 +259,11 @@ class GO2Connection(Module, Camera, Pointcloud):
     connection: Go2ConnectionProtocol
     camera_info_static: CameraInfo = _camera_info_static()
     _camera_info_thread: Thread | None = None
+    _camera_info_stop_event: Event
+    _motion_lock: RLock
+    _stop_lock: RLock
+    _stopping: Event
+    _stop_error: BaseException | None
     _latest_video_frame: Image | None = None
     _latest_lowstate: LowStateMsg | None = None
 
@@ -267,6 +279,11 @@ class GO2Connection(Module, Camera, Pointcloud):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self._camera_info_stop_event = Event()
+        self._motion_lock = RLock()
+        self._stop_lock = RLock()
+        self._stopping = Event()
+        self._stop_error = None
         self.connection = make_connection(
             self.config.ip,
             self.config.g,
@@ -279,6 +296,9 @@ class GO2Connection(Module, Camera, Pointcloud):
 
     @rpc
     def start(self) -> None:
+        with self._stop_lock:
+            self._stopping.clear()
+            self._stop_error = None
         super().start()
         if not hasattr(self, "connection"):
             return
@@ -296,6 +316,7 @@ class GO2Connection(Module, Camera, Pointcloud):
 
         if self.config.camera:
             self.register_disposable(self.connection.video_stream().subscribe(onimage))
+            self._camera_info_stop_event.clear()
             self._camera_info_thread = Thread(
                 target=self.publish_camera_info,
                 daemon=True,
@@ -316,15 +337,32 @@ class GO2Connection(Module, Camera, Pointcloud):
 
     @rpc
     def stop(self) -> None:
-        self.liedown()
+        with self._stop_lock:
+            if self._stopping.is_set():
+                # Concurrent callers wait on _stop_lock until the owning
+                # teardown exits. Preserve a failed teardown as a sticky
+                # result: retrying an ambiguously partial shutdown is unsafe.
+                if self._stop_error is not None:
+                    raise self._stop_error
+                return
+            self._stopping.set()
+            try:
+                self._camera_info_stop_event.set()
+                if self._camera_info_thread and self._camera_info_thread.is_alive():
+                    self._camera_info_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
 
-        if self.connection:
-            self.connection.stop()
-
-        if self._camera_info_thread and self._camera_info_thread.is_alive():
-            self._camera_info_thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-
-        super().stop()
+                try:
+                    try:
+                        # Quiesce cmd_vel and sensor callbacks before changing posture.
+                        # The Unitree transport remains alive until connection.stop().
+                        super().stop()
+                    finally:
+                        self.liedown()
+                finally:
+                    self.connection.stop()
+            except BaseException as error:
+                self._stop_error = error
+                raise
 
     @classmethod
     def _odom_to_tf(cls, odom: PoseStamped) -> list[Transform]:
@@ -358,14 +396,19 @@ class GO2Connection(Module, Camera, Pointcloud):
             self.odom.publish(msg)
 
     def publish_camera_info(self) -> None:
-        while True:
+        while not self._camera_info_stop_event.is_set():
             self.camera_info.publish(self.camera_info_static)
-            time.sleep(1.0)
+            self._camera_info_stop_event.wait(1.0)
 
     @rpc
     def move(self, twist: Twist, duration: float = 0.0) -> bool:
         """Send movement command to robot."""
-        return self.connection.move(twist, duration)
+        if self._stopping.is_set():
+            return False
+        with self._motion_lock:
+            if self._stopping.is_set():
+                return False
+            return self.connection.move(twist, duration)
 
     @rpc
     def standup(self) -> bool:
@@ -375,7 +418,8 @@ class GO2Connection(Module, Camera, Pointcloud):
     @rpc
     def liedown(self) -> bool:
         """Make the robot lie down."""
-        return self.connection.liedown()
+        with self._motion_lock:
+            return self.connection.liedown()
 
     @rpc
     def balance_stand(self) -> bool:

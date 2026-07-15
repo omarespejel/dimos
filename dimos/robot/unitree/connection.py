@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+from concurrent.futures import Future
 from dataclasses import dataclass
 import functools
 import json
@@ -108,10 +109,16 @@ class UnitreeWebRTCConnection(Resource):
     ) -> None:
         self.ip = ip
         self.mode = mode
-        self.stop_timer: threading.Timer | None = None
+        self.stop_timer: asyncio.TimerHandle | None = None
+        self._movement_generation = 0
+        self._disconnect_complete = False
         self.cmd_vel_timeout = 0.2
         self._velocity_api = velocity_api
         self._move_ids = SequentialIds()
+        self._stop_lock = threading.Lock()
+        self._stop_started = False
+        self._stop_complete = threading.Event()
+        self._stop_error: Exception | None = None
         # Per-device AES-128 key for new Unitree firmware (data2=3 handshake); omitted when unset.
         self.conn = LegionConnection(
             WebRTCConnectionMethod.LocalSTA, ip=self.ip, aes_128_key=aes_128_key
@@ -120,6 +127,11 @@ class UnitreeWebRTCConnection(Resource):
 
     def connect(self) -> None:
         self.loop = asyncio.new_event_loop()
+        self._movement_stopped_event = asyncio.Event()
+        self._movement_stopped_event.set()
+        self._close_loop_on_thread_exit = threading.Event()
+        self._finish_stop_on_thread_exit = threading.Event()
+        self._stop_loop_on_cleanup_exit = threading.Event()
 
         async def async_connect() -> None:
             await self.conn.connect()
@@ -133,7 +145,13 @@ class UnitreeWebRTCConnection(Resource):
 
         def start_background_loop() -> None:
             asyncio.set_event_loop(self.loop)
-            self.loop.run_forever()
+            try:
+                self.loop.run_forever()
+            finally:
+                if self._close_loop_on_thread_exit.is_set():
+                    self._close_event_loop()
+                if self._finish_stop_on_thread_exit.is_set():
+                    self._finish_stop()
 
         self.thread = threading.Thread(target=start_background_loop, daemon=True)
         self.thread.start()
@@ -142,33 +160,230 @@ class UnitreeWebRTCConnection(Resource):
         try:
             asyncio.run_coroutine_threadsafe(async_connect(), self.loop).result()
         except Exception:
+            self._close_loop_on_thread_exit.set()
             self.loop.call_soon_threadsafe(self.loop.stop)
             self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+            self._close_event_loop()
             raise
+
+    def _close_event_loop(self) -> None:
+        """Close the stopped loop from its owner or after its thread exits."""
+        if self.loop.is_running() or self.loop.is_closed():
+            return
+        if self.thread.is_alive() and threading.current_thread() is not self.thread:
+            return
+        self.loop.close()
 
     def start(self) -> None:
         pass
 
+    def _claim_stop(self) -> bool:
+        """Return whether this caller owns the one shutdown transition."""
+        with self._stop_lock:
+            if self._stop_started:
+                return False
+            self._stop_started = True
+            return True
+
+    def _record_stop_error(self, error: Exception | None) -> None:
+        if error is None:
+            return
+        with self._stop_lock:
+            if self._stop_error is None:
+                self._stop_error = error
+
+    def _finish_stop(self, error: Exception | None = None) -> None:
+        """Publish the shared shutdown result to all waiting callers."""
+        self._record_stop_error(error)
+        self._stop_complete.set()
+
+    def _wait_for_stop(self) -> None:
+        """Wait for the shutdown owner without blocking the connection loop."""
+        if threading.current_thread() is self.thread and not self._stop_complete.is_set():
+            return
+        self._stop_complete.wait()
+        with self._stop_lock:
+            error = self._stop_error
+        if error is not None:
+            raise error
+
+    def _cancel_and_drain_loop_future(
+        self,
+        future: Future[Any],
+        operation_complete: threading.Event,
+        operation: str,
+    ) -> bool:
+        """Cancel a timed-out loop task and wait for its actual coroutine exit."""
+        future.cancel()
+        if operation_complete.wait(timeout=DEFAULT_THREAD_JOIN_TIMEOUT):
+            return True
+        logger.warning(
+            "Timed out draining cancelled Unitree %s task after %.1f seconds",
+            operation,
+            DEFAULT_THREAD_JOIN_TIMEOUT,
+        )
+        return False
+
     def stop(self) -> None:
-        # Cancel timer
-        if self.stop_timer:
-            self.stop_timer.cancel()
-            self.stop_timer = None
+        if not self._claim_stop():
+            self._wait_for_stop()
+            return
+
+        movement_error: Exception | None = None
+        completion_deferred = False
+        terminal_error: Exception | None = None
+        stop_loop_here = True
+        disconnect_complete = threading.Event()
+        movement_retry_complete = threading.Event()
 
         async def async_disconnect() -> None:
             try:
-                self._publish_movement(0, 0, 0)
                 await self.conn.disconnect()
-            except Exception:
-                pass
+                self._disconnect_complete = True
+            finally:
+                disconnect_complete.set()
+                if self._stop_loop_on_cleanup_exit.is_set():
+                    self._close_loop_on_thread_exit.set()
+                    self.loop.stop()
 
-        if self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
+        async def wait_for_movement_stop_retry() -> None:
+            try:
+                try:
+                    await asyncio.wait_for(
+                        self._movement_stopped_event.wait(),
+                        timeout=DEFAULT_THREAD_JOIN_TIMEOUT,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "Timed out waiting for Unitree movement-stop retry after %.1f seconds",
+                        DEFAULT_THREAD_JOIN_TIMEOUT,
+                    )
+            finally:
+                movement_retry_complete.set()
+                if self._stop_loop_on_cleanup_exit.is_set():
+                    self._close_loop_on_thread_exit.set()
+                    self.loop.stop()
 
-            self.loop.call_soon_threadsafe(self.loop.stop)
+        try:
+            if self._disconnect_complete and not self.thread.is_alive():
+                self._close_event_loop()
+                return
 
-        if self.thread.is_alive():
-            self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+            try:
+                self.stop_movement()
+            except Exception as e:
+                movement_error = e
+
+            if self.loop.is_running():
+                if threading.current_thread() is self.thread:
+
+                    async def disconnect_then_stop() -> None:
+                        try:
+                            if movement_error is not None:
+                                await wait_for_movement_stop_retry()
+                            try:
+                                await asyncio.wait_for(
+                                    async_disconnect(),
+                                    timeout=DEFAULT_THREAD_JOIN_TIMEOUT,
+                                )
+                            except TimeoutError:
+                                logger.warning(
+                                    "Timed out waiting for Unitree WebRTC disconnect after %.1f seconds",
+                                    DEFAULT_THREAD_JOIN_TIMEOUT,
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to disconnect Unitree WebRTC connection: %s", e
+                                )
+                        finally:
+                            self._close_loop_on_thread_exit.set()
+                            self.loop.stop()
+
+                    self._record_stop_error(movement_error)
+                    self._finish_stop_on_thread_exit.set()
+                    self.loop.create_task(disconnect_then_stop())
+                    completion_deferred = True
+                    if movement_error is not None:
+                        raise movement_error
+                    return
+
+                if movement_error is not None:
+                    retry_future = asyncio.run_coroutine_threadsafe(
+                        wait_for_movement_stop_retry(), self.loop
+                    )
+                    try:
+                        retry_future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT * 2)
+                    except TimeoutError:
+                        stop_loop_here = False
+                        self._stop_loop_on_cleanup_exit.set()
+                        if not self._cancel_and_drain_loop_future(
+                            retry_future,
+                            movement_retry_complete,
+                            "movement-stop retry",
+                        ):
+                            raise TimeoutError(
+                                "Timed out draining Unitree movement-stop retry task"
+                            ) from None
+                        raise TimeoutError(
+                            "Timed out waiting for Unitree movement-stop retry task"
+                        ) from None
+
+                future = asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
+                try:
+                    future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+                except TimeoutError:
+                    stop_loop_here = False
+                    self._stop_loop_on_cleanup_exit.set()
+                    if not self._cancel_and_drain_loop_future(
+                        future,
+                        disconnect_complete,
+                        "WebRTC disconnect",
+                    ):
+                        raise TimeoutError(
+                            "Timed out draining Unitree WebRTC disconnect task"
+                        ) from None
+                    logger.warning(
+                        "Timed out waiting for Unitree WebRTC disconnect after %.1f seconds",
+                        DEFAULT_THREAD_JOIN_TIMEOUT,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to disconnect Unitree WebRTC connection: %s", e)
+                finally:
+                    if stop_loop_here:
+                        self._close_loop_on_thread_exit.set()
+                        self.loop.call_soon_threadsafe(self.loop.stop)
+
+            elif not self.loop.is_closed():
+                if self.thread.is_alive():
+                    self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+                try:
+                    self.loop.run_until_complete(async_disconnect())
+                except Exception as e:
+                    logger.warning("Failed to disconnect stopped Unitree WebRTC loop: %s", e)
+            else:
+                logger.warning("Cannot disconnect Unitree WebRTC connection: event loop is closed")
+
+            if self.thread.is_alive():
+                self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+            if self.thread.is_alive():
+                shutdown_timeout = TimeoutError(
+                    "Timed out waiting for Unitree WebRTC event loop to stop"
+                )
+                logger.warning("%s", shutdown_timeout)
+                if movement_error is None:
+                    raise shutdown_timeout
+
+            self._close_event_loop()
+
+            if movement_error is not None:
+                raise movement_error
+        except Exception as e:
+            terminal_error = e
+            raise
+        finally:
+            if not completion_deferred:
+                self._finish_stop(terminal_error or movement_error)
 
     def _publish_movement(self, x: float, y: float, yaw: float) -> None:
         if self._velocity_api:
@@ -205,6 +420,7 @@ class UnitreeWebRTCConnection(Resource):
         x, y, yaw = twist.linear.x, twist.linear.y, twist.angular.z
 
         async def async_move() -> None:
+            self._arm_movement_watchdog()
             self._publish_movement(x, y, yaw)
 
         async def async_move_duration() -> None:
@@ -215,15 +431,6 @@ class UnitreeWebRTCConnection(Resource):
             while time.time() - start_time < duration:
                 await async_move()
                 await asyncio.sleep(sleep_time)
-
-        # Cancel existing timer and start a new one
-        if self.stop_timer:
-            self.stop_timer.cancel()
-
-        # Auto-stop after 0.5 seconds if no new commands
-        self.stop_timer = threading.Timer(self.cmd_vel_timeout, self.stop_movement)
-        self.stop_timer.daemon = True
-        self.stop_timer.start()
 
         try:
             if duration > 0:
@@ -471,31 +678,69 @@ class UnitreeWebRTCConnection(Resource):
         return self.video_stream()
 
     def stop_movement(self) -> None:
-        """Cancel the auto-stop timer (used by move() for continuous commands)."""
+        """Cancel the watchdog and publish zero velocity on the active wire API."""
+        if threading.current_thread() is self.thread:
+            self._stop_movement_on_loop()
+            return
+        if not self.loop.is_running():
+            logger.warning("Cannot send movement stop: WebRTC event loop is not running")
+            return
+
+        async def async_stop() -> None:
+            self._stop_movement_on_loop()
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(async_stop(), self.loop)
+            future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        except Exception as e:
+            logger.warning("Failed to send movement stop: %s", e)
+            raise
+
+    def _cancel_movement_watchdog(self) -> None:
+        """Invalidate the current watchdog. Must run on the WebRTC event loop."""
+        self._movement_generation += 1
         if self.stop_timer:
             self.stop_timer.cancel()
             self.stop_timer = None
+
+    def _arm_movement_watchdog(self) -> None:
+        """Refresh the command-scoped watchdog on the WebRTC event loop."""
+        generation = self._movement_generation + 1
+        replacement = self.loop.call_later(
+            self.cmd_vel_timeout,
+            self._movement_watchdog_expired,
+            generation,
+        )
+        previous = self.stop_timer
+        self._movement_stopped_event.clear()
+        self._movement_generation = generation
+        self.stop_timer = replacement
+        if previous:
+            previous.cancel()
+
+    def _movement_watchdog_expired(self, generation: int) -> None:
+        """Stop only if this callback still owns the active command generation."""
+        if generation != self._movement_generation:
+            return
+        try:
+            self._stop_movement_on_loop()
+        except Exception as e:
+            logger.warning("Failed to publish watchdog stop; retry remains armed: %s", e)
+
+    def _stop_movement_on_loop(self) -> None:
+        """Publish zero velocity before retiring the active watchdog."""
+        try:
+            self._publish_movement(0.0, 0.0, 0.0)
+        except Exception:
+            # Keep a bounded-delay fail-safe alive if the transport rejects the
+            # zero command. _arm_movement_watchdog preserves the current handle
+            # when scheduling the replacement itself fails.
+            self._movement_stopped_event.clear()
+            self._arm_movement_watchdog()
+            raise
+        self._cancel_movement_watchdog()
+        self._movement_stopped_event.set()
 
     def disconnect(self) -> None:
         """Disconnect from the robot and clean up resources."""
-        # Cancel timer
-        if self.stop_timer:
-            self.stop_timer.cancel()
-            self.stop_timer = None
-
-        if hasattr(self, "conn"):
-
-            async def async_disconnect() -> None:
-                try:
-                    await self.conn.disconnect()
-                except:
-                    pass
-
-            if hasattr(self, "loop") and self.loop.is_running():
-                asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
-
-        if hasattr(self, "loop") and self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
-
-        if hasattr(self, "thread") and self.thread.is_alive():
-            self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        self.stop()
