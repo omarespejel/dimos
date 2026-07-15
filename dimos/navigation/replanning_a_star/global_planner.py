@@ -62,6 +62,7 @@ class GlobalPlanner(Resource):
     _replan_event: Event
     _replan_reason: StopMessage | None
     _lock: RLock
+    _activation_lock: RLock
     _safe_goal_clearance: float
 
     _safe_goal_tolerance: float = 4.0
@@ -95,6 +96,7 @@ class GlobalPlanner(Resource):
         self._replan_event = Event()
         self._replan_reason = None
         self._lock = RLock()
+        self._activation_lock = RLock()
         self._reset_safe_goal_clearance()
 
     def start(self) -> None:
@@ -107,11 +109,13 @@ class GlobalPlanner(Resource):
         self._thread.start()
 
     def stop(self) -> None:
-        self.cancel_goal()
-        self._local_planner.stop()
-        self._disposables.dispose()
+        # Block the monitor before LocalPlanner emits its final stop event. Otherwise the
+        # callback can request a replan after cancel_goal() has cleared the active goal.
         self._stop_planner.set()
         self._replan_event.set()
+        self._disposables.dispose()
+        self.cancel_goal()
+        self._local_planner.stop()
 
         if self._thread is not None and self._thread is not current_thread():
             self._thread.join(DEFAULT_THREAD_JOIN_TIMEOUT)
@@ -131,10 +135,14 @@ class GlobalPlanner(Resource):
         self._navigation_map_near.update(msg)
 
     def handle_goal_request(self, goal: PoseStamped) -> None:
-        logger.info("Got new goal", goal=str(goal))
-        with self._lock:
-            self._current_goal = goal
-            self._goal_reached = False
+        with self._activation_lock:
+            if self._stop_planner.is_set():
+                logger.debug("Ignoring goal request during planner shutdown.")
+                return
+            logger.info("Got new goal", goal=str(goal))
+            with self._lock:
+                self._current_goal = goal
+                self._goal_reached = False
         self._replan_limiter.reset()
         self._plan_path()
 
@@ -146,27 +154,32 @@ class GlobalPlanner(Resource):
         self._reset_safe_goal_clearance()
 
     def cancel_goal(self, *, but_will_try_again: bool = False, arrived: bool = False) -> None:
-        # return silently so we don't flood the logs.
-        with self._lock:
-            no_goal = self._current_goal is None
-        if no_goal and self._local_planner.get_state() == NavigationState.IDLE:
-            return
+        with self._activation_lock:
+            # Keep the complete cancellation transition serialized with goal
+            # requests. Subject callbacks are synchronous, but releasing this
+            # lock before the empty-path publication and local stop would let a
+            # new goal activate and then be stopped by stale cancellation work.
+            # return silently so we don't flood the logs.
+            with self._lock:
+                no_goal = self._current_goal is None
+            if no_goal and self._local_planner.get_state() == NavigationState.IDLE:
+                return
 
-        logger.info("Cancelling goal.", but_will_try_again=but_will_try_again, arrived=arrived)
+            logger.info("Cancelling goal.", but_will_try_again=but_will_try_again, arrived=arrived)
 
-        with self._lock:
-            self._position_tracker.reset_data()
+            with self._lock:
+                self._position_tracker.reset_data()
+
+                if not but_will_try_again:
+                    self._current_goal = None
+                    self._goal_reached = arrived
+                    self._replan_limiter.reset()
+
+            self.path.on_next(Path())
+            self._local_planner.stop_planning()
 
             if not but_will_try_again:
-                self._current_goal = None
-                self._goal_reached = arrived
-                self._replan_limiter.reset()
-
-        self.path.on_next(Path())
-        self._local_planner.stop_planning()
-
-        if not but_will_try_again:
-            self.goal_reached.on_next(Bool(arrived))
+                self.goal_reached.on_next(Bool(arrived))
 
     def set_replanning_enabled(self, enabled: bool) -> None:
         with self._lock:
@@ -258,6 +271,9 @@ class GlobalPlanner(Resource):
                 last_stuck_check = time.perf_counter()
 
     def _on_stopped_navigating(self, stop_message: StopMessage) -> None:
+        if self._stop_planner.is_set():
+            return
+
         with self._lock:
             self._replan_reason = stop_message
         # Signal the monitoring thread to do the replanning. This is so we don't have two
@@ -287,10 +303,11 @@ class GlobalPlanner(Resource):
             current_odom = self._current_odom
             current_goal = self._current_goal
 
-        logger.info("Replanning.", attempt=self._replan_limiter.get_attempt())
+        if self._stop_planner.is_set() or current_odom is None or current_goal is None:
+            logger.debug("Skipping replan during shutdown or without an active goal and odometry.")
+            return
 
-        assert current_odom is not None
-        assert current_goal is not None
+        logger.info("Replanning.", attempt=self._replan_limiter.get_attempt())
 
         if current_goal.position.distance(current_odom.position) < self._replan_goal_tolerance:
             self.cancel_goal(arrived=True)
@@ -309,13 +326,18 @@ class GlobalPlanner(Resource):
         self._plan_path()
 
     def _plan_path(self) -> None:
+        if self._stop_planner.is_set():
+            return
+
         self.cancel_goal(but_will_try_again=True)
 
         with self._lock:
             current_odom = self._current_odom
             current_goal = self._current_goal
 
-        assert current_goal is not None
+        if self._stop_planner.is_set() or current_goal is None:
+            logger.debug("Skipping path planning during shutdown or without an active goal.")
+            return
 
         if current_odom is None:
             logger.warning("Cannot handle goal request: missing odometry.")
@@ -341,9 +363,28 @@ class GlobalPlanner(Resource):
 
         resampled_path = smooth_resample_path(path, current_goal, 0.1)
 
-        self.path.on_next(resampled_path)
+        with self._activation_lock:
+            # This is intentionally one activation transition. A concurrent
+            # cancel waits and then stops the newly activated path; a reentrant
+            # cancel from a synchronous path subscriber clears the goal and is
+            # detected by the validation below. Publishing or activating after
+            # releasing this lock would allow motion to restart after cancel.
+            with self._lock:
+                goal_is_current = self._current_goal is current_goal
+            if self._stop_planner.is_set() or not goal_is_current:
+                logger.debug("Discarding a path computed for an inactive goal.")
+                return
 
-        self._local_planner.start_planning(resampled_path)
+            self.path.on_next(resampled_path)
+
+            # Subject callbacks run synchronously and may cancel the goal reentrantly.
+            with self._lock:
+                goal_is_current = self._current_goal is current_goal
+            if self._stop_planner.is_set() or not goal_is_current:
+                logger.debug("Discarding a path cancelled while being published.")
+                return
+
+            self._local_planner.start_planning(resampled_path)
 
     def _find_wide_path(self, goal: Vector3, robot_pos: Vector3) -> Path | None:
         #        sizes_to_try: list[float] = [2.2, 1.7, 1.3, 1]
