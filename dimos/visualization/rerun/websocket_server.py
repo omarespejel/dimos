@@ -201,6 +201,11 @@ class RerunWebSocketServer(Module):
                     if time.monotonic() >= deadline:
                         raise TimeoutError("WebSocket server did not become ready")
             except BaseException:
+                # Startup failure is terminal for this module instance. A
+                # run_coroutine_threadsafe submission may still be queued on a
+                # live but stalled borrowed loop; its first step must observe
+                # this request before it can bind a listener.
+                self._stop_requested.set()
                 cleanup_complete = self._cancel_serve_and_wait()
                 self._serve_error_reported = True
                 if not cleanup_complete:
@@ -294,6 +299,8 @@ class RerunWebSocketServer(Module):
             # teardown gates.
             if not self._serve_started.is_set() and not self._is_on_module_loop():
                 self._serve_started.wait(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+            if self._serve_teardown_complete.is_set():
+                return True
             task = self._serve_task
             loop = self._loop
             if task is None or loop is None or loop.is_closed() or not loop.is_running():
@@ -467,12 +474,9 @@ class RerunWebSocketServer(Module):
                 if self._server_ready.is_set() and self._stop_event is not None:
                     self._stop_event.set()
                 else:
-                    future = self._serve_future
-                    if future is not None and not future.done():
-                        try:
-                            future.cancel()
-                        except RuntimeError as error:
-                            logger.warning(f"Could not cancel WebSocket serve future: {error}")
+                    task = self._serve_task
+                    if task is not None and not task.done():
+                        task.cancel()
                 self._schedule_deferred_finalizer()
             finally:
                 self._lifecycle_lock.release()
@@ -542,6 +546,12 @@ class RerunWebSocketServer(Module):
         self._serve_coroutine = None
         self._serve_started.set()
         try:
+            # Do not enter the server context after start() or same-loop stop()
+            # has failed an as-yet-unstarted submission. Cancelling the chained
+            # concurrent Future before this Task's first step can skip this
+            # wrapper's finally block and strand both lifecycle gates.
+            if self._stop_requested.is_set():
+                return
             await self._serve()
         except (asyncio.CancelledError, GeneratorExit):
             raise

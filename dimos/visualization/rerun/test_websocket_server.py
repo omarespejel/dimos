@@ -592,21 +592,44 @@ def test_same_loop_stop_after_readiness_check_is_not_lost(
     assert loop is not None
     final_readiness_check = threading.Event()
     release_readiness_check = threading.Event()
+    readiness_wait_returned = threading.Event()
     same_loop_stop_done = threading.Event()
     start_done = threading.Event()
     start_errors: list[BaseException] = []
     same_loop_errors: list[BaseException] = []
 
+    class ObservedServerReady:
+        def __init__(self) -> None:
+            self._event = threading.Event()
+
+        def clear(self) -> None:
+            self._event.clear()
+
+        def is_set(self) -> bool:
+            return self._event.is_set()
+
+        def set(self) -> None:
+            self._event.set()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            ready = self._event.wait(timeout)
+            if ready:
+                readiness_wait_returned.set()
+            return ready
+
     class GatedStopRequest:
         def __init__(self) -> None:
             self._event = threading.Event()
             self._lock = threading.Lock()
-            self._checks = 0
+            self._gated_after_readiness = False
 
         def is_set(self) -> bool:
             with self._lock:
-                self._checks += 1
-                gate_this_check = self._checks == 4
+                gate_this_check = (
+                    readiness_wait_returned.is_set() and not self._gated_after_readiness
+                )
+                if gate_this_check:
+                    self._gated_after_readiness = True
                 value = self._event.is_set()
             if gate_this_check:
                 final_readiness_check.set()
@@ -617,6 +640,7 @@ def test_same_loop_stop_after_readiness_check_is_not_lost(
         def set(self) -> None:
             self._event.set()
 
+    monkeypatch.setattr(module, "_server_ready", ObservedServerReady())
     monkeypatch.setattr(module, "_stop_requested", GatedStopRequest())
 
     def start_module() -> None:
@@ -657,6 +681,111 @@ def test_same_loop_stop_after_readiness_check_is_not_lost(
         release_readiness_check.set()
         starter.join(timeout=2.0)
         module.stop()
+
+
+def test_start_timeout_aborts_unstarted_submission_before_live_loop_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+    unused_tcp_port: int,
+) -> None:
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever)
+    loop_thread.start()
+    blocker_entered = threading.Event()
+    release_blocker = threading.Event()
+    submitted = threading.Event()
+    context_entered = threading.Event()
+    start_done = threading.Event()
+    start_errors: list[BaseException] = []
+
+    async def construct_on_borrowed_loop() -> RerunWebSocketServer:
+        return RerunWebSocketServer()
+
+    module = asyncio.run_coroutine_threadsafe(construct_on_borrowed_loop(), loop).result(
+        timeout=2.0
+    )
+    original_submit = asyncio.run_coroutine_threadsafe
+
+    class BindingContext:
+        def __init__(self) -> None:
+            self.listener: socket.socket | None = None
+
+        async def __aenter__(self) -> object:
+            listener = socket.socket()
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", unused_tcp_port))
+            listener.listen()
+            self.listener = listener
+            context_entered.set()
+            return object()
+
+        async def __aexit__(self, *_args: Any) -> None:
+            assert self.listener is not None
+            self.listener.close()
+
+    def block_loop() -> None:
+        blocker_entered.set()
+        assert release_blocker.wait(timeout=2.0)
+
+    def observed_submit(coroutine: Any, target_loop: asyncio.AbstractEventLoop) -> Any:
+        future = original_submit(coroutine, target_loop)
+        submitted.set()
+        return future
+
+    def start_module() -> None:
+        try:
+            module.start()
+        except BaseException as error:
+            start_errors.append(error)
+        finally:
+            start_done.set()
+
+    async def drain_loop() -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(ws_server, "serve", lambda *_args, **_kwargs: BindingContext())
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", observed_submit)
+    monkeypatch.setattr(websocket_server_module, "DEFAULT_THREAD_JOIN_TIMEOUT", 0.0)
+    loop.call_soon_threadsafe(block_loop)
+    assert blocker_entered.wait(timeout=2.0)
+    starter = threading.Thread(target=start_module)
+    try:
+        starter.start()
+        assert submitted.wait(timeout=2.0)
+        assert start_done.wait(timeout=2.0)
+        starter.join(timeout=2.0)
+
+        assert not starter.is_alive()
+        assert len(start_errors) == 1
+        assert isinstance(start_errors[0], TimeoutError)
+        assert "did not become ready" in str(start_errors[0])
+        assert not module._serve_started.is_set()
+        assert not context_entered.is_set()
+
+        drain_future = original_submit(drain_loop(), loop)
+        release_blocker.set()
+        drain_future.result(timeout=2.0)
+
+        assert module._serve_teardown_complete.wait(timeout=2.0)
+        assert module._module_finalize_complete.wait(timeout=2.0)
+        assert not context_entered.is_set()
+        assert not module._server_ready.is_set()
+        assert module._ws_server is None
+        assert loop.is_running()
+        module.stop()
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", unused_tcp_port))
+    finally:
+        release_blocker.set()
+        monkeypatch.setattr(websocket_server_module, "DEFAULT_THREAD_JOIN_TIMEOUT", 2.0)
+        if not module._module_finalize_complete.is_set():
+            module.stop()
+        starter.join(timeout=2.0)
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=2.0)
+        if not loop.is_closed():
+            loop.close()
 
 
 def test_start_force_finalizes_when_borrowed_loop_closes_before_serve_runs(
