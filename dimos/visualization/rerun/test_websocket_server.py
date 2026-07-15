@@ -372,3 +372,49 @@ def test_stop_reports_incomplete_serve_teardown(monkeypatch: pytest.MonkeyPatch)
     finally:
         monkeypatch.setattr(module, "_cancel_serve_and_wait", cancel_serve_and_wait)
         module.stop()
+
+
+def test_ready_server_stop_preserves_loop_until_context_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = RerunWebSocketServer()
+    context_exit_entered = threading.Event()
+    exit_gate: asyncio.Event | None = None
+
+    class SlowExitServerContext:
+        async def __aenter__(self) -> None:
+            nonlocal exit_gate
+            exit_gate = asyncio.Event()
+
+        async def __aexit__(self, *_args: Any) -> None:
+            assert exit_gate is not None
+            context_exit_entered.set()
+            await exit_gate.wait()
+
+    def slow_exit_serve(*_args: Any, **_kwargs: Any) -> SlowExitServerContext:
+        return SlowExitServerContext()
+
+    monkeypatch.setattr(ws_server, "serve", slow_exit_serve)
+    monkeypatch.setattr(websocket_server_module, "DEFAULT_THREAD_JOIN_TIMEOUT", 0.05)
+    try:
+        module.start()
+        with pytest.raises(TimeoutError, match="teardown did not complete"):
+            module.stop()
+
+        assert context_exit_entered.is_set()
+        assert module._loop is not None
+        assert not module._loop.is_closed()
+        assert module._loop_thread is not None
+        assert module._loop_thread.is_alive()
+
+        assert exit_gate is not None
+        module._loop.call_soon_threadsafe(exit_gate.set)
+        assert module._serve_teardown_complete.wait(timeout=2.0)
+        module.stop()
+        assert module._loop is None
+        assert module._loop_thread is None
+    finally:
+        if exit_gate is not None and module._loop is not None:
+            module._loop.call_soon_threadsafe(exit_gate.set)
+            module._serve_teardown_complete.wait(timeout=2.0)
+        module.stop()

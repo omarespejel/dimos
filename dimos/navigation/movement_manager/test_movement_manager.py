@@ -212,7 +212,7 @@ def test_non_finite_navigation_is_rejected(
 
     manager._on_nav(Twist(linear, angular))
 
-    assert captured.cmd_vel == []
+    assert captured.cmd_vel == [_twist()]
 
 
 def test_finite_navigation_keeps_planner_owned_speed_envelope(
@@ -277,14 +277,15 @@ def test_stop_before_first_goal_rejects_replayed_clicks(
     manager, captured = manager_and_captured
     manager.config.latch_teleop_stop = True
     manager.config.tele_cooldown_sec = 0.0
-    monkeypatch.setattr(time, "time", lambda: 100.0)
+    stop_ts = 1_700_000_000.0
+    monkeypatch.setattr(time, "time", lambda: stop_ts)
 
     manager._on_teleop_stop(Bool(data=True))
     goal_count = len(captured.goal)
     way_point_count = len(captured.way_point)
-    manager._on_click(_click(x=2.0, ts=99.0))
-    manager._on_click(_click(x=3.0, ts=100.0))
-    manager._on_click(_click(x=4.0, ts=101.0))
+    manager._on_click(_click(x=2.0, ts=stop_ts - 1.0))
+    manager._on_click(_click(x=3.0, ts=stop_ts))
+    manager._on_click(_click(x=4.0, ts=stop_ts + 1.0))
     manager._on_nav(_twist(lx=0.9))
 
     assert len(captured.goal) == goal_count + 1
@@ -294,6 +295,57 @@ def test_stop_before_first_goal_rejects_replayed_clicks(
     assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
     assert not manager._operator_stop_latched
     assert manager._operator_stop_ts is None
+
+
+def test_stop_before_first_goal_accepts_relative_timestamp_by_arrival_order(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager.config.tele_cooldown_sec = 0.0
+
+    manager._on_teleop_stop(Bool(data=True))
+    manager._on_click(_click(x=4.0, ts=12.0))
+    manager._on_nav(_twist(lx=0.9))
+
+    assert captured.goal[-1].x == 4.0
+    assert captured.cmd_vel == [_twist(), _twist(lx=0.9)]
+    assert not manager._operator_stop_latched
+
+
+def test_latched_stop_rejects_timestamp_domain_change(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager._on_click(_click(ts=12.0))
+    manager._on_teleop_stop(Bool(data=True))
+    goal_count = len(captured.goal)
+
+    manager._on_click(_click(ts=1_700_000_001.0))
+
+    assert len(captured.goal) == goal_count
+    assert captured.cmd_vel == [_twist()]
+    assert manager._operator_stop_latched
+
+
+def test_missing_timestamp_releases_latch_after_relative_goal(
+    manager_and_captured: tuple[MovementManager, Captured],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, captured = manager_and_captured
+    manager.config.latch_teleop_stop = True
+    manager._on_click(_click(ts=12.0))
+    monkeypatch.setattr(time, "time", lambda: 1_700_000_000.0)
+    manager._on_teleop_stop(Bool(data=True))
+
+    monkeypatch.setattr(time, "time", lambda: 1_700_000_001.0)
+    manager._on_click(_click(x=4.0, ts=0.0))
+
+    assert captured.goal[-1].x == 4.0
+    assert captured.goal[-1].ts == 1_700_000_001.0
+    assert captured.cmd_vel == [_twist()]
+    assert not manager._operator_stop_latched
 
 
 @pytest.mark.parametrize(
@@ -532,6 +584,47 @@ def test_stop_zero_is_final_and_suppresses_waiting_callback(
     assert captured.cmd_vel[-1].is_zero()
 
 
+def test_concurrent_stop_waits_for_first_stop_to_complete(
+    manager_and_captured: tuple[MovementManager, Captured],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _captured = manager_and_captured
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    second_returned = threading.Event()
+    original_close = manager._close_module
+
+    def blocking_close() -> None:
+        close_entered.set()
+        assert release_close.wait(timeout=2.0)
+        original_close()
+
+    monkeypatch.setattr(manager, "_close_module", blocking_close)
+    first = threading.Thread(target=manager.stop)
+
+    def stop_again() -> None:
+        manager.stop()
+        second_returned.set()
+
+    second = threading.Thread(target=stop_again)
+    try:
+        first.start()
+        assert close_entered.wait(timeout=2.0)
+        second.start()
+        assert not second_returned.wait(timeout=0.05)
+        release_close.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+    finally:
+        release_close.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert second_returned.is_set()
+
+
 def test_cancel_goal_uses_configured_planning_frame() -> None:
     manager = MovementManager(planning_frame_id="/world")
     captured, unsubs = _attach(manager)
@@ -569,6 +662,8 @@ def test_invalid_or_out_of_range_teleop_is_rejected_before_state_change(
     angular: Vector3,
 ) -> None:
     manager, captured = manager_and_captured
+    manager.config.max_teleop_linear_speed = 1.0
+    manager.config.max_teleop_angular_speed = 2.0
 
     manager._on_teleop(Twist(linear, angular))
 
@@ -583,6 +678,8 @@ def test_teleop_rejects_scaled_output_above_configured_limit(
     manager_and_captured: tuple[MovementManager, Captured],
 ) -> None:
     manager, captured = manager_and_captured
+    manager.config.max_teleop_linear_speed = 1.0
+    manager.config.max_teleop_angular_speed = 2.0
     manager.config.tele_cmd_vel_scaling = Twist(Vector3(2, 1, 1), Vector3(1, 1, 1))
 
     manager._on_teleop(_twist(lx=0.6))
@@ -590,6 +687,17 @@ def test_teleop_rejects_scaled_output_above_configured_limit(
     assert captured.cmd_vel == [_twist()]
     assert not manager._teleop_active
     assert manager._last_teleop_time == 0.0
+
+
+def test_default_teleop_limits_preserve_finite_existing_commands(
+    manager_and_captured: tuple[MovementManager, Captured],
+) -> None:
+    manager, captured = manager_and_captured
+    command = _twist(lx=1.5)
+
+    manager._on_teleop(command)
+
+    assert captured.cmd_vel == [command]
 
 
 def test_valid_click_publishes_goal(

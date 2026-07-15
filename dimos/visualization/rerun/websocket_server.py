@@ -152,20 +152,40 @@ class RerunWebSocketServer(Module):
                 raise TimeoutError("WebSocket server teardown did not complete during stop")
             super().stop()
             return
-        try:
-            if (
-                self._loop is not None
-                and not self._loop.is_closed()
-                and self._stop_event is not None
-            ):
-                self._loop.call_soon_threadsafe(self._stop_event.set)
-                if (
-                    self._serve_future is not None
-                    and threading.current_thread() is not self._loop_thread
-                ):
-                    self._serve_future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-        finally:
+
+        loop = self._loop
+        stop_event = self._stop_event
+        future = self._serve_future
+        if loop is None or loop.is_closed() or stop_event is None or future is None:
+            if not self._cancel_serve_and_wait():
+                raise TimeoutError("WebSocket server teardown did not complete during stop")
+        else:
+            loop.call_soon_threadsafe(stop_event.set)
+            if threading.current_thread() is self._loop_thread:
+                # Closing the loop from its own thread would strand _serve().
+                # The scheduled event will unwind it; a later caller can finish
+                # module teardown once _serve_teardown_complete is set.
+                raise RuntimeError("WebSocket server cannot synchronously stop on its loop thread")
+
+            serve_error: BaseException | None = None
+            try:
+                future.result(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+            except TimeoutError as error:
+                raise TimeoutError(
+                    "WebSocket server teardown did not complete during stop"
+                ) from error
+            except BaseException as error:
+                serve_error = error
+
+            if not self._serve_teardown_complete.is_set():
+                raise TimeoutError("WebSocket server teardown did not complete during stop")
+
             super().stop()
+            if serve_error is not None:
+                raise serve_error
+            return
+
+        super().stop()
 
     async def _serve(self) -> None:
         self._stop_event = asyncio.Event()

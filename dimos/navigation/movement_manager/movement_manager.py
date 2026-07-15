@@ -28,6 +28,7 @@ from typing import Any, Literal
 from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
 from reactivex.disposable import Disposable
 
+from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
@@ -41,8 +42,7 @@ logger = setup_logger()
 # without this you can (basically) click into infinity in rerun (not good for the planner)
 MAX_CLICK_HORIZONTAL_M = 500.0
 MAX_CLICK_VERTICAL_M = 50.0
-DEFAULT_MAX_TELEOP_LINEAR_M_S = 1.0
-DEFAULT_MAX_TELEOP_ANGULAR_RAD_S = 2.0
+UNIX_TIMESTAMP_MIN_SECONDS = 1_000_000_000.0
 
 
 def _canonical_frame_id(frame_id: str) -> str:
@@ -59,32 +59,34 @@ def _twist_is_finite(twist: Twist) -> bool:
     )
 
 
-def _twist_within_limits(twist: Twist, linear_limit: float, angular_limit: float) -> bool:
-    """Return whether every Twist component is finite and within its limit."""
-    if (
-        not math.isfinite(linear_limit)
-        or not math.isfinite(angular_limit)
-        or linear_limit < 0.0
-        or angular_limit < 0.0
-    ):
+def _twist_within_limits(
+    twist: Twist, linear_limit: float | None, angular_limit: float | None
+) -> bool:
+    """Return whether every Twist component is finite and within configured limits."""
+    if not _twist_is_finite(twist):
         return False
-    return _twist_is_finite(twist) and all(
-        abs(value) <= limit
-        for vector, limit in (
-            (twist.linear, linear_limit),
-            (twist.angular, angular_limit),
-        )
-        for value in vector.as_tuple
-    )
+    for vector, limit in ((twist.linear, linear_limit), (twist.angular, angular_limit)):
+        if limit is None:
+            continue
+        if not math.isfinite(limit) or limit < 0.0:
+            return False
+        if any(abs(value) > limit for value in vector.as_tuple):
+            return False
+    return True
+
+
+def _uses_unix_timestamp(timestamp: float) -> bool:
+    """Return whether a timestamp is in the Unix-epoch domain used by the viewer."""
+    return timestamp >= UNIX_TIMESTAMP_MIN_SECONDS
 
 
 class MovementManagerConfig(ModuleConfig):
     tele_cooldown_sec: float = 1.0
     tele_cmd_vel_scaling: Twist = Twist(Vector3(1, 1, 1), Vector3(1, 1, 1))
-    # Default keyboard teleop peaks at 1 m/s linear and 1.6 rad/s angular
-    # under boost. Other control envelopes must opt in explicitly.
-    max_teleop_linear_speed: float = DEFAULT_MAX_TELEOP_LINEAR_M_S
-    max_teleop_angular_speed: float = DEFAULT_MAX_TELEOP_ANGULAR_RAD_S
+    # None preserves the historical finite-command behavior. Supervised teleop
+    # deployments should set limits for their robot and operating environment.
+    max_teleop_linear_speed: float | None = None
+    max_teleop_angular_speed: float | None = None
     planning_frame_id: str = "map"
     # mixed preserves the teleop cooldown mux; manual_only rejects all planner velocity.
     control_mode: Literal["mixed", "manual_only"] = "mixed"
@@ -118,6 +120,8 @@ class MovementManager(Module):
         self._transition_generation = 0
         self._stop_transition_active = False
         self._stopping = False
+        self._stop_owner_ident: int | None = None
+        self._stop_complete = threading.Event()
         self._planning_frame_id = _canonical_frame_id(self.config.planning_frame_id)
         if not self._planning_frame_id:
             raise ValueError("planning_frame_id must not be empty")
@@ -133,25 +137,41 @@ class MovementManager(Module):
     @rpc
     def stop(self) -> None:
         first_stop = False
+        wait_for_stop = False
+        current_ident = threading.get_ident()
         try:
             with self._lock:
                 if self._stopping:
-                    return
-                # This gate is terminal for the module instance. Set it only
-                # after any in-flight callback releases the lock, and before
-                # the final zero is published or subscriptions are torn down.
-                self._stopping = True
-                first_stop = True
-                self._teleop_active = False
-                self._operator_stop_latched = False
-                self._operator_stop_ts = None
-                self._last_goal = None
-                self._transition_generation += 1
-                self._stop_transition_active = False
-                self.cmd_vel.publish(Twist.zero())
+                    # Reentrant cleanup from the same thread must not deadlock.
+                    if self._stop_owner_ident == current_ident:
+                        return
+                    wait_for_stop = True
+                else:
+                    # This gate is terminal for the module instance. Set it only
+                    # after any in-flight callback releases the lock, and before
+                    # the final zero is published or subscriptions are torn down.
+                    self._stopping = True
+                    self._stop_owner_ident = current_ident
+                    self._stop_complete.clear()
+                    first_stop = True
+                    self._teleop_active = False
+                    self._operator_stop_latched = False
+                    self._operator_stop_ts = None
+                    self._last_goal = None
+                    self._transition_generation += 1
+                    self._stop_transition_active = False
+                    self.cmd_vel.publish(Twist.zero())
         finally:
             if first_stop:
-                super().stop()
+                try:
+                    super().stop()
+                finally:
+                    with self._lock:
+                        self._stop_owner_ident = None
+                        self._stop_complete.set()
+
+        if wait_for_stop and not self._stop_complete.wait(timeout=DEFAULT_THREAD_JOIN_TIMEOUT):
+            raise TimeoutError("MovementManager stop did not complete")
 
     def _on_click(self, msg: PointStamped) -> None:
         if not all(math.isfinite(v) for v in (msg.x, msg.y, msg.z)):
@@ -164,14 +184,15 @@ class MovementManager(Module):
         ):
             logger.warning("Ignored out-of-range click", x=msg.x, y=msg.y, z=msg.z)
             return
-        if not math.isfinite(msg.ts):
+        if not math.isfinite(msg.ts) or msg.ts < 0.0:
             logger.warning("Ignored click with invalid timestamp", ts=msg.ts)
             return
 
         # The viewer uses zero when timestamp_ms is absent. Treat receipt of
         # such a click as a new operator action while retaining explicit
         # timestamps for stale/replay protection.
-        click_ts = time.time() if msg.ts == 0.0 else msg.ts
+        timestamp_was_missing = msg.ts == 0.0
+        click_ts = time.time() if timestamp_was_missing else msg.ts
         click_frame_id = _canonical_frame_id(msg.frame_id)
         if click_frame_id != self._planning_frame_id:
             logger.warning(
@@ -180,7 +201,7 @@ class MovementManager(Module):
                 received=msg.frame_id,
             )
             return
-        if msg.frame_id != self._planning_frame_id:
+        if msg.frame_id != self._planning_frame_id or timestamp_was_missing:
             msg = PointStamped(
                 # Use the resolved receipt timestamp so PointStamped does not
                 # independently normalize an explicit zero a second time.
@@ -198,12 +219,29 @@ class MovementManager(Module):
                 logger.warning("Ignored replacement goal during STOP transition")
                 return
             if self._operator_stop_latched:
-                baseline_ts = self._operator_stop_ts
-                if self._last_goal is not None:
+                last_goal_ts = self._last_goal[0] if self._last_goal is not None else None
+                if (
+                    last_goal_ts is not None
+                    and not timestamp_was_missing
+                    and _uses_unix_timestamp(last_goal_ts) != _uses_unix_timestamp(click_ts)
+                ):
+                    logger.warning(
+                        "Ignored replacement goal from a different timestamp domain",
+                        received_ts=click_ts,
+                        last_ts=last_goal_ts,
+                    )
+                    return
+
+                # Unix timestamps are comparable to the viewer STOP boundary.
+                # Relative/replay timestamps remain supported: they are ordered
+                # against the previous goal, or by stream arrival when STOP was
+                # pressed before the first goal.
+                baseline_ts = None if timestamp_was_missing else last_goal_ts
+                if _uses_unix_timestamp(click_ts) and self._operator_stop_ts is not None:
                     baseline_ts = (
-                        self._last_goal[0]
+                        self._operator_stop_ts
                         if baseline_ts is None
-                        else max(baseline_ts, self._last_goal[0])
+                        else max(self._operator_stop_ts, baseline_ts)
                     )
                 if baseline_ts is not None and click_ts <= baseline_ts:
                     logger.warning(
@@ -258,7 +296,8 @@ class MovementManager(Module):
             # Navigation owns a different speed envelope than keyboard teleop,
             # but no planner should be able to forward NaN or infinity to cmd_vel.
             if not _twist_is_finite(msg):
-                logger.warning("Ignored non-finite navigation command")
+                logger.warning("Stopped on non-finite navigation command")
+                self.cmd_vel.publish(Twist.zero())
                 return
             if self._teleop_active:
                 # check if cooldown has expired
