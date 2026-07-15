@@ -28,29 +28,8 @@ import pytest
 import websockets.asyncio.client as ws_client
 
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
-from dimos.core.global_config import global_config
 from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
-
-_E2E_PORT = 13032
-
-
-@pytest.fixture()
-def server(wait_for_server: Any) -> Generator[RerunWebSocketServer, None, None]:
-    original_port = global_config.rerun_websocket_server_port
-    global_config.update(rerun_websocket_server_port=_E2E_PORT)
-    module: RerunWebSocketServer | None = None
-    try:
-        module = RerunWebSocketServer()
-        module.start()
-        wait_for_server(_E2E_PORT)
-        yield module
-    finally:
-        try:
-            if module is not None:
-                module.stop()
-        finally:
-            global_config.update(rerun_websocket_server_port=original_port)
 
 
 def _send_messages(port: int, messages: list[dict[str, Any]], *, delay: float = 0.05) -> None:
@@ -79,7 +58,7 @@ class TestViewerProtocolE2E:
 
         try:
             _send_messages(
-                _E2E_PORT,
+                server.port,
                 [
                     {
                         "type": "click",
@@ -118,7 +97,7 @@ class TestViewerProtocolE2E:
 
         try:
             _send_messages(
-                _E2E_PORT,
+                server.port,
                 [
                     {"type": "heartbeat", "timestamp_ms": 1000},
                     {"type": "heartbeat", "timestamp_ms": 2000},
@@ -167,7 +146,7 @@ class TestViewerProtocolE2E:
 
         try:
             _send_messages(
-                _E2E_PORT,
+                server.port,
                 [
                     {
                         "type": "click",
@@ -180,7 +159,7 @@ class TestViewerProtocolE2E:
                 ],
             )
             _send_messages(
-                _E2E_PORT,
+                server.port,
                 [
                     {
                         "type": "click",
@@ -213,7 +192,7 @@ class TestViewerBinaryConnectMode:
             [
                 "dimos-viewer",
                 "--connect",
-                f"--ws-url=ws://127.0.0.1:{_E2E_PORT}/ws",
+                f"--ws-url=ws://127.0.0.1:{server.port}/ws",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
