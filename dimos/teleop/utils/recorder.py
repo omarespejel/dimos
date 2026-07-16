@@ -77,7 +77,7 @@ class TeleopRecorder(Recorder):
         self._db_path = base.with_name(f"{base.stem}_{timestamp}{base.suffix}")
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         # Open the store ourselves so the base Recorder records into our path.
-        self._store = self.register_disposable(SqliteStore(path=str(self._db_path)))
+        self._store = SqliteStore(path=str(self._db_path))
         self._store.start()
         super().start()
 
