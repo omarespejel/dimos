@@ -19,7 +19,7 @@ import enum
 import inspect
 import os
 from pathlib import Path
-import sqlite3
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
@@ -182,16 +182,47 @@ class MemoryModule(Module):
     config: MemoryModuleConfig
     _store: SqliteStore | None = None
 
+    def __init__(self, **kwargs: Any) -> None:
+        self._memory_stop_lock = threading.RLock()
+        self._memory_stopping = False
+        self._store_stopped = False
+        super().__init__(**kwargs)
+
+    def __getstate__(self) -> dict[str, Any]:
+        state: dict[str, Any] = super().__getstate__()  # type: ignore[no-untyped-call]
+        state.pop("_memory_stop_lock", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        self._memory_stop_lock = threading.RLock()
+        self._memory_stopping = False
+
     @property
     def store(self) -> SqliteStore:
         if self._store is not None:
             return self._store
 
-        self._store = self.register_disposable(
-            SqliteStore(path=str(self.config.db_path)),
-        )
+        self._store = SqliteStore(path=str(self.config.db_path))
         self._store.start()
         return self._store
+
+    @rpc
+    def stop(self) -> None:
+        # Keep concurrent RPC and worker shutdown calls in the same critical
+        # section so neither can close the store while the other is draining
+        # callbacks.
+        with self._memory_stop_lock:
+            if self._memory_stopping:
+                return
+            self._memory_stopping = True
+            try:
+                super().stop()
+                if self._store is not None and not self._store_stopped:
+                    self._store.stop()
+                    self._store_stopped = True
+            finally:
+                self._memory_stopping = False
 
 
 class SemanticSearchConfig(MemoryModuleConfig):
@@ -441,11 +472,7 @@ class Recorder(MemoryModule):
         tf_stream = self.store.stream("tf", TFMessage)
 
         def on_tf(msg: TFMessage, _topic: Any) -> None:
-            try:
-                for transform in msg.transforms:
-                    tf_stream.append(TFMessage(transform), ts=transform.ts, pose=None)
-            except sqlite3.ProgrammingError:
-                # A late LCM callback raced teardown and hit the closed store.
-                pass
+            for transform in msg.transforms:
+                tf_stream.append(TFMessage(transform), ts=transform.ts, pose=None)
 
         self.register_disposable(Disposable(pubsub.subscribe(topic, on_tf)))
