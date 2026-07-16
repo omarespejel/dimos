@@ -704,6 +704,7 @@ def test_start_timeout_aborts_unstarted_submission_before_live_loop_resumes(
         timeout=2.0
     )
     original_submit = asyncio.run_coroutine_threadsafe
+    original_thread_join_timeout = vars(websocket_server_module)["DEFAULT_THREAD_JOIN_TIMEOUT"]
 
     class BindingContext:
         def __init__(self) -> None:
@@ -777,7 +778,11 @@ def test_start_timeout_aborts_unstarted_submission_before_live_loop_resumes(
             probe.bind(("127.0.0.1", unused_tcp_port))
     finally:
         release_blocker.set()
-        monkeypatch.setattr(websocket_server_module, "DEFAULT_THREAD_JOIN_TIMEOUT", 2.0)
+        monkeypatch.setattr(
+            websocket_server_module,
+            "DEFAULT_THREAD_JOIN_TIMEOUT",
+            original_thread_join_timeout,
+        )
         if not module._module_finalize_complete.is_set():
             module.stop()
         starter.join(timeout=2.0)
