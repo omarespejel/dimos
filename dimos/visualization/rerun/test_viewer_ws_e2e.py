@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Generator
 import json
 import os
 import subprocess
@@ -27,24 +28,8 @@ import pytest
 import websockets.asyncio.client as ws_client
 
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
-from dimos.core.global_config import global_config
+from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
-
-_E2E_PORT = 13032
-
-
-@pytest.fixture()
-def server(wait_for_server: Any) -> RerunWebSocketServer:
-    original_port = global_config.rerun_websocket_server_port
-    global_config.update(rerun_websocket_server_port=_E2E_PORT)
-    try:
-        module = RerunWebSocketServer()
-        module.start()
-        wait_for_server(_E2E_PORT)
-        yield module
-        module.stop()
-    finally:
-        global_config.update(rerun_websocket_server_port=original_port)
 
 
 def _send_messages(port: int, messages: list[dict[str, Any]], *, delay: float = 0.05) -> None:
@@ -62,15 +47,18 @@ class TestViewerProtocolE2E:
 
     def test_viewer_click_reaches_stream(self, server: RerunWebSocketServer) -> None:
         """A viewer click over WebSocket publishes PointStamped."""
-        received: list[Any] = []
+        received: list[PointStamped] = []
         done = threading.Event()
-        unsubscribe = server.clicked_point.subscribe(
-            lambda point: (received.append(point), done.set())
-        )
+
+        def capture_point(point: PointStamped) -> None:
+            received.append(point)
+            done.set()
+
+        unsubscribe = server.clicked_point.subscribe(capture_point)
 
         try:
             _send_messages(
-                _E2E_PORT,
+                server.port,
                 [
                     {
                         "type": "click",
@@ -91,20 +79,25 @@ class TestViewerProtocolE2E:
         assert point.x == pytest.approx(10.0)
         assert point.y == pytest.approx(20.0)
         assert point.z == pytest.approx(0.5)
-        assert point.frame_id == "/world/robot"
+        # Rerun entity paths identify picked entities; navigation consumes
+        # viewer coordinates in the canonical planning frame.
+        assert point.frame_id == "map"
         assert point.ts == pytest.approx(42.0)
 
     def test_full_viewer_session_sequence(self, server: RerunWebSocketServer) -> None:
         """Realistic session: heartbeats, click, twist, stop — only the click produces a point."""
-        received: list[Any] = []
+        received: list[PointStamped] = []
         done = threading.Event()
-        unsubscribe = server.clicked_point.subscribe(
-            lambda point: (received.append(point), done.set())
-        )
+
+        def capture_point(point: PointStamped) -> None:
+            received.append(point)
+            done.set()
+
+        unsubscribe = server.clicked_point.subscribe(capture_point)
 
         try:
             _send_messages(
-                _E2E_PORT,
+                server.port,
                 [
                     {"type": "heartbeat", "timestamp_ms": 1000},
                     {"type": "heartbeat", "timestamp_ms": 2000},
@@ -141,10 +134,10 @@ class TestViewerProtocolE2E:
 
     def test_reconnect_after_disconnect(self, server: RerunWebSocketServer) -> None:
         """Server keeps accepting new connections after a client disconnects."""
-        received: list[Any] = []
+        received: list[PointStamped] = []
         all_done = threading.Event()
 
-        def _on_point(point: Any) -> None:
+        def _on_point(point: PointStamped) -> None:
             received.append(point)
             if len(received) >= 2:
                 all_done.set()
@@ -153,7 +146,7 @@ class TestViewerProtocolE2E:
 
         try:
             _send_messages(
-                _E2E_PORT,
+                server.port,
                 [
                     {
                         "type": "click",
@@ -166,7 +159,7 @@ class TestViewerProtocolE2E:
                 ],
             )
             _send_messages(
-                _E2E_PORT,
+                server.port,
                 [
                     {
                         "type": "click",
@@ -190,14 +183,16 @@ class TestViewerBinaryConnectMode:
     """Smoke test: dimos-viewer binary starts in --connect mode."""
 
     @pytest.fixture()
-    def viewer_process(self, server: RerunWebSocketServer) -> subprocess.Popen[bytes]:
+    def viewer_process(
+        self, server: RerunWebSocketServer
+    ) -> Generator[subprocess.Popen[bytes], None, None]:
         if not os.environ.get("DISPLAY"):
             pytest.skip("dimos-viewer requires a display (winit cannot start without one)")
         process = subprocess.Popen(
             [
                 "dimos-viewer",
                 "--connect",
-                f"--ws-url=ws://127.0.0.1:{_E2E_PORT}/ws",
+                f"--ws-url=ws://127.0.0.1:{server.port}/ws",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

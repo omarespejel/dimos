@@ -14,35 +14,45 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable
-import time
+from collections.abc import Callable, Generator
+from contextlib import AbstractContextManager, contextmanager
 
 import pytest
-import websockets.asyncio.client as ws_client
 
-_POLL_INTERVAL = 0.1
-_SERVER_STARTUP_TIMEOUT = 5.0
+from dimos.core.global_config import global_config
+from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
 
-
-def _wait_for_server(port: int, timeout: float = _SERVER_STARTUP_TIMEOUT) -> None:
-    """Block until the WebSocket server on *port* accepts a connection."""
-
-    async def _probe() -> None:
-        async with ws_client.connect(f"ws://127.0.0.1:{port}/ws"):
-            pass
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            asyncio.run(_probe())
-            return
-        except Exception:
-            time.sleep(_POLL_INTERVAL)
-    raise TimeoutError(f"Server on port {port} did not become ready within {timeout}s")
+WebSocketServerFactory = Callable[[int], AbstractContextManager[RerunWebSocketServer]]
 
 
 @pytest.fixture()
-def wait_for_server() -> Callable[[int, float], None]:
-    """Fixture that returns a callable to wait for a WebSocket server."""
-    return _wait_for_server
+def websocket_server_factory() -> WebSocketServerFactory:
+    """Create a running WebSocket server while preserving global port config."""
+
+    @contextmanager
+    def running_server(port: int) -> Generator[RerunWebSocketServer, None, None]:
+        original_port = global_config.rerun_websocket_server_port
+        global_config.update(rerun_websocket_server_port=port)
+        module: RerunWebSocketServer | None = None
+        try:
+            module = RerunWebSocketServer()
+            module.start()
+            yield module
+        finally:
+            try:
+                if module is not None:
+                    module.stop()
+            finally:
+                global_config.update(rerun_websocket_server_port=original_port)
+
+    return running_server
+
+
+@pytest.fixture()
+def server(
+    unused_tcp_port: int,
+    websocket_server_factory: WebSocketServerFactory,
+) -> Generator[RerunWebSocketServer, None, None]:
+    """Run the WebSocket server on a per-test port safe for parallel workers."""
+    with websocket_server_factory(unused_tcp_port) as module:
+        yield module
