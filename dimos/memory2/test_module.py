@@ -354,6 +354,36 @@ def test_memory_module_refuses_store_creation_after_stop_begins(
     store_factory.assert_not_called()
 
 
+def test_memory_module_retries_failed_store_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    store.stop.side_effect = [RuntimeError("close failed"), None]
+    monkeypatch.setattr(memory_module, "SqliteStore", MagicMock(return_value=store))
+    module = MemoryModule(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    assert module.store is store
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        module.stop()
+
+    assert module._memory_stopping
+    assert not module._memory_stopped.is_set()
+    assert module._store is store
+    with pytest.raises(RuntimeError, match="stopping or stopped"):
+        assert module.store is not None
+
+    module.stop()
+
+    assert store.stop.call_count == 2
+    store.stop.assert_called_with()
+    assert module._store is None
+    assert module._memory_stopped.is_set()
+
+
 def test_memory_module_restores_fresh_runtime_store_state(tmp_path: Path) -> None:
     module = MemoryModule(
         db_path=tmp_path / "recording.db",
@@ -369,9 +399,11 @@ def test_memory_module_restores_fresh_runtime_store_state(tmp_path: Path) -> Non
     module.stop()
 
     assert "_memory_stop_lock" not in state
+    assert "_memory_stopping" not in state
     assert "_memory_stopped" not in state
     assert "_store" not in state
     assert restored._store is None
+    assert not restored._memory_stopping
     assert not restored._memory_stopped.is_set()
 
 
@@ -387,6 +419,7 @@ def test_memory_module_preserves_stopped_state_when_restored(tmp_path: Path) -> 
     restored.__setstate__(state)
 
     assert restored._module_closed
+    assert restored._memory_stopping
     assert restored._memory_stopped.is_set()
     with pytest.raises(RuntimeError, match="stopping or stopped"):
         assert restored.store is not None

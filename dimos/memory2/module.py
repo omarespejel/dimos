@@ -184,6 +184,7 @@ class MemoryModule(Module):
 
     def __init__(self, **kwargs: Any) -> None:
         self._memory_stop_lock = threading.RLock()
+        self._memory_stopping = False
         self._memory_stopped = threading.Event()
         super().__init__(**kwargs)
 
@@ -191,6 +192,7 @@ class MemoryModule(Module):
         # ModuleBase's pickle hook is intentionally untyped.
         state: dict[str, Any] = super().__getstate__()  # type: ignore[no-untyped-call]
         state.pop("_memory_stop_lock", None)
+        state.pop("_memory_stopping", None)
         state.pop("_memory_stopped", None)
         state.pop("_store", None)
         return state
@@ -198,6 +200,7 @@ class MemoryModule(Module):
     def __setstate__(self, state: dict[str, Any]) -> None:
         super().__setstate__(state)
         self._memory_stop_lock = threading.RLock()
+        self._memory_stopping = self._module_closed
         self._memory_stopped = threading.Event()
         if self._module_closed:
             self._memory_stopped.set()
@@ -205,7 +208,7 @@ class MemoryModule(Module):
 
     def _open_store(self, path: str | Path) -> SqliteStore:
         with self._memory_stop_lock:
-            if self._memory_stopped.is_set():
+            if self._memory_stopping:
                 raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
             if self._store is not None:
                 raise RuntimeError("Memory store is already open")
@@ -218,7 +221,7 @@ class MemoryModule(Module):
     @property
     def store(self) -> SqliteStore:
         with self._memory_stop_lock:
-            if self._memory_stopped.is_set():
+            if self._memory_stopping:
                 raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
             if self._store is not None:
                 return self._store
@@ -228,19 +231,19 @@ class MemoryModule(Module):
     @rpc
     def stop(self) -> None:
         # Keep concurrent RPC and worker shutdown calls in the same critical
-        # section so neither can close the store while the other is draining
-        # callbacks.
+        # section so neither can close the store while the other is disposing
+        # subscriptions.
         with self._memory_stop_lock:
             if self._memory_stopped.is_set():
                 return
-            self._memory_stopped.set()
-            try:
-                super().stop()
-            finally:
-                store = self._store
+            self._memory_stopping = True
+            super().stop()
+
+            store = self._store
+            if store is not None:
+                store.stop()
                 self._store = None
-                if store is not None:
-                    store.stop()
+            self._memory_stopped.set()
 
 
 class SemanticSearchConfig(MemoryModuleConfig):
