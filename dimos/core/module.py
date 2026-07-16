@@ -142,17 +142,27 @@ class ModuleBase(Configurable, CompositeResource):
     _loop_thread: threading.Thread | None
     _bound_rpc_calls: dict[str, RpcCall] = {}
     _module_closed: bool = False
-    _module_closed_lock: threading.Lock
+    _module_closed_lock: threading.RLock
+    _module_close_error: BaseException | None
+    _module_stop_lock: threading.RLock
+    _module_stop_started: bool
+    _module_stop_error: BaseException | None
     _loop_thread_timeout: float = 2.0
     _main_gen: AsyncGenerator[None, None] | None = None
     _tools: dict[str, Any]
     _tools_lock: threading.Lock
 
     def __init__(self, config_args: dict[str, Any]) -> None:
-        super().__init__(**config_args)
-        self._module_closed_lock = threading.Lock()
+        # These guards must exist before Configurable initialization: callers
+        # may need to clean up a partially initialized module.
+        self._module_closed_lock = threading.RLock()
+        self._module_close_error = None
+        self._module_stop_lock = threading.RLock()
+        self._module_stop_started = False
+        self._module_stop_error = None
         self._tools = {}
         self._tools_lock = threading.Lock()
+        super().__init__(**config_args)
         self._loop, self._loop_thread = get_loop()
         try:
             self.rpc = self.config.rpc_transport(  # type: ignore[call-arg]
@@ -194,41 +204,107 @@ class ModuleBase(Configurable, CompositeResource):
 
     @rpc
     def stop(self) -> None:
-        self._stop_main()
-        super().stop()
-        self._close_module()
+        with self._module_stop_lock:
+            if self._module_stop_started:
+                if self._module_stop_error is not None:
+                    raise self._module_stop_error
+                return
+            self._module_stop_started = True
+
+            first_error: BaseException | None = None
+            for teardown in (self._stop_main, super().stop, self._close_module):
+                try:
+                    teardown()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+
+            self._module_stop_error = first_error
+            if first_error is not None:
+                raise first_error
 
     def _close_module(self) -> None:
         with self._module_closed_lock:
             if self._module_closed:
+                if self._module_close_error is not None:
+                    raise self._module_close_error
                 return
             self._module_closed = True
 
-        self._close_all_tools()
-        self._close_rpc()
+            first_error: BaseException | None = None
 
-        # Save into local variables to avoid race when stopping concurrently
-        # (from RPC and worker shutdown)
-        loop_thread = getattr(self, "_loop_thread", None)
-        loop = getattr(self, "_loop", None)
+            def remember(error: BaseException) -> None:
+                nonlocal first_error
+                if first_error is None:
+                    first_error = error
 
-        if loop_thread:
-            if loop_thread.is_alive():
-                if loop:
-                    loop.call_soon_threadsafe(loop.stop)
-                loop_thread.join(timeout=self._loop_thread_timeout)
+            def attempt(teardown: Callable[[], Any]) -> None:
+                try:
+                    teardown()
+                except BaseException as error:
+                    remember(error)
+
+            attempt(self._close_all_tools)
+            attempt(self._close_rpc)
+
+            # Save into local variables to avoid races with observers while
+            # teardown owns the close lock.
+            loop_thread = getattr(self, "_loop_thread", None)
+            loop = getattr(self, "_loop", None)
             self._loop = None
             self._loop_thread = None
 
-        if hasattr(self, "_tf") and self._tf is not None:
-            self._tf.stop()
-            self._tf = None
+            if loop_thread:
+                loop_thread_alive = True
+                try:
+                    loop_thread_alive = loop_thread.is_alive()
+                except BaseException as error:
+                    remember(error)
 
-        # Stop transports and break the In/Out -> owner -> self reference
-        # cycle so the instance can be freed by refcount instead of waiting for GC.
-        for attr in [*self.inputs.values(), *self.outputs.values()]:
-            attr.stop()
-            attr.owner = None
+                if loop_thread_alive:
+                    if loop:
+                        attempt(lambda: loop.call_soon_threadsafe(loop.stop))
+                    if loop_thread is not threading.current_thread():
+                        attempt(lambda: loop_thread.join(timeout=self._loop_thread_timeout))
+
+                        try:
+                            if loop_thread.is_alive():
+                                remember(
+                                    TimeoutError(
+                                        f"{type(self).__name__} event-loop thread did not stop"
+                                    )
+                                )
+                        except BaseException as error:
+                            remember(error)
+
+            tf = getattr(self, "_tf", None)
+            self._tf = None
+            if tf is not None:
+                attempt(tf.stop)
+
+            # Stop transports and break the In/Out -> owner -> self reference
+            # cycle so the instance can be freed by refcount instead of waiting for GC.
+            streams: list[Any] = []
+            for collection_name in ("inputs", "outputs"):
+                try:
+                    streams.extend(getattr(self, collection_name).values())
+                except BaseException as error:
+                    remember(error)
+
+            for stream in streams:
+                try:
+                    stream.stop()
+                except BaseException as error:
+                    remember(error)
+                finally:
+                    try:
+                        stream.owner = None
+                    except BaseException as error:
+                        remember(error)
+
+            self._module_close_error = first_error
+            if first_error is not None:
+                raise first_error
 
     def _close_all_tools(self) -> None:
         with self._tools_lock:
@@ -241,9 +317,10 @@ class ModuleBase(Configurable, CompositeResource):
                 logger.exception("failed to stop tool-stream during module close")
 
     def _close_rpc(self) -> None:
-        if self.rpc:
-            self.rpc.stop()  # type: ignore[attr-defined]
-            self.rpc = None  # type: ignore[assignment]
+        rpc_transport = getattr(self, "rpc", None)
+        self.rpc = None  # type: ignore[assignment]
+        if rpc_transport:
+            rpc_transport.stop()
 
     def __getstate__(self):  # type: ignore[no-untyped-def]
         """Exclude unpicklable runtime attributes when serializing."""
@@ -251,6 +328,11 @@ class ModuleBase(Configurable, CompositeResource):
         # Remove unpicklable attributes
         state.pop("_disposables", None)
         state.pop("_module_closed_lock", None)
+        state.pop("_module_close_error", None)
+        state.pop("_module_stop_lock", None)
+        state.pop("_module_stop_started", None)
+        state.pop("_module_stop_error", None)
+        state.pop("_module_closed", None)
         state.pop("_loop", None)
         state.pop("_loop_thread", None)
         state.pop("_rpc", None)
@@ -264,7 +346,13 @@ class ModuleBase(Configurable, CompositeResource):
         """Restore object from pickled state."""
         self.__dict__.update(state)
         # Reinitialize runtime attributes
-        self._module_closed_lock = threading.Lock()
+        self._disposables = None
+        self._module_closed_lock = threading.RLock()
+        self._module_closed = False
+        self._module_close_error = None
+        self._module_stop_lock = threading.RLock()
+        self._module_stop_started = False
+        self._module_stop_error = None
         self._loop = None
         self._loop_thread = None
         self._rpc = None
