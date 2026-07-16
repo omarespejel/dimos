@@ -14,18 +14,23 @@
 
 from __future__ import annotations
 
+from queue import Queue
+import threading
 from typing import TYPE_CHECKING
 
 import pytest
+from reactivex.abc import DisposableBase
 
 from dimos.memory2.replay import ReplayStream
 from dimos.memory2.store.base import StreamAccessor
 
 if TYPE_CHECKING:
+    from dimos.memory2.store.base import Store
+    from dimos.memory2.store.memory import MemoryStore
     from dimos.memory2.store.sqlite import SqliteStore
 
 
-def _populate(store: SqliteStore, name: str, timestamps: list[float]) -> None:
+def _populate(store: Store, name: str, timestamps: list[float]) -> None:
     """Append integer payloads at each given ts to a named stream."""
     s = store.stream(name, int)
     for i, ts in enumerate(timestamps):
@@ -121,8 +126,6 @@ def test_anchor_reset_forgets_pin(sqlite_store: SqliteStore) -> None:
 
 def test_replay_anchor_thread_safe(sqlite_store: SqliteStore) -> None:
     """Concurrent _resolve_anchor calls return the same anchor — no torn state."""
-    import threading
-
     _populate(sqlite_store, "lidar", [0.0, 0.1, 0.2])
     _populate(sqlite_store, "odom", [0.0, 0.1, 0.2])
     replay = sqlite_store.replay()
@@ -146,3 +149,98 @@ def test_replay_anchor_thread_safe(sqlite_store: SqliteStore) -> None:
 
     assert len(anchors) == n_workers
     assert all(a == anchors[0] for a in anchors)
+
+
+def test_observable_dispose_waits_for_inflight_callback(memory_store: MemoryStore) -> None:
+    _populate(memory_store, "lidar", [0.0, 0.1])
+    replay = memory_store.replay()
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    second_callback = threading.Event()
+    completed = threading.Event()
+    dispose_entered = threading.Event()
+    dispose_returned = threading.Event()
+    errors: Queue[BaseException] = Queue()
+    callback_count = 0
+
+    def on_next(_value: int) -> None:
+        nonlocal callback_count
+        callback_count += 1
+        if callback_count > 1:
+            second_callback.set()
+        callback_started.set()
+        if not release_callback.wait(timeout=2.0):
+            errors.put(TimeoutError("callback release timed out"))
+
+    subscription = replay.streams.lidar.observable().subscribe(
+        on_next,
+        errors.put,
+        completed.set,
+    )
+
+    def dispose() -> None:
+        dispose_entered.set()
+        try:
+            subscription.dispose()
+        except BaseException as error:
+            errors.put(error)
+        finally:
+            dispose_returned.set()
+
+    dispose_thread = threading.Thread(target=dispose, daemon=True)
+    try:
+        assert callback_started.wait(timeout=2.0)
+        dispose_thread.start()
+        assert dispose_entered.wait(timeout=2.0)
+        assert not dispose_returned.wait(timeout=0.1)
+    finally:
+        release_callback.set()
+        subscription.dispose()
+        if dispose_thread.ident is not None:
+            dispose_thread.join(timeout=2.0)
+
+    assert not dispose_thread.is_alive()
+    assert dispose_returned.is_set()
+    assert not second_callback.wait(timeout=0.2)
+    assert not completed.is_set()
+    assert callback_count == 1
+    assert errors.empty()
+
+
+def test_observable_can_dispose_from_its_callback(memory_store: MemoryStore) -> None:
+    _populate(memory_store, "lidar", [0.0, 0.1, 0.2])
+    replay = memory_store.replay()
+    subscription_ready = threading.Event()
+    second_seen = threading.Event()
+    third_seen = threading.Event()
+    completed = threading.Event()
+    errors: Queue[Exception] = Queue()
+    subscription: DisposableBase | None = None
+
+    def on_next(value: int) -> None:
+        if value == 0:
+            if not subscription_ready.wait(timeout=2.0):
+                errors.put(TimeoutError("subscription assignment timed out"))
+        elif value == 1:
+            assert subscription is not None
+            subscription.dispose()
+            second_seen.set()
+        else:
+            third_seen.set()
+
+    try:
+        subscription = replay.streams.lidar.observable().subscribe(
+            on_next,
+            errors.put,
+            completed.set,
+        )
+        subscription_ready.set()
+
+        assert second_seen.wait(timeout=2.0)
+        assert not third_seen.wait(timeout=0.2)
+        assert not completed.is_set()
+        assert errors.empty()
+    finally:
+        subscription_ready.set()
+        if subscription is not None:
+            subscription.dispose()

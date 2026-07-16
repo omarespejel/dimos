@@ -15,7 +15,7 @@
 from enum import Enum
 from importlib import resources
 import sys
-from threading import Thread
+from threading import Event, RLock, Thread
 import time
 from typing import Any, Protocol
 
@@ -45,7 +45,6 @@ from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.robot.unitree.connection import UnitreeWebRTCConnection
 from dimos.robot.unitree.type.lowstate import LowStateMsg
 from dimos.spec.perception import Camera, Pointcloud
-from dimos.utils.decorators.decorators import cached_property, simple_mcache
 from dimos.utils.logging_config import setup_logger
 
 if sys.version_info < (3, 13):
@@ -153,32 +152,62 @@ def make_connection(
         raise ValueError(f"Unknown simulator {cfg.simulation!r}. Choose from: mujoco, dimsim")
 
 
-class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
+class ReplayConnection(CompositeResource):
     def __init__(  # type: ignore[no-untyped-def]
         self,
         dataset: str = "go2_china_office",
         **kwargs,
     ) -> None:
+        self._disposables = None
+        self._lifecycle_lock = RLock()
+        self._stopped = Event()
+        self._stop_error: BaseException | None = None
+        self._replay: Replay | None = None
         self.dataset = dataset
         self._loop = kwargs.get("loop", False)
         self._seek = kwargs.get("seek")
         self._duration = kwargs.get("duration")
 
-    @cached_property
+    @property
     def replay(self) -> Replay:
-        # One shared store + Replay so lidar/odom/video advance against the
-        # same wall-clock anchor on subscribe.
-        store = self.register_disposable(
-            SqliteStore(path=str(resolve_db_path(self.dataset)), must_exist=True)
-        )
-        store.start()
-        return store.replay(loop=self._loop, seek=self._seek, duration=self._duration)
+        with self._lifecycle_lock:
+            if self._stopped.is_set():
+                raise RuntimeError("replay connection is stopped")
+            if self._replay is None:
+                # One shared store + Replay so lidar/odom/video advance against
+                # the same wall-clock anchor on subscribe.
+                store = self.register_disposable(
+                    SqliteStore(path=str(resolve_db_path(self.dataset)), must_exist=True)
+                )
+                store.start()
+                self._replay = store.replay(
+                    loop=self._loop,
+                    seek=self._seek,
+                    duration=self._duration,
+                )
+            return self._replay
 
     def connect(self) -> None:
         pass
 
     def start(self) -> None:
         pass
+
+    def stop(self) -> None:
+        with self._lifecycle_lock:
+            if self._stopped.is_set():
+                if self._stop_error is not None:
+                    raise self._stop_error
+                return
+            self._stopped.set()
+            try:
+                super().stop()
+            except BaseException as error:
+                self._stop_error = error
+                raise
+
+    def disconnect(self) -> None:
+        self.stop()
 
     def standup(self) -> bool:
         return True
@@ -221,25 +250,21 @@ class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
                 return name
         raise KeyError(f"None of {names!r} in dataset {self.dataset!r}; available: {available}")
 
-    @simple_mcache
     def lidar_stream(self) -> Observable[PointCloud2]:
         stream: ReplayStream[PointCloud2] = self.replay.stream(
             self._stream_name("go2_lidar", "lidar")
         )
         return stream.observable()
 
-    @simple_mcache
     def odom_stream(self) -> Observable[PoseStamped]:
         stream: ReplayStream[PoseStamped] = self.replay.stream(
             self._stream_name("go2_odom", "odom")
         )
         return stream.observable()
 
-    @simple_mcache
     def video_stream(self) -> Observable[Image]:
         return self.replay.streams.color_image.observable()
 
-    @simple_mcache
     def lowstate_stream(self) -> Observable:  # type: ignore[type-arg]
         # Replay datasets carry no low-level state (battery/IMU) — emit nothing.
         return empty()
