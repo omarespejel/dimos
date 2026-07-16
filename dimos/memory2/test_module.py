@@ -389,4 +389,4 @@ def test_memory_module_preserves_stopped_state_when_restored(tmp_path: Path) -> 
     assert restored._module_closed
     assert restored._memory_stopped.is_set()
     with pytest.raises(RuntimeError, match="stopping or stopped"):
-        _ = restored.store
+        assert restored.store is not None
