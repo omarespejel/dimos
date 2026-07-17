@@ -491,9 +491,25 @@ class Recorder(MemoryModule):
             logger.warning("Recorder: no pubsub tf available — not recording tf")
             return
         tf_stream = self.store.stream("tf", TFMessage)
+        stopping = threading.Event()
+        callback_lock = threading.Lock()
 
         def on_tf(msg: TFMessage, _topic: Any) -> None:
-            for transform in msg.transforms:
-                tf_stream.append(TFMessage(transform), ts=transform.ts, pose=None)
+            with callback_lock:
+                if stopping.is_set():
+                    return
+                for transform in msg.transforms:
+                    tf_stream.append(TFMessage(transform), ts=transform.ts, pose=None)
 
-        self.register_disposable(Disposable(pubsub.subscribe(topic, on_tf)))
+        unsubscribe = pubsub.subscribe(topic, on_tf)
+
+        def unsubscribe_and_drain() -> None:
+            stopping.set()
+            try:
+                unsubscribe()
+            finally:
+                # Do not close the store while an admitted append is active.
+                with callback_lock:
+                    pass
+
+        self.register_disposable(Disposable(unsubscribe_and_drain))

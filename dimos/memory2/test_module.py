@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import threading
@@ -29,11 +29,13 @@ from reactivex.disposable import Disposable
 from dimos.core.module import ModuleConfig
 from dimos.core.stream import In, Out
 from dimos.memory2 import module as memory_module
-from dimos.memory2.module import MemoryModule, StreamModule
+from dimos.memory2.module import MemoryModule, Recorder, StreamModule
 from dimos.memory2.store.sqlite import SqliteStore
 from dimos.memory2.stream import Stream
 from dimos.memory2.transform import Transformer
 from dimos.memory2.type.observation import Observation
+from dimos.msgs.geometry_msgs.Transform import Transform
+from dimos.msgs.tf2_msgs.TFMessage import TFMessage
 from dimos.protocol.rpc.spec import Args, RPCSpec
 
 
@@ -106,6 +108,35 @@ module_cases = [
     pytest.param(MethodPipelineModule, id="method-pipeline"),
 ]
 
+TFCallback = Callable[[TFMessage, Any], None]
+TFRecorderFixture = tuple[Recorder, MagicMock, MagicMock, TFCallback, MagicMock]
+
+
+@pytest.fixture
+def tf_recorder(tmp_path: Path) -> Iterator[TFRecorderFixture]:
+    store = MagicMock(spec=SqliteStore)
+    tf_stream = MagicMock(spec=Stream)
+    store.stream.return_value = tf_stream
+    unsubscribe = MagicMock()
+    pubsub = MagicMock()
+    pubsub.subscribe.return_value = unsubscribe
+    tf = MagicMock()
+    tf.config.topic = "/tf"
+    tf.pubsub = pubsub
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    module._tf = tf
+    module._record_tf()
+    callback = pubsub.subscribe.call_args.args[1]
+
+    try:
+        yield module, store, tf_stream, callback, unsubscribe
+    finally:
+        module.stop()
+
 
 @pytest.mark.parametrize("module_cls", module_cases)
 def test_blueprint_ports(module_cls: type[StreamModule[Any, Any]]) -> None:
@@ -151,6 +182,78 @@ def test_memory_module_stops_subscriptions_before_store(
     store.start.assert_called_once_with()
     store.stop.assert_called_once_with()
     store.dispose.assert_not_called()
+
+
+def test_recorder_stop_waits_for_active_tf_callback(
+    tf_recorder: TFRecorderFixture,
+) -> None:
+    module, store, tf_stream, callback, unsubscribe = tf_recorder
+    append_started = threading.Event()
+    append_release = threading.Event()
+    append_finished = threading.Event()
+    unsubscribed = threading.Event()
+    store_stopped = threading.Event()
+
+    def append(*_args: Any, **_kwargs: Any) -> None:
+        append_started.set()
+        assert append_release.wait(timeout=2)
+        append_finished.set()
+
+    def stop_store() -> None:
+        assert append_finished.is_set()
+        store_stopped.set()
+
+    tf_stream.append.side_effect = append
+    unsubscribe.side_effect = unsubscribed.set
+    store.stop.side_effect = stop_store
+    transform = Transform(ts=1.0)
+    message = TFMessage(transform)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        callback_future = pool.submit(callback, message, "/tf")
+        assert append_started.wait(timeout=1)
+        stop_future = pool.submit(module.stop)
+        try:
+            assert unsubscribed.wait(timeout=1)
+            assert not store_stopped.wait(timeout=0.1)
+        finally:
+            append_release.set()
+
+        callback_future.result(timeout=2)
+        stop_future.result(timeout=2)
+
+    tf_stream.append.assert_called_once()
+    recorded_message = tf_stream.append.call_args.args[0]
+    assert recorded_message.transforms == [transform]
+    assert tf_stream.append.call_args.kwargs == {"ts": 1.0, "pose": None}
+    unsubscribe.assert_called_once_with()
+    store.stop.assert_called_once_with()
+    assert store_stopped.is_set()
+
+
+def test_recorder_ignores_tf_callback_entering_after_unsubscribe(
+    tf_recorder: TFRecorderFixture,
+) -> None:
+    module, store, tf_stream, callback, unsubscribe = tf_recorder
+    callback_scheduled = threading.Event()
+    callback_release = threading.Event()
+    message = TFMessage(Transform(ts=1.0))
+
+    def invoke_callback() -> None:
+        callback_scheduled.set()
+        assert callback_release.wait(timeout=2)
+        callback(message, "/tf")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        callback_future = pool.submit(invoke_callback)
+        assert callback_scheduled.wait(timeout=1)
+        module.stop()
+        callback_release.set()
+        callback_future.result(timeout=2)
+
+    tf_stream.append.assert_not_called()
+    unsubscribe.assert_called_once_with()
+    store.stop.assert_called_once_with()
 
 
 def test_memory_module_serializes_concurrent_stop(
