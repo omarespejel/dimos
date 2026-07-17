@@ -14,12 +14,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 import enum
 import inspect
 import os
 from pathlib import Path
-import sqlite3
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
@@ -182,16 +184,76 @@ class MemoryModule(Module):
     config: MemoryModuleConfig
     _store: SqliteStore | None = None
 
+    def __init__(self, **kwargs: Any) -> None:
+        self._memory_stop_lock = threading.RLock()
+        self._memory_stopping = False
+        self._memory_stopped = threading.Event()
+        super().__init__(**kwargs)
+
+    def __getstate__(self) -> dict[str, Any]:
+        # ModuleBase's pickle hook is intentionally untyped.
+        with self._memory_stop_lock:
+            state: dict[str, Any] = super().__getstate__()  # type: ignore[no-untyped-call]
+            state.pop("_memory_stop_lock", None)
+            state.pop("_memory_stopping", None)
+            state.pop("_memory_stopped", None)
+            state.pop("_store", None)
+            return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        self._memory_stop_lock = threading.RLock()
+        self._memory_stopping = self._module_closed
+        self._memory_stopped = threading.Event()
+        if self._module_closed:
+            self._memory_stopped.set()
+        self._store = None
+
+    def _open_store(self, path: str | Path) -> SqliteStore:
+        with self._memory_stop_lock:
+            if self._memory_stopping:
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+            if self._store is not None:
+                raise RuntimeError("Memory store is already open")
+
+            store = SqliteStore(path=str(path))
+            try:
+                store.start()
+            except BaseException:
+                try:
+                    store.stop()
+                except Exception:
+                    logger.exception("Failed to clean up memory store after start failure")
+                raise
+            self._store = store
+            return store
+
     @property
     def store(self) -> SqliteStore:
-        if self._store is not None:
-            return self._store
+        with self._memory_stop_lock:
+            if self._memory_stopping:
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+            if self._store is not None:
+                return self._store
 
-        self._store = self.register_disposable(
-            SqliteStore(path=str(self.config.db_path)),
-        )
-        self._store.start()
-        return self._store
+            return self._open_store(self.config.db_path)
+
+    @rpc
+    def stop(self) -> None:
+        # Keep concurrent RPC and worker shutdown calls in the same critical
+        # section so neither can close the store while the other is disposing
+        # subscriptions.
+        with self._memory_stop_lock:
+            if self._memory_stopped.is_set():
+                return
+            self._memory_stopping = True
+            super().stop()
+
+            store = self._store
+            if store is not None:
+                store.stop()
+                self._store = None
+            self._memory_stopped.set()
 
 
 class SemanticSearchConfig(MemoryModuleConfig):
@@ -379,19 +441,66 @@ class Recorder(MemoryModule):
         and registers the subscription for cleanup on stop().
         """
 
+        callback_state = threading.Condition()
+        accepting_callbacks = True
+        active_callbacks = 0
+
+        def stop_admitting_callbacks() -> None:
+            nonlocal accepting_callbacks
+            with callback_state:
+                accepting_callbacks = False
+
+        # Shutdown closes admission before cancelling the dispatcher, then
+        # waits below for callbacks already inside the handler to finish.
+        self.register_disposable(Disposable(stop_admitting_callbacks))
+
         async def on_msg(msg: Any) -> None:
-            ts = self._resolve_ts(name, msg)
-            pose = await self._resolve_pose(name, msg, ts)
-            if not pose:
-                logger.warning(
-                    "[%s] No pose for time %s (msg ts: %s), storing without pose",
-                    name,
-                    ts,
-                    getattr(msg, "ts", None),
-                )
-            stream.append(msg, ts=ts, pose=pose)
+            nonlocal active_callbacks
+            with callback_state:
+                if not accepting_callbacks:
+                    return
+                active_callbacks += 1
+            try:
+                ts = self._resolve_ts(name, msg)
+                pose = await self._resolve_pose(name, msg, ts)
+                if not pose:
+                    logger.warning(
+                        "[%s] No pose for time %s (msg ts: %s), storing without pose",
+                        name,
+                        ts,
+                        getattr(msg, "ts", None),
+                    )
+                stream.append(msg, ts=ts, pose=pose)
+            finally:
+                with callback_state:
+                    active_callbacks -= 1
+                    if active_callbacks == 0:
+                        callback_state.notify_all()
 
         self.process_observable(input_topic.pure_observable(), on_msg)
+
+        def drain_callbacks() -> None:
+            with callback_state:
+                callback_state.wait_for(lambda: active_callbacks == 0)
+
+            # Dispatcher disposal requests cancellation on the module loop.
+            # Give that cancellation one complete loop turn before Module.stop
+            # stops the loop, otherwise the dispatcher task can be destroyed
+            # while its cancellation wakeup is still queued.
+            loop = self._loop
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if loop is not None and loop.is_running() and running_loop is not loop:
+                checkpoint = asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop)
+                try:
+                    checkpoint.result(timeout=self._loop_thread_timeout)
+                except FuturesTimeoutError:
+                    checkpoint.cancel()
+                    logger.warning("Timed out waiting for recorder dispatcher cancellation")
+
+        self.register_disposable(Disposable(drain_callbacks))
 
     def _prepare_streams(self) -> None:
         """On APPEND, drop the streams this recorder is about to (re)write — the
@@ -439,13 +548,48 @@ class Recorder(MemoryModule):
             logger.warning("Recorder: no pubsub tf available — not recording tf")
             return
         tf_stream = self.store.stream("tf", TFMessage)
+        callback_state = threading.Condition()
+        append_lock = threading.Lock()
+        accepting_callbacks = True
+        active_callbacks = 0
+        unsubscribe: Callable[[], None] | None = None
 
         def on_tf(msg: TFMessage, _topic: Any) -> None:
+            nonlocal active_callbacks
+            with callback_state:
+                if not accepting_callbacks:
+                    return
+                active_callbacks += 1
             try:
-                for transform in msg.transforms:
-                    tf_stream.append(TFMessage(transform), ts=transform.ts, pose=None)
-            except sqlite3.ProgrammingError:
-                # A late LCM callback raced teardown and hit the closed store.
-                pass
+                with append_lock:
+                    for transform in msg.transforms:
+                        tf_stream.append(TFMessage(transform), ts=transform.ts, pose=None)
+            finally:
+                with callback_state:
+                    active_callbacks -= 1
+                    if active_callbacks == 0:
+                        callback_state.notify_all()
 
-        self.register_disposable(Disposable(pubsub.subscribe(topic, on_tf)))
+        def unsubscribe_and_drain() -> None:
+            nonlocal accepting_callbacks
+            with callback_state:
+                accepting_callbacks = False
+                unsubscribe_now = unsubscribe
+            try:
+                if unsubscribe_now is not None:
+                    unsubscribe_now()
+            finally:
+                with callback_state:
+                    callback_state.wait_for(lambda: active_callbacks == 0)
+
+        self.register_disposable(Disposable(unsubscribe_and_drain))
+
+        returned_unsubscribe = pubsub.subscribe(topic, on_tf)
+        with callback_state:
+            if accepting_callbacks:
+                unsubscribe = returned_unsubscribe
+                unsubscribe_now = None
+            else:
+                unsubscribe_now = returned_unsubscribe
+        if unsubscribe_now is not None:
+            unsubscribe_now()
