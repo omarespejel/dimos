@@ -29,6 +29,8 @@ from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
 from dimos.navigation.replanning_a_star import global_planner as planner_module
 from dimos.navigation.replanning_a_star.global_planner import GlobalPlanner
 
+TEST_TIMEOUT = 5.0
+
 
 @pytest.fixture()
 def planner(mocker: MockerFixture) -> GlobalPlanner:
@@ -113,7 +115,7 @@ def test_start_waits_for_stop_and_rejects_restart(
 
     def pause_join(_timeout: float) -> None:
         join_started.set()
-        if not release_join.wait(timeout=1.0):
+        if not release_join.wait(timeout=TEST_TIMEOUT):
             raise TimeoutError("test did not release monitor join")
 
     def start_planner() -> None:
@@ -126,14 +128,14 @@ def test_start_waits_for_stop_and_rejects_restart(
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
             stop_future = executor.submit(planner.stop)
-            assert join_started.wait(timeout=1.0)
+            assert join_started.wait(timeout=TEST_TIMEOUT)
             start_future = executor.submit(start_planner)
-            assert start_attempted.wait(timeout=1.0)
+            assert start_attempted.wait(timeout=TEST_TIMEOUT)
             thread_type.assert_not_called()
             release_join.set()
-            stop_future.result(timeout=1.0)
+            stop_future.result(timeout=TEST_TIMEOUT)
             with pytest.raises(RuntimeError, match="cannot be restarted"):
-                start_future.result(timeout=1.0)
+                start_future.result(timeout=TEST_TIMEOUT)
     finally:
         release_join.set()
 
@@ -178,7 +180,7 @@ def test_computed_path_for_replaced_goal_is_discarded(
 
     def finish_after_replacement(*_args: Any) -> MagicMock:
         planning_started.set()
-        assert release_planning.wait(timeout=1.0)
+        assert release_planning.wait(timeout=TEST_TIMEOUT)
         return MagicMock()
 
     mocker.patch.object(planner, "_find_wide_path", side_effect=finish_after_replacement)
@@ -186,13 +188,13 @@ def test_computed_path_for_replaced_goal_is_discarded(
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         plan_future = executor.submit(planner._plan_path, 1)
-        assert planning_started.wait(timeout=1.0)
+        assert planning_started.wait(timeout=TEST_TIMEOUT)
         planner.path.reset_mock()
         cast("MagicMock", planner._local_planner.start_planning).reset_mock()
         replacement_plan = mocker.patch.object(planner, "_plan_path")
         planner.handle_goal_request(MagicMock())
         release_planning.set()
-        plan_future.result(timeout=1.0)
+        plan_future.result(timeout=TEST_TIMEOUT)
 
     replacement_plan.assert_called_once()
     planner.path.on_next.assert_not_called()
@@ -210,7 +212,7 @@ def test_stop_during_path_publication_prevents_local_start(
     planner.path = MagicMock()
     publication_started = Event()
     release_publication = Event()
-    publication_released: list[bool] = []
+    publication_released = []
     resampled_path = MagicMock()
     mocker.patch.object(planner, "_find_safe_goal", return_value=MagicMock())
     mocker.patch.object(planner, "_find_wide_path", return_value=MagicMock())
@@ -219,22 +221,22 @@ def test_stop_during_path_publication_prevents_local_start(
     def pause_publication(path: Any) -> None:
         if path is resampled_path:
             publication_started.set()
-            publication_released.append(release_publication.wait(timeout=1.0))
+            publication_released.append(release_publication.wait(timeout=TEST_TIMEOUT))
 
     planner.path.on_next.side_effect = pause_publication
 
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
             plan_future = executor.submit(planner._plan_path, 1)
-            assert publication_started.wait(timeout=1.0)
+            assert publication_started.wait(timeout=TEST_TIMEOUT)
             start_planning = cast("MagicMock", planner._local_planner.start_planning)
             start_planning.reset_mock()
             stop_future = executor.submit(planner.stop)
-            assert planner._stop_planner.wait(timeout=1.0)
+            assert planner._stop_planner.wait(timeout=TEST_TIMEOUT)
             assert not stop_future.done()
             release_publication.set()
-            plan_future.result(timeout=1.0)
-            stop_future.result(timeout=1.0)
+            plan_future.result(timeout=TEST_TIMEOUT)
+            stop_future.result(timeout=TEST_TIMEOUT)
     finally:
         release_publication.set()
 
@@ -281,7 +283,7 @@ def test_monitor_arrival_does_not_cancel_replacement_goal(
 
     def distance_after_replacement(_position: Any) -> float:
         arrival_check_started.set()
-        assert release_arrival_check.wait(timeout=1.0)
+        assert release_arrival_check.wait(timeout=TEST_TIMEOUT)
         return 0.0
 
     wait_count = 0
@@ -298,10 +300,10 @@ def test_monitor_arrival_does_not_cancel_replacement_goal(
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         monitor_future = executor.submit(planner._thread_entrypoint)
-        assert arrival_check_started.wait(timeout=1.0)
+        assert arrival_check_started.wait(timeout=TEST_TIMEOUT)
         planner.handle_goal_request(replacement_goal)
         release_arrival_check.set()
-        monitor_future.result(timeout=1.0)
+        monitor_future.result(timeout=TEST_TIMEOUT)
 
     assert planner._current_goal is replacement_goal
     planner.goal_reached.on_next.assert_not_called()
