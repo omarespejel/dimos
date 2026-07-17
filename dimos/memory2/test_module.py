@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import threading
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -29,12 +29,15 @@ from reactivex.disposable import Disposable
 from dimos.core.module import ModuleConfig
 from dimos.core.stream import In, Out
 from dimos.memory2 import module as memory_module
-from dimos.memory2.module import MemoryModule, StreamModule
+from dimos.memory2.module import MemoryModule, Recorder, StreamModule
 from dimos.memory2.store.sqlite import SqliteStore
 from dimos.memory2.stream import Stream
 from dimos.memory2.transform import Transformer
 from dimos.memory2.type.observation import Observation
+from dimos.msgs.geometry_msgs.Transform import Transform
+from dimos.msgs.tf2_msgs.TFMessage import TFMessage
 from dimos.protocol.rpc.spec import Args, RPCSpec
+from dimos.protocol.tf.tf import TFSpec
 
 
 class _TestRPC(RPCSpec):
@@ -49,6 +52,31 @@ class _TestRPC(RPCSpec):
 
     def call_nowait(self, _name: str, _arguments: Args) -> None:
         pass
+
+
+class _CountingTF(TFSpec):
+    instances: ClassVar[int] = 0
+
+    def __init__(self, **kwargs: Any) -> None:
+        type(self).instances += 1
+        super().__init__(**kwargs)
+
+    def publish(self, *args: Transform) -> None:
+        pass
+
+    def publish_static(self, *args: Transform) -> None:
+        pass
+
+    def get(
+        self,
+        parent_frame: str,
+        child_frame: str,
+        time_point: float | None = None,
+        time_tolerance: float | None = None,
+        *,
+        forward_tolerance: float = 0.0,
+    ) -> Transform | None:
+        return None
 
 
 # -- Shared transformer ---------------------------------------------------
@@ -105,6 +133,215 @@ module_cases = [
     pytest.param(StaticTransformerModule, id="static-transformer"),
     pytest.param(MethodPipelineModule, id="method-pipeline"),
 ]
+
+TFRecorderFixture = tuple[
+    Recorder,
+    MagicMock,
+    MagicMock,
+    Callable[[TFMessage, Any], None],
+    MagicMock,
+]
+SYNC_TIMEOUT = 2.0
+
+
+@pytest.fixture
+def tf_recorder(tmp_path: Path) -> Iterator[TFRecorderFixture]:
+    store = MagicMock(spec=SqliteStore)
+    tf_stream = MagicMock(spec=Stream)
+    store.stream.return_value = tf_stream
+    unsubscribe = MagicMock()
+    pubsub = MagicMock()
+    pubsub.subscribe.return_value = unsubscribe
+    tf = MagicMock()
+    tf.config.topic = "/tf"
+    tf.pubsub = pubsub
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+
+    try:
+        module._store = store
+        module._tf = tf
+        module._record_tf()
+        callback = pubsub.subscribe.call_args.args[1]
+        yield module, store, tf_stream, callback, unsubscribe
+    finally:
+        module.stop()
+
+
+def test_recorder_stop_waits_for_active_tf_callback(
+    tf_recorder: TFRecorderFixture,
+) -> None:
+    module, store, tf_stream, callback, unsubscribe = tf_recorder
+    append_started = threading.Event()
+    append_release = threading.Event()
+    append_finished = threading.Event()
+    unsubscribed = threading.Event()
+    store_stopped = threading.Event()
+
+    def append(*_args: Any, **_kwargs: Any) -> None:
+        append_started.set()
+        assert append_release.wait(timeout=SYNC_TIMEOUT)
+        append_finished.set()
+
+    def stop_store() -> None:
+        assert append_finished.is_set()
+        store_stopped.set()
+
+    tf_stream.append.side_effect = append
+    unsubscribe.side_effect = unsubscribed.set
+    store.stop.side_effect = stop_store
+    transform = Transform(ts=1.0)
+    message = TFMessage(transform)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        callback_future = pool.submit(callback, message, "/tf")
+        assert append_started.wait(timeout=SYNC_TIMEOUT)
+        stop_future = pool.submit(module.stop)
+        try:
+            assert unsubscribed.wait(timeout=SYNC_TIMEOUT)
+            assert not store_stopped.is_set()
+        finally:
+            append_release.set()
+
+        callback_future.result(timeout=SYNC_TIMEOUT)
+        stop_future.result(timeout=SYNC_TIMEOUT)
+
+    recorded_message = tf_stream.append.call_args.args[0]
+    assert recorded_message.transforms == [transform]
+    assert tf_stream.append.call_args.kwargs == {"ts": 1.0, "pose": None}
+    unsubscribe.assert_called_once_with()
+    store.stop.assert_called_once_with()
+    assert store_stopped.is_set()
+
+
+def test_recorder_rejects_tf_callback_when_stop_races_setup(
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    tf_stream = MagicMock(spec=Stream)
+    stream_started = threading.Event()
+    stream_release = threading.Event()
+    stop_started = threading.Event()
+    store_stopped = threading.Event()
+    store.stop.side_effect = store_stopped.set
+
+    def open_stream(*_args: Any, **_kwargs: Any) -> MagicMock:
+        stream_started.set()
+        assert stream_release.wait(timeout=SYNC_TIMEOUT)
+        return tf_stream
+
+    store.stream.side_effect = open_stream
+    unsubscribe = MagicMock()
+    retained_callback: list[Callable[[TFMessage, Any], None]] = []
+    pubsub = MagicMock()
+
+    def subscribe(_topic: str, callback: Callable[[TFMessage, Any], None]) -> MagicMock:
+        retained_callback.append(callback)
+        return unsubscribe
+
+    pubsub.subscribe.side_effect = subscribe
+    tf = MagicMock()
+    tf.config.topic = "/tf"
+    tf.pubsub = pubsub
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    module._tf = tf
+
+    def stop_module() -> None:
+        stop_started.set()
+        module.stop()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            record_future = pool.submit(module._record_tf)
+            assert stream_started.wait(timeout=SYNC_TIMEOUT)
+            stop_future = pool.submit(stop_module)
+            try:
+                assert stop_started.wait(timeout=SYNC_TIMEOUT)
+                assert not store_stopped.is_set()
+            finally:
+                stream_release.set()
+            record_future.result(timeout=SYNC_TIMEOUT)
+            stop_future.result(timeout=SYNC_TIMEOUT)
+
+        assert len(retained_callback) == 1
+        retained_callback[0](TFMessage(Transform(ts=1.0)), "/tf")
+    finally:
+        stream_release.set()
+        module.stop()
+
+    unsubscribe.assert_called_once_with()
+    store.stop.assert_called_once_with()
+    assert store_stopped.is_set()
+    tf_stream.append.assert_not_called()
+
+
+def test_recorder_tf_gate_runs_before_other_disposables(
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    tf_stream = MagicMock(spec=Stream)
+    store.stream.return_value = tf_stream
+    unsubscribe = MagicMock()
+    pubsub = MagicMock()
+    pubsub.subscribe.return_value = unsubscribe
+    tf = MagicMock()
+    tf.config.topic = "/tf"
+    tf.pubsub = pubsub
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+
+    def fail_cleanup() -> None:
+        raise RuntimeError("cleanup failed")
+
+    try:
+        module._store = store
+        module._tf = tf
+        module.register_disposable(Disposable(fail_cleanup))
+        module._record_tf()
+        callback = pubsub.subscribe.call_args.args[1]
+
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            module.stop()
+
+        unsubscribe.assert_called_once_with()
+        store.stop.assert_not_called()
+
+        module.stop()
+        callback(TFMessage(Transform(ts=1.0)), "/tf")
+    finally:
+        module.stop()
+
+    store.stop.assert_called_once_with()
+    tf_stream.append.assert_not_called()
+
+
+def test_recorder_rejects_tf_setup_after_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(_CountingTF, "instances", 0)
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+        tf_transport=_CountingTF,
+    )
+
+    try:
+        module.stop()
+        with pytest.raises(RuntimeError, match="stopping or stopped"):
+            module._record_tf()
+    finally:
+        module.stop()
+
+    assert _CountingTF.instances == 0
 
 
 @pytest.mark.parametrize("module_cls", module_cases)

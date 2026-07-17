@@ -24,6 +24,7 @@ import time
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 from pydantic import Field, field_validator
+from reactivex.abc import DisposableBase
 from reactivex.disposable import Disposable
 
 from dimos.agents.annotation import skill
@@ -44,8 +45,6 @@ from dimos.utils.data import backup_file
 from dimos.utils.logging_config import setup_logger
 
 if TYPE_CHECKING:
-    from reactivex.abc import DisposableBase
-
     from dimos.core.stream import In, Out
     from dimos.msgs.geometry_msgs.Pose import Pose
 
@@ -228,6 +227,9 @@ class MemoryModule(Module):
 
             return self._open_store(self.config.db_path)
 
+    def _before_memory_stop(self) -> None:
+        pass
+
     @rpc
     def stop(self) -> None:
         # Keep concurrent RPC and worker shutdown calls in the same critical
@@ -237,6 +239,7 @@ class MemoryModule(Module):
             if self._memory_stopped.is_set():
                 return
             self._memory_stopping = True
+            self._before_memory_stop()
             super().stop()
 
             store = self._store
@@ -370,6 +373,22 @@ class Recorder(MemoryModule):
     config: RecorderConfig
 
     _pose_setters: dict[str, Any] = {}
+    _tf_cleanup: DisposableBase | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = super().__getstate__()
+        state.pop("_tf_cleanup", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        self._tf_cleanup = None
+
+    def _before_memory_stop(self) -> None:
+        cleanup, self._tf_cleanup = self._tf_cleanup, None
+        if cleanup is not None:
+            cleanup.dispose()
+        super()._before_memory_stop()
 
     @rpc
     def start(self) -> None:
@@ -485,15 +504,64 @@ class Recorder(MemoryModule):
 
     def _record_tf(self) -> None:
         """Record the live tf stream under "tf" (no-op without a pubsub tf)."""
-        topic = getattr(self.tf.config, "topic", None)
-        pubsub = getattr(self.tf, "pubsub", None)
+        with self._memory_stop_lock:
+            if self._memory_stopping:
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+            tf = self.tf
+            topic = getattr(tf.config, "topic", None)
+            pubsub = getattr(tf, "pubsub", None)
         if not topic or pubsub is None:
             logger.warning("Recorder: no pubsub tf available — not recording tf")
             return
-        tf_stream = self.store.stream("tf", TFMessage)
+        callback_state = threading.Condition()
+        accepting_callbacks = True
+        active_callbacks = 0
+        unsubscribe: Callable[[], None] | None = None
+        tf_stream: Stream[TFMessage] | None = None
 
         def on_tf(msg: TFMessage, _topic: Any) -> None:
-            for transform in msg.transforms:
-                tf_stream.append(TFMessage(transform), ts=transform.ts, pose=None)
+            nonlocal active_callbacks
+            with callback_state:
+                if not accepting_callbacks:
+                    return
+                active_callbacks += 1
+            try:
+                assert tf_stream is not None
+                for transform in msg.transforms:
+                    tf_stream.append(TFMessage(transform), ts=transform.ts, pose=None)
+            finally:
+                with callback_state:
+                    active_callbacks -= 1
+                    if active_callbacks == 0:
+                        callback_state.notify_all()
 
-        self.register_disposable(Disposable(pubsub.subscribe(topic, on_tf)))
+        def unsubscribe_and_drain() -> None:
+            nonlocal accepting_callbacks
+            with callback_state:
+                accepting_callbacks = False
+                unsubscribe_now = unsubscribe
+            try:
+                if unsubscribe_now is not None:
+                    unsubscribe_now()
+            finally:
+                with callback_state:
+                    callback_state.wait_for(lambda: active_callbacks == 0)
+
+        cleanup = Disposable(unsubscribe_and_drain)
+        with self._memory_stop_lock:
+            if self._memory_stopping:
+                cleanup.dispose()
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+            self._tf_cleanup = cleanup
+            self.register_disposable(cleanup)
+            tf_stream = self.store.stream("tf", TFMessage)
+
+        returned_unsubscribe = pubsub.subscribe(topic, on_tf)
+        with callback_state:
+            if accepting_callbacks:
+                unsubscribe = returned_unsubscribe
+                unsubscribe_now = None
+            else:
+                unsubscribe_now = returned_unsubscribe
+        if unsubscribe_now is not None:
+            unsubscribe_now()
