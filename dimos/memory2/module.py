@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 import enum
 import inspect
 import os
@@ -495,7 +496,7 @@ class Recorder(MemoryModule):
                 checkpoint = asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop)
                 try:
                     checkpoint.result(timeout=self._loop_thread_timeout)
-                except TimeoutError:
+                except FuturesTimeoutError:
                     checkpoint.cancel()
                     logger.warning("Timed out waiting for recorder dispatcher cancellation")
 

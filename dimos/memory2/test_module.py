@@ -402,6 +402,53 @@ def test_recorder_stop_settles_idle_input_dispatcher(tmp_path: Path) -> None:
     store.stop.assert_called_once_with()
 
 
+def test_recorder_checkpoint_timeout_does_not_break_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    stream = MagicMock(spec=Stream)
+    subject: Subject[Any] = Subject()
+    input_topic = MagicMock(spec=In)
+    input_topic.pure_observable.return_value = subject
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    module._port_to_stream("color_image", input_topic, stream)
+
+    class LegacyFuturesTimeoutError(Exception):
+        pass
+
+    monkeypatch.setattr(
+        memory_module,
+        "FuturesTimeoutError",
+        LegacyFuturesTimeoutError,
+        raising=False,
+    )
+    checkpoint = MagicMock()
+    checkpoint.result.side_effect = LegacyFuturesTimeoutError
+
+    def timeout_checkpoint(coro: Any, _loop: Any) -> MagicMock:
+        coro.close()
+        return checkpoint
+
+    monkeypatch.setattr(
+        asyncio,
+        "run_coroutine_threadsafe",
+        timeout_checkpoint,
+    )
+
+    try:
+        module.stop()
+    finally:
+        module.stop()
+
+    checkpoint.cancel.assert_called_once_with()
+    store.stop.assert_called_once_with()
+
+
 def test_recorder_stop_waits_for_active_tf_callback(
     tf_recorder: TFRecorderFixture,
 ) -> None:
