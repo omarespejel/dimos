@@ -190,12 +190,13 @@ class MemoryModule(Module):
 
     def __getstate__(self) -> dict[str, Any]:
         # ModuleBase's pickle hook is intentionally untyped.
-        state: dict[str, Any] = super().__getstate__()  # type: ignore[no-untyped-call]
-        state.pop("_memory_stop_lock", None)
-        state.pop("_memory_stopping", None)
-        state.pop("_memory_stopped", None)
-        state.pop("_store", None)
-        return state
+        with self._memory_stop_lock:
+            state: dict[str, Any] = super().__getstate__()  # type: ignore[no-untyped-call]
+            state.pop("_memory_stop_lock", None)
+            state.pop("_memory_stopping", None)
+            state.pop("_memory_stopped", None)
+            state.pop("_store", None)
+            return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         super().__setstate__(state)
@@ -214,7 +215,14 @@ class MemoryModule(Module):
                 raise RuntimeError("Memory store is already open")
 
             store = SqliteStore(path=str(path))
-            store.start()
+            try:
+                store.start()
+            except BaseException:
+                try:
+                    store.stop()
+                except Exception:
+                    logger.exception("Failed to clean up memory store after start failure")
+                raise
             self._store = store
             return store
 
@@ -491,25 +499,37 @@ class Recorder(MemoryModule):
             logger.warning("Recorder: no pubsub tf available — not recording tf")
             return
         tf_stream = self.store.stream("tf", TFMessage)
-        stopping = threading.Event()
-        callback_lock = threading.Lock()
+        callback_state = threading.Condition()
+        append_lock = threading.Lock()
+        accepting_callbacks = True
+        active_callbacks = 0
 
         def on_tf(msg: TFMessage, _topic: Any) -> None:
-            with callback_lock:
-                if stopping.is_set():
+            nonlocal active_callbacks
+            with callback_state:
+                if not accepting_callbacks:
                     return
-                for transform in msg.transforms:
-                    tf_stream.append(TFMessage(transform), ts=transform.ts, pose=None)
+                active_callbacks += 1
+            try:
+                with append_lock:
+                    for transform in msg.transforms:
+                        tf_stream.append(TFMessage(transform), ts=transform.ts, pose=None)
+            finally:
+                with callback_state:
+                    active_callbacks -= 1
+                    if active_callbacks == 0:
+                        callback_state.notify_all()
 
         unsubscribe = pubsub.subscribe(topic, on_tf)
 
         def unsubscribe_and_drain() -> None:
-            stopping.set()
+            nonlocal accepting_callbacks
+            with callback_state:
+                accepting_callbacks = False
             try:
                 unsubscribe()
             finally:
-                # Do not close the store while an admitted append is active.
-                with callback_lock:
-                    pass
+                with callback_state:
+                    callback_state.wait_for(lambda: active_callbacks == 0)
 
         self.register_disposable(Disposable(unsubscribe_and_drain))

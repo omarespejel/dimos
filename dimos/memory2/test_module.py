@@ -19,7 +19,9 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import pickle
 import threading
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -37,6 +39,8 @@ from dimos.memory2.type.observation import Observation
 from dimos.msgs.geometry_msgs.Transform import Transform
 from dimos.msgs.tf2_msgs.TFMessage import TFMessage
 from dimos.protocol.rpc.spec import Args, RPCSpec
+
+SYNC_TIMEOUT = 5.0
 
 
 class _TestRPC(RPCSpec):
@@ -112,6 +116,25 @@ TFCallback = Callable[[TFMessage, Any], None]
 TFRecorderFixture = tuple[Recorder, MagicMock, MagicMock, TFCallback, MagicMock]
 
 
+class _ObservedLock:
+    def __init__(self, lock: Any) -> None:
+        self._lock = lock
+        self._attempt_lock = threading.Lock()
+        self._attempts = 0
+        self.second_attempted = threading.Event()
+
+    def __enter__(self) -> _ObservedLock:
+        with self._attempt_lock:
+            self._attempts += 1
+            if self._attempts == 2:
+                self.second_attempted.set()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self._lock.release()
+
+
 @pytest.fixture
 def tf_recorder(tmp_path: Path) -> Iterator[TFRecorderFixture]:
     store = MagicMock(spec=SqliteStore)
@@ -184,6 +207,27 @@ def test_memory_module_stops_subscriptions_before_store(
     store.dispose.assert_not_called()
 
 
+def test_memory_module_cleans_up_store_after_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    store.start.side_effect = RuntimeError("start failed")
+    monkeypatch.setattr(memory_module, "SqliteStore", MagicMock(return_value=store))
+    module = MemoryModule(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        assert module.store is not None
+
+    assert module._store is None
+    store.start.assert_called_once_with()
+    store.stop.assert_called_once_with()
+    module.stop()
+
+
 def test_recorder_stop_waits_for_active_tf_callback(
     tf_recorder: TFRecorderFixture,
 ) -> None:
@@ -196,7 +240,7 @@ def test_recorder_stop_waits_for_active_tf_callback(
 
     def append(*_args: Any, **_kwargs: Any) -> None:
         append_started.set()
-        assert append_release.wait(timeout=2)
+        assert append_release.wait(timeout=SYNC_TIMEOUT)
         append_finished.set()
 
     def stop_store() -> None:
@@ -211,21 +255,107 @@ def test_recorder_stop_waits_for_active_tf_callback(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         callback_future = pool.submit(callback, message, "/tf")
-        assert append_started.wait(timeout=1)
+        assert append_started.wait(timeout=SYNC_TIMEOUT)
         stop_future = pool.submit(module.stop)
         try:
-            assert unsubscribed.wait(timeout=1)
+            assert unsubscribed.wait(timeout=SYNC_TIMEOUT)
             assert not store_stopped.wait(timeout=0.1)
         finally:
             append_release.set()
 
-        callback_future.result(timeout=2)
-        stop_future.result(timeout=2)
+        callback_future.result(timeout=SYNC_TIMEOUT)
+        stop_future.result(timeout=SYNC_TIMEOUT)
 
     tf_stream.append.assert_called_once()
     recorded_message = tf_stream.append.call_args.args[0]
     assert recorded_message.transforms == [transform]
     assert tf_stream.append.call_args.kwargs == {"ts": 1.0, "pose": None}
+    unsubscribe.assert_called_once_with()
+    store.stop.assert_called_once_with()
+    assert store_stopped.is_set()
+
+
+def test_recorder_drains_all_tf_callbacks_admitted_before_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    tf_stream = MagicMock(spec=Stream)
+    store.stream.return_value = tf_stream
+    unsubscribe = MagicMock()
+    pubsub = MagicMock()
+    pubsub.subscribe.return_value = unsubscribe
+    tf = MagicMock()
+    tf.config.topic = "/tf"
+    tf.pubsub = pubsub
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    module._tf = tf
+
+    append_lock = _ObservedLock(threading.Lock())
+    threading_proxy = SimpleNamespace(
+        Condition=threading.Condition,
+        Event=threading.Event,
+        Lock=lambda: append_lock,
+        RLock=threading.RLock,
+    )
+    with monkeypatch.context() as context:
+        context.setattr(memory_module, "threading", threading_proxy)
+        module._record_tf()
+
+    callback = pubsub.subscribe.call_args.args[1]
+    first_append_started = threading.Event()
+    first_append_release = threading.Event()
+    unsubscribed = threading.Event()
+    store_stopped = threading.Event()
+    persisted: list[float] = []
+
+    def append(message: TFMessage, **_kwargs: Any) -> None:
+        transform = message.transforms[0]
+        if transform.ts == 1.0:
+            first_append_started.set()
+            assert first_append_release.wait(timeout=SYNC_TIMEOUT)
+        persisted.append(transform.ts)
+
+    def stop_store() -> None:
+        assert persisted == [1.0, 2.0]
+        store_stopped.set()
+
+    tf_stream.append.side_effect = append
+    unsubscribe.side_effect = unsubscribed.set
+    store.stop.side_effect = stop_store
+    first_message = TFMessage(Transform(ts=1.0))
+    second_message = TFMessage(Transform(ts=2.0))
+
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            first_future = pool.submit(callback, first_message, "/tf")
+            second_future = None
+            stop_future = None
+            try:
+                assert first_append_started.wait(timeout=SYNC_TIMEOUT)
+                second_future = pool.submit(callback, second_message, "/tf")
+                assert append_lock.second_attempted.wait(timeout=SYNC_TIMEOUT)
+                stop_future = pool.submit(module.stop)
+                assert unsubscribed.wait(timeout=SYNC_TIMEOUT)
+                assert not stop_future.done()
+            finally:
+                first_append_release.set()
+
+            first_future.result(timeout=SYNC_TIMEOUT)
+            assert second_future is not None
+            second_future.result(timeout=SYNC_TIMEOUT)
+            assert stop_future is not None
+            stop_future.result(timeout=SYNC_TIMEOUT)
+    finally:
+        first_append_release.set()
+        module.stop()
+
+    assert persisted == [1.0, 2.0]
+    assert tf_stream.append.call_count == 2
     unsubscribe.assert_called_once_with()
     store.stop.assert_called_once_with()
     assert store_stopped.is_set()
@@ -241,15 +371,15 @@ def test_recorder_ignores_tf_callback_entering_after_unsubscribe(
 
     def invoke_callback() -> None:
         callback_scheduled.set()
-        assert callback_release.wait(timeout=2)
+        assert callback_release.wait(timeout=SYNC_TIMEOUT)
         callback(message, "/tf")
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         callback_future = pool.submit(invoke_callback)
-        assert callback_scheduled.wait(timeout=1)
+        assert callback_scheduled.wait(timeout=SYNC_TIMEOUT)
         module.stop()
         callback_release.set()
-        callback_future.result(timeout=2)
+        callback_future.result(timeout=SYNC_TIMEOUT)
 
     tf_stream.append.assert_not_called()
     unsubscribe.assert_called_once_with()
@@ -283,7 +413,7 @@ def test_memory_module_serializes_concurrent_stop(
     def blocking_close_rpc() -> None:
         events.append("close-started")
         close_started.set()
-        assert close_release.wait(timeout=2)
+        assert close_release.wait(timeout=SYNC_TIMEOUT)
         events.append("close-finished")
         close_rpc()
 
@@ -297,17 +427,17 @@ def test_memory_module_serializes_concurrent_stop(
         first_stop = pool.submit(module.stop)
         second_stop = None
         try:
-            assert close_started.wait(timeout=1)
+            assert close_started.wait(timeout=SYNC_TIMEOUT)
             second_stop = pool.submit(stop_again)
-            assert second_started.wait(timeout=1)
+            assert second_started.wait(timeout=SYNC_TIMEOUT)
             assert not store_stopped.wait(timeout=0.1)
             assert not second_stop.done()
         finally:
             close_release.set()
 
-        first_stop.result(timeout=2)
+        first_stop.result(timeout=SYNC_TIMEOUT)
         assert second_stop is not None
-        second_stop.result(timeout=2)
+        second_stop.result(timeout=SYNC_TIMEOUT)
 
     assert events == ["close-started", "close-finished", "store-stopped"]
     store.stop.assert_called_once_with()
@@ -324,7 +454,7 @@ def test_memory_module_serializes_store_initialization(
 
     def make_store(**_kwargs: Any) -> SqliteStore:
         factory_entered.set()
-        assert factory_release.wait(timeout=2)
+        assert factory_release.wait(timeout=SYNC_TIMEOUT)
         return store
 
     store_factory = MagicMock(side_effect=make_store)
@@ -342,16 +472,16 @@ def test_memory_module_serializes_store_initialization(
         first_store = pool.submit(lambda: module.store)
         second_store = None
         try:
-            assert factory_entered.wait(timeout=1)
+            assert factory_entered.wait(timeout=SYNC_TIMEOUT)
             second_store = pool.submit(get_store_again)
-            assert second_started.wait(timeout=1)
+            assert second_started.wait(timeout=SYNC_TIMEOUT)
             assert not second_store.done()
         finally:
             factory_release.set()
 
-        assert first_store.result(timeout=2) is store
+        assert first_store.result(timeout=SYNC_TIMEOUT) is store
         assert second_store is not None
-        assert second_store.result(timeout=2) is store
+        assert second_store.result(timeout=SYNC_TIMEOUT) is store
 
     module.stop()
 
@@ -373,7 +503,7 @@ def test_memory_module_stop_waits_for_store_initialization(
 
     def start_store() -> None:
         start_entered.set()
-        assert start_release.wait(timeout=2)
+        assert start_release.wait(timeout=SYNC_TIMEOUT)
         start_finished.set()
 
     def stop_store() -> None:
@@ -394,10 +524,10 @@ def test_memory_module_stop_waits_for_store_initialization(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         getter = pool.submit(lambda: module.store)
-        assert start_entered.wait(timeout=1)
+        assert start_entered.wait(timeout=SYNC_TIMEOUT)
 
         stopper = pool.submit(stop_module)
-        assert stop_started.wait(timeout=1)
+        assert stop_started.wait(timeout=SYNC_TIMEOUT)
 
         try:
             assert not store_stop_called.wait(timeout=0.1)
@@ -405,8 +535,8 @@ def test_memory_module_stop_waits_for_store_initialization(
         finally:
             start_release.set()
 
-        assert getter.result(timeout=2) is store
-        stopper.result(timeout=2)
+        assert getter.result(timeout=SYNC_TIMEOUT) is store
+        stopper.result(timeout=SYNC_TIMEOUT)
 
     store.start.assert_called_once_with()
     store.stop.assert_called_once_with()
@@ -429,7 +559,7 @@ def test_memory_module_refuses_store_creation_after_stop_begins(
 
     def blocking_close_rpc() -> None:
         close_started.set()
-        assert close_release.wait(timeout=2)
+        assert close_release.wait(timeout=SYNC_TIMEOUT)
         close_rpc()
 
     monkeypatch.setattr(module, "_close_rpc", blocking_close_rpc)
@@ -442,17 +572,17 @@ def test_memory_module_refuses_store_creation_after_stop_begins(
         stop = pool.submit(module.stop)
         getter = None
         try:
-            assert close_started.wait(timeout=1)
+            assert close_started.wait(timeout=SYNC_TIMEOUT)
             getter = pool.submit(get_store)
-            assert getter_started.wait(timeout=1)
+            assert getter_started.wait(timeout=SYNC_TIMEOUT)
             assert not getter.done()
         finally:
             close_release.set()
 
-        stop.result(timeout=2)
+        stop.result(timeout=SYNC_TIMEOUT)
         assert getter is not None
         with pytest.raises(RuntimeError, match="stopping or stopped"):
-            getter.result(timeout=2)
+            getter.result(timeout=SYNC_TIMEOUT)
 
     store_factory.assert_not_called()
 
@@ -495,8 +625,7 @@ def test_memory_module_restores_fresh_runtime_store_state(tmp_path: Path) -> Non
     module._store = MagicMock(spec=SqliteStore)
 
     state = module.__getstate__()
-    restored = MemoryModule.__new__(MemoryModule)
-    restored.__setstate__(state)
+    restored = pickle.loads(pickle.dumps(module))
 
     module._store = None
     module.stop()
@@ -517,9 +646,52 @@ def test_memory_module_preserves_stopped_state_when_restored(tmp_path: Path) -> 
     )
     module.stop()
 
-    state = module.__getstate__()
-    restored = MemoryModule.__new__(MemoryModule)
-    restored.__setstate__(state)
+    restored = pickle.loads(pickle.dumps(module))
+
+    assert restored._module_closed
+    assert restored._memory_stopping
+    assert restored._memory_stopped.is_set()
+    with pytest.raises(RuntimeError, match="stopping or stopped"):
+        assert restored.store is not None
+
+
+def test_memory_module_pickle_waits_for_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = MemoryModule(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    stop_entered = threading.Event()
+    stop_release = threading.Event()
+    stop_lock = _ObservedLock(threading.RLock())
+    monkeypatch.setattr(module, "_memory_stop_lock", stop_lock)
+    original_stop_main = MemoryModule._stop_main
+
+    def blocking_stop_main(self: MemoryModule) -> None:
+        stop_entered.set()
+        assert stop_release.wait(timeout=SYNC_TIMEOUT)
+        original_stop_main(self)
+
+    monkeypatch.setattr(MemoryModule, "_stop_main", blocking_stop_main)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stop_future = pool.submit(module.stop)
+        snapshot_future = None
+        try:
+            assert stop_entered.wait(timeout=SYNC_TIMEOUT)
+            assert module._memory_stopping
+            assert not module._module_closed
+            snapshot_future = pool.submit(pickle.dumps, module)
+            assert stop_lock.second_attempted.wait(timeout=SYNC_TIMEOUT)
+            assert not snapshot_future.done()
+        finally:
+            stop_release.set()
+
+        stop_future.result(timeout=SYNC_TIMEOUT)
+        assert snapshot_future is not None
+        restored = pickle.loads(snapshot_future.result(timeout=SYNC_TIMEOUT))
 
     assert restored._module_closed
     assert restored._memory_stopping
