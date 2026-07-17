@@ -25,6 +25,7 @@ from dimos.memory2 import module as memory_module
 from dimos.memory2.module import Recorder
 from dimos.memory2.store.sqlite import SqliteStore
 from dimos.protocol.rpc.spec import Args, RPCSpec
+from dimos.teleop.utils import recorder as teleop_recorder_module
 from dimos.teleop.utils.recorder import TeleopRecorder
 
 
@@ -60,12 +61,59 @@ def test_teleop_recorder_leaves_store_open_until_subscriptions_stop(
         rpc_transport=_TestRPC,
     )
 
-    assert module.start() is None
-    module.register_disposable(Disposable(lambda: events.append("subscription")))
-    module.stop()
+    stopped = False
+    try:
+        assert module.start() is None
+        module.register_disposable(Disposable(lambda: events.append("subscription")))
+        module.stop()
+        stopped = True
+    finally:
+        if not stopped:
+            module.stop()
 
     assert events == ["store-started", "subscription", "store-stopped"]
     store_factory.assert_called_once_with(path=str(module._db_path))
     store.start.assert_called_once_with()
     store.stop.assert_called_once_with()
     store.dispose.assert_not_called()
+
+
+def test_teleop_recorder_cleans_up_after_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    store = MagicMock(spec=SqliteStore)
+    store.start.side_effect = lambda: events.append("store-started")
+    store.stop.side_effect = lambda: events.append("store-stopped")
+    monkeypatch.setattr(memory_module, "SqliteStore", MagicMock(return_value=store))
+    generate_report = MagicMock()
+    monkeypatch.setattr(teleop_recorder_module, "generate_report", generate_report)
+
+    def fail_after_subscribing(module: Recorder) -> None:
+        module.register_disposable(Disposable(lambda: events.append("subscription")))
+        raise RuntimeError("recorder start failed")
+
+    monkeypatch.setattr(Recorder, "start", fail_after_subscribing)
+    module = TeleopRecorder(
+        db_path=tmp_path / "teleop.db",
+        generate_report=True,
+        rpc_transport=_TestRPC,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="recorder start failed"):
+            module.start()
+
+        assert events == ["store-started", "subscription", "store-stopped"]
+        assert module._store is None
+        assert module._db_path is None
+        assert module._memory_stopped.is_set()
+        store.stop.assert_called_once_with()
+        generate_report.assert_not_called()
+    finally:
+        if not module._memory_stopped.is_set():
+            super(TeleopRecorder, module).stop()
+
+    module.stop()
+    generate_report.assert_not_called()

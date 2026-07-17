@@ -77,7 +77,15 @@ class TeleopRecorder(Recorder):
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         # Open the store ourselves so the base Recorder records into our path.
         self._open_store(self._db_path)
-        super().start()
+        try:
+            super().start()
+        except BaseException:
+            try:
+                super().stop()
+            except Exception:
+                logger.exception("Failed to clean up teleop recorder after start failure")
+            self._db_path = None
+            raise
 
     @rpc
     def stop(self) -> None:

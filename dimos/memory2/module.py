@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 import enum
 import inspect
@@ -439,19 +440,66 @@ class Recorder(MemoryModule):
         and registers the subscription for cleanup on stop().
         """
 
+        callback_state = threading.Condition()
+        accepting_callbacks = True
+        active_callbacks = 0
+
+        def stop_admitting_callbacks() -> None:
+            nonlocal accepting_callbacks
+            with callback_state:
+                accepting_callbacks = False
+
+        # Shutdown closes admission before cancelling the dispatcher, then
+        # waits below for callbacks already inside the handler to finish.
+        self.register_disposable(Disposable(stop_admitting_callbacks))
+
         async def on_msg(msg: Any) -> None:
-            ts = self._resolve_ts(name, msg)
-            pose = await self._resolve_pose(name, msg, ts)
-            if not pose:
-                logger.warning(
-                    "[%s] No pose for time %s (msg ts: %s), storing without pose",
-                    name,
-                    ts,
-                    getattr(msg, "ts", None),
-                )
-            stream.append(msg, ts=ts, pose=pose)
+            nonlocal active_callbacks
+            with callback_state:
+                if not accepting_callbacks:
+                    return
+                active_callbacks += 1
+            try:
+                ts = self._resolve_ts(name, msg)
+                pose = await self._resolve_pose(name, msg, ts)
+                if not pose:
+                    logger.warning(
+                        "[%s] No pose for time %s (msg ts: %s), storing without pose",
+                        name,
+                        ts,
+                        getattr(msg, "ts", None),
+                    )
+                stream.append(msg, ts=ts, pose=pose)
+            finally:
+                with callback_state:
+                    active_callbacks -= 1
+                    if active_callbacks == 0:
+                        callback_state.notify_all()
 
         self.process_observable(input_topic.pure_observable(), on_msg)
+
+        def drain_callbacks() -> None:
+            with callback_state:
+                callback_state.wait_for(lambda: active_callbacks == 0)
+
+            # Dispatcher disposal requests cancellation on the module loop.
+            # Give that cancellation one complete loop turn before Module.stop
+            # stops the loop, otherwise the dispatcher task can be destroyed
+            # while its cancellation wakeup is still queued.
+            loop = self._loop
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if loop is not None and loop.is_running() and running_loop is not loop:
+                checkpoint = asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop)
+                try:
+                    checkpoint.result(timeout=self._loop_thread_timeout)
+                except TimeoutError:
+                    checkpoint.cancel()
+                    logger.warning("Timed out waiting for recorder dispatcher cancellation")
+
+        self.register_disposable(Disposable(drain_callbacks))
 
     def _prepare_streams(self) -> None:
         """On APPEND, drop the streams this recorder is about to (re)write — the
@@ -503,6 +551,7 @@ class Recorder(MemoryModule):
         append_lock = threading.Lock()
         accepting_callbacks = True
         active_callbacks = 0
+        unsubscribe: Callable[[], None] | None = None
 
         def on_tf(msg: TFMessage, _topic: Any) -> None:
             nonlocal active_callbacks
@@ -520,16 +569,26 @@ class Recorder(MemoryModule):
                     if active_callbacks == 0:
                         callback_state.notify_all()
 
-        unsubscribe = pubsub.subscribe(topic, on_tf)
-
         def unsubscribe_and_drain() -> None:
             nonlocal accepting_callbacks
             with callback_state:
                 accepting_callbacks = False
+                unsubscribe_now = unsubscribe
             try:
-                unsubscribe()
+                if unsubscribe_now is not None:
+                    unsubscribe_now()
             finally:
                 with callback_state:
                     callback_state.wait_for(lambda: active_callbacks == 0)
 
         self.register_disposable(Disposable(unsubscribe_and_drain))
+
+        returned_unsubscribe = pubsub.subscribe(topic, on_tf)
+        with callback_state:
+            if accepting_callbacks:
+                unsubscribe = returned_unsubscribe
+                unsubscribe_now = None
+            else:
+                unsubscribe_now = returned_unsubscribe
+        if unsubscribe_now is not None:
+            unsubscribe_now()
