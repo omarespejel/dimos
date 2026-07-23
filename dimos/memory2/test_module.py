@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+import asyncio
+from collections.abc import Callable, Coroutine, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import MagicMock
 
@@ -144,6 +146,26 @@ TFRecorderFixture = tuple[
 SYNC_TIMEOUT: float = 2.0
 
 
+class _ObservedCondition:
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self.drain_entered = threading.Event()
+
+    def __enter__(self) -> _ObservedCondition:
+        self._condition.acquire()
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self._condition.release()
+
+    def notify_all(self) -> None:
+        self._condition.notify_all()
+
+    def wait_for(self, predicate: Callable[[], bool], timeout: float | None = None) -> bool:
+        self.drain_entered.set()
+        return self._condition.wait_for(predicate, timeout=timeout)
+
+
 @pytest.fixture
 def tf_recorder(tmp_path: Path) -> Iterator[TFRecorderFixture]:
     store = MagicMock(spec=SqliteStore)
@@ -168,6 +190,144 @@ def tf_recorder(tmp_path: Path) -> Iterator[TFRecorderFixture]:
         yield module, store, tf_stream, callback, unsubscribe
     finally:
         module.stop()
+
+
+def test_recorder_stop_waits_for_active_input_append(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    stream = MagicMock(spec=Stream)
+    input_topic = MagicMock(spec=In)
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    callback: list[Callable[[Any], Coroutine[Any, Any, None]]] = []
+    append_started = threading.Event()
+    append_release = threading.Event()
+    append_finished = threading.Event()
+    store_stopped = threading.Event()
+    callback_state = _ObservedCondition()
+
+    def capture_callback(
+        _observable: Any,
+        async_callback: Callable[[Any], Coroutine[Any, Any, None]],
+    ) -> Disposable:
+        callback.append(async_callback)
+        return Disposable()
+
+    async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
+        return None
+
+    def append(*_args: Any, **_kwargs: Any) -> None:
+        append_started.set()
+        assert append_release.wait(timeout=SYNC_TIMEOUT)
+        append_finished.set()
+
+    def stop_store() -> None:
+        assert append_finished.is_set()
+        store_stopped.set()
+
+    monkeypatch.setattr(module, "process_observable", capture_callback)
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    stream.append.side_effect = append
+    store.stop.side_effect = stop_store
+    with monkeypatch.context() as condition_patch:
+        condition_patch.setattr(threading, "Condition", lambda: callback_state)
+        module._port_to_stream("color_image", input_topic, stream)
+    message = SimpleNamespace(ts=1.0)
+
+    def record_message() -> None:
+        asyncio.run(callback[0](message))
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            record_future = pool.submit(record_message)
+            assert append_started.wait(timeout=SYNC_TIMEOUT)
+            stop_future = pool.submit(module.stop)
+            try:
+                assert callback_state.drain_entered.wait(timeout=SYNC_TIMEOUT)
+                assert not store_stopped.is_set()
+                assert not stop_future.done()
+            finally:
+                append_release.set()
+
+            record_future.result(timeout=SYNC_TIMEOUT)
+            stop_future.result(timeout=SYNC_TIMEOUT)
+    finally:
+        append_release.set()
+        module.stop()
+
+    stream.append.assert_called_once_with(message, ts=1.0, pose=None)
+    store.stop.assert_called_once_with()
+    assert store_stopped.is_set()
+
+
+def test_recorder_rejects_input_append_after_stop_begins(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    stream = MagicMock(spec=Stream)
+    input_topic = MagicMock(spec=In)
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    callback: list[Callable[[Any], Coroutine[Any, Any, None]]] = []
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+    store_stopped = threading.Event()
+
+    def capture_callback(
+        _observable: Any,
+        async_callback: Callable[[Any], Coroutine[Any, Any, None]],
+    ) -> Disposable:
+        callback.append(async_callback)
+        return Disposable()
+
+    async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
+        return None
+
+    def block_cleanup() -> None:
+        cleanup_started.set()
+        assert cleanup_release.wait(timeout=SYNC_TIMEOUT)
+
+    monkeypatch.setattr(module, "process_observable", capture_callback)
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    store.stop.side_effect = store_stopped.set
+    module._port_to_stream("color_image", input_topic, stream)
+    module.register_disposable(Disposable(block_cleanup))
+    message = SimpleNamespace(ts=1.0)
+
+    def record_message() -> None:
+        asyncio.run(callback[0](message))
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            stop_future = pool.submit(module.stop)
+            assert cleanup_started.wait(timeout=SYNC_TIMEOUT)
+            record_future = pool.submit(record_message)
+            try:
+                record_future.result(timeout=SYNC_TIMEOUT)
+                stream.append.assert_not_called()
+                assert not store_stopped.is_set()
+            finally:
+                cleanup_release.set()
+
+            stop_future.result(timeout=SYNC_TIMEOUT)
+    finally:
+        cleanup_release.set()
+        module.stop()
+
+    stream.append.assert_not_called()
+    store.stop.assert_called_once_with()
+    assert store_stopped.is_set()
 
 
 def test_recorder_stop_waits_for_active_tf_callback(
