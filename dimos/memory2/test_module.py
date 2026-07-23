@@ -20,6 +20,7 @@ import asyncio
 from collections.abc import Callable, Coroutine, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import pickle
 import threading
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -855,8 +856,7 @@ def test_memory_module_restores_fresh_runtime_store_state(tmp_path: Path) -> Non
     module._store = MagicMock(spec=SqliteStore)
 
     state = module.__getstate__()
-    restored = MemoryModule.__new__(MemoryModule)
-    restored.__setstate__(state)
+    restored = pickle.loads(pickle.dumps(module))
 
     module._store = None
     module.stop()
@@ -877,9 +877,7 @@ def test_memory_module_preserves_stopped_state_when_restored(tmp_path: Path) -> 
     )
     module.stop()
 
-    state = module.__getstate__()
-    restored = MemoryModule.__new__(MemoryModule)
-    restored.__setstate__(state)
+    restored = pickle.loads(pickle.dumps(module))
 
     assert restored._module_closed
     assert restored._memory_stopping
