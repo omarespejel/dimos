@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 from pydantic import Field, field_validator
 from reactivex.abc import DisposableBase
-from reactivex.disposable import Disposable
+from reactivex.disposable import Disposable, SingleAssignmentDisposable
 
 from dimos.agents.annotation import skill
 from dimos.constants import DIMOS_PROJECT_ROOT
@@ -462,18 +462,21 @@ class Recorder(MemoryModule):
             with callback_state:
                 accepting_callbacks = False
 
-        # Dispose in admission -> subscription -> drain order on stop().
+        # Pre-register the subscription slot so stop() can cancel an async
+        # handler before waiting for admitted callbacks to drain. Assignment
+        # after a concurrent stop disposes the subscription immediately.
         self.register_disposable(Disposable(stop_admitting_callbacks))
+        subscription = self.register_disposable(SingleAssignmentDisposable())
 
         async def on_msg(msg: Any) -> None:
             nonlocal active_callbacks
-            ts = self._resolve_ts(name, msg)
-            pose = await self._resolve_pose(name, msg, ts)
             with callback_state:
                 if not accepting_callbacks:
                     return
                 active_callbacks += 1
             try:
+                ts = self._resolve_ts(name, msg)
+                pose = await self._resolve_pose(name, msg, ts)
                 if not pose:
                     logger.warning(
                         "[%s] No pose for time %s (msg ts: %s), storing without pose",
@@ -487,8 +490,6 @@ class Recorder(MemoryModule):
                     active_callbacks -= 1
                     if active_callbacks == 0:
                         callback_state.notify_all()
-
-        self.process_observable(input_topic.pure_observable(), on_msg)
 
         def drain_callbacks() -> None:
             wait_started = time.monotonic()
@@ -507,6 +508,7 @@ class Recorder(MemoryModule):
                 )
 
         self.register_disposable(Disposable(drain_callbacks))
+        subscription.disposable = self.process_observable(input_topic.pure_observable(), on_msg)
 
     def _prepare_streams(self) -> None:
         """On APPEND, drop the streams this recorder is about to (re)write — the
