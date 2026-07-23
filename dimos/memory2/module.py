@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 from pydantic import Field, field_validator
 from reactivex.abc import DisposableBase
-from reactivex.disposable import Disposable
+from reactivex.disposable import Disposable, SingleAssignmentDisposable
 
 from dimos.agents.annotation import skill
 from dimos.constants import DIMOS_PROJECT_ROOT
@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
 logger = setup_logger()
 
+_INPUT_DRAIN_LOG_INTERVAL_SECONDS: float = 5.0
 _TF_DRAIN_LOG_INTERVAL_SECONDS: float = 5.0
 
 T = TypeVar("T")
@@ -452,19 +453,62 @@ class Recorder(MemoryModule):
         and registers the subscription for cleanup on stop().
         """
 
-        async def on_msg(msg: Any) -> None:
-            ts = self._resolve_ts(name, msg)
-            pose = await self._resolve_pose(name, msg, ts)
-            if not pose:
-                logger.warning(
-                    "[%s] No pose for time %s (msg ts: %s), storing without pose",
-                    name,
-                    ts,
-                    getattr(msg, "ts", None),
-                )
-            stream.append(msg, ts=ts, pose=pose)
+        callback_state = threading.Condition()
+        accepting_callbacks = True
+        active_callbacks = 0
 
-        self.process_observable(input_topic.pure_observable(), on_msg)
+        def stop_admitting_callbacks() -> None:
+            nonlocal accepting_callbacks
+            with callback_state:
+                accepting_callbacks = False
+
+        # Pre-register the subscription slot so stop() can cancel an async
+        # handler before waiting for admitted callbacks to drain. Assignment
+        # after a concurrent stop disposes the subscription immediately.
+        self.register_disposable(Disposable(stop_admitting_callbacks))
+        subscription = self.register_disposable(SingleAssignmentDisposable())
+
+        async def on_msg(msg: Any) -> None:
+            nonlocal active_callbacks
+            with callback_state:
+                if not accepting_callbacks:
+                    return
+                active_callbacks += 1
+            try:
+                ts = self._resolve_ts(name, msg)
+                pose = await self._resolve_pose(name, msg, ts)
+                if not pose:
+                    logger.warning(
+                        "[%s] No pose for time %s (msg ts: %s), storing without pose",
+                        name,
+                        ts,
+                        getattr(msg, "ts", None),
+                    )
+                stream.append(msg, ts=ts, pose=pose)
+            finally:
+                with callback_state:
+                    active_callbacks -= 1
+                    if active_callbacks == 0:
+                        callback_state.notify_all()
+
+        def drain_callbacks() -> None:
+            wait_started = time.monotonic()
+            while True:
+                with callback_state:
+                    if callback_state.wait_for(
+                        lambda: active_callbacks == 0,
+                        timeout=_INPUT_DRAIN_LOG_INTERVAL_SECONDS,
+                    ):
+                        break
+                    remaining_callbacks = active_callbacks
+                logger.warning(
+                    "Still waiting for recorder input callbacks",
+                    active_callbacks=remaining_callbacks,
+                    elapsed_seconds=time.monotonic() - wait_started,
+                )
+
+        self.register_disposable(Disposable(drain_callbacks))
+        subscription.disposable = self.process_observable(input_topic.pure_observable(), on_msg)
 
     def _prepare_streams(self) -> None:
         """On APPEND, drop the streams this recorder is about to (re)write — the
