@@ -381,20 +381,42 @@ class Recorder(MemoryModule):
     _pose_setters: dict[str, Any] = {}
     _tf_cleanup: DisposableBase | None = None
 
+    def __init__(self, **kwargs: Any) -> None:
+        self._input_cleanups: list[DisposableBase] = []
+        super().__init__(**kwargs)
+
     def __getstate__(self) -> dict[str, Any]:
         state = super().__getstate__()
+        state.pop("_input_cleanups", None)
         state.pop("_tf_cleanup", None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         super().__setstate__(state)
+        self._input_cleanups = []
         self._tf_cleanup = None
 
     def _before_memory_stop(self) -> None:
-        cleanup, self._tf_cleanup = self._tf_cleanup, None
-        if cleanup is not None:
-            cleanup.dispose()
-        super()._before_memory_stop()
+        cleanups, self._input_cleanups = self._input_cleanups, []
+        tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
+        if tf_cleanup is not None:
+            cleanups.append(tf_cleanup)
+        first_error: BaseException | None = None
+
+        for cleanup in cleanups:
+            try:
+                cleanup.dispose()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        try:
+            super()._before_memory_stop()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+
+        if first_error is not None:
+            raise first_error
 
     @rpc
     def start(self) -> None:
@@ -501,10 +523,14 @@ class Recorder(MemoryModule):
 
         def drain_callbacks() -> None:
             wait_started = time.monotonic()
+
+            def callbacks_drained() -> bool:
+                return active_callbacks == 0
+
             while True:
                 with callback_state:
                     if callback_state.wait_for(
-                        lambda: active_callbacks == 0,
+                        callbacks_drained,
                         timeout=_INPUT_DRAIN_LOG_INTERVAL_SECONDS,
                     ):
                         break
@@ -515,21 +541,37 @@ class Recorder(MemoryModule):
                     elapsed_seconds=time.monotonic() - wait_started,
                 )
 
-        # Own setup and teardown through one ordered disposable. Make the
+        # Install the safety cleanup before starting the dispatcher. Make the
         # dispatcher available to stop() before subscribing; a subscription
         # returned after stop is disposed immediately by its assignment slot.
-        input_cleanup = self.register_disposable(Disposable(stop_input))
-        with callback_state:
-            if not accepting_callbacks:
-                return
-            on_next, dispatcher_disposable = self._make_async_dispatch(on_msg)
-            dispatcher.disposable = dispatcher_disposable
+        input_cleanup = Disposable(stop_input)
+        with self._memory_stop_lock:
+            if self._memory_stopping:
+                input_cleanup.dispose()
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+            self._input_cleanups.append(input_cleanup)
         try:
+            with callback_state:
+                if not accepting_callbacks:
+                    return
+                on_next, dispatcher_disposable = self._make_async_dispatch(on_msg)
+                dispatcher.disposable = dispatcher_disposable
+
             # Stamp arrival time before the coalescing dispatch queue.
-            stamped = input_topic.pure_observable().pipe(ops.map(lambda msg: (time.time(), msg)))
+            def stamp_reception(msg: Any) -> tuple[float, Any]:
+                return time.time(), msg
+
+            stamped = input_topic.pure_observable().pipe(ops.map(stamp_reception))
             observable_subscription = stamped.subscribe(on_next)
         except BaseException:
-            input_cleanup.dispose()
+            with self._memory_stop_lock:
+                try:
+                    input_cleanup.dispose()
+                except BaseException:
+                    logger.exception("Failed to clean up recorder input after setup error")
+                finally:
+                    if input_cleanup in self._input_cleanups:
+                        self._input_cleanups.remove(input_cleanup)
             raise
         rx_subscription.disposable = observable_subscription
 
