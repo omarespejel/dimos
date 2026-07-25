@@ -179,6 +179,7 @@ def test_recorder_stop_waits_for_active_input_append(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    reception_ts = 10.0
     store = MagicMock(spec=SqliteStore)
     stream = MagicMock(spec=Stream)
     input_topic = MagicMock(spec=In)
@@ -216,6 +217,7 @@ def test_recorder_stop_waits_for_active_input_append(
         store_stopped.set()
 
     monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr("dimos.memory2.module.time.time", lambda: reception_ts)
     monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(memory_module, "logger", test_logger)
     stream.append.side_effect = append
@@ -240,7 +242,12 @@ def test_recorder_stop_waits_for_active_input_append(
         append_release.set()
         module.stop()
 
-    stream.append.assert_called_once_with(message, ts=1.0, pose=None)
+    stream.append.assert_called_once_with(
+        message,
+        ts=1.0,
+        pose=None,
+        tags={"reception_ts": reception_ts},
+    )
     store.stop.assert_called_once_with()
     assert store_stopped.is_set()
     assert test_logger.warning.call_args.args == ("Still waiting for recorder input callbacks",)
@@ -251,6 +258,7 @@ def test_recorder_stop_waits_for_active_pose_lookup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    reception_ts = 10.0
     store = MagicMock(spec=SqliteStore)
     stream = MagicMock(spec=Stream)
     input_topic = MagicMock(spec=In)
@@ -285,6 +293,7 @@ def test_recorder_stop_waits_for_active_pose_lookup(
 
     monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(memory_module, "logger", test_logger)
+    monkeypatch.setattr("dimos.memory2.module.time.time", lambda: reception_ts)
     tf = MagicMock()
     tf.get.side_effect = get_pose
     tf.stop.side_effect = stop_tf
@@ -305,7 +314,12 @@ def test_recorder_stop_waits_for_active_pose_lookup(
         pose_release.set()
         module.stop()
 
-    stream.append.assert_called_once_with(message, ts=1.0, pose=None)
+    stream.append.assert_called_once_with(
+        message,
+        ts=1.0,
+        pose=None,
+        tags={"reception_ts": reception_ts},
+    )
     tf.stop.assert_called_once_with()
     store.stop.assert_called_once_with()
 
@@ -356,8 +370,11 @@ def test_recorder_rejects_input_append_after_stop_begins(
     store = MagicMock(spec=SqliteStore)
     stream = MagicMock(spec=Stream)
     input_topic = MagicMock(spec=In)
-    subject: Subject[Any] = Subject()
-    input_topic.pure_observable.return_value = subject
+    observable = MagicMock()
+    stamped_observable = MagicMock()
+    input_topic.pure_observable.return_value = observable
+    observable.pipe.return_value = stamped_observable
+    stamped_observable.subscribe.return_value = Disposable()
     module = Recorder(
         db_path=tmp_path / "recording.db",
         record_tf=False,
@@ -367,15 +384,25 @@ def test_recorder_rejects_input_append_after_stop_begins(
     cleanup_started = threading.Event()
     cleanup_release = threading.Event()
     store_stopped = threading.Event()
+    callbacks: list[Callable[[Any], Any]] = []
+    pose_called = threading.Event()
 
     async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
+        pose_called.set()
         return None
 
     def block_cleanup() -> None:
         cleanup_started.set()
         assert cleanup_release.wait(timeout=SYNC_TIMEOUT)
 
+    def make_dispatch(
+        async_callback: Callable[[Any], Any],
+    ) -> tuple[Callable[[Any], None], Disposable]:
+        callbacks.append(async_callback)
+        return lambda _msg: None, Disposable()
+
     monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
     store.stop.side_effect = store_stopped.set
     module._port_to_stream("color_image", input_topic, stream)
     module.register_disposable(Disposable(block_cleanup))
@@ -386,8 +413,9 @@ def test_recorder_rejects_input_append_after_stop_begins(
             stop_future = pool.submit(module.stop)
             assert cleanup_started.wait(timeout=SYNC_TIMEOUT)
             try:
-                subject.on_next(message)
+                asyncio.run(callbacks[0]((2.0, message)))
                 stream.append.assert_not_called()
+                assert not pose_called.is_set()
                 assert not store_stopped.is_set()
             finally:
                 cleanup_release.set()
@@ -477,8 +505,10 @@ def test_recorder_input_teardown_is_ordered(
     stream = MagicMock(spec=Stream)
     input_topic = MagicMock(spec=In)
     observable = MagicMock()
+    stamped_observable = MagicMock()
     input_topic.pure_observable.return_value = observable
-    observable.subscribe.return_value = Disposable(lambda: events.append("subscription"))
+    observable.pipe.return_value = stamped_observable
+    stamped_observable.subscribe.return_value = Disposable(lambda: events.append("subscription"))
     module = Recorder(
         db_path=tmp_path / "recording.db",
         record_tf=False,
@@ -498,6 +528,101 @@ def test_recorder_input_teardown_is_ordered(
     module.stop()
 
     assert events == ["subscription", "dispatcher", "store"]
+
+
+def test_recorder_stamps_reception_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reception_time = [10.0]
+    callbacks: list[Callable[[Any], Any]] = []
+    pending: list[Any] = []
+    store = MagicMock(spec=SqliteStore)
+    stream = MagicMock(spec=Stream)
+    input_topic = MagicMock(spec=In)
+    subject: Subject[Any] = Subject()
+    input_topic.pure_observable.return_value = subject
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+
+    async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
+        return None
+
+    def make_dispatch(
+        async_callback: Callable[[Any], Any],
+    ) -> tuple[Callable[[Any], None], Disposable]:
+        callbacks.append(async_callback)
+        return pending.append, Disposable()
+
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
+    monkeypatch.setattr("dimos.memory2.module.time.time", lambda: reception_time[0])
+    module._port_to_stream("color_image", input_topic, stream)
+    message = SimpleNamespace(ts=1.0)
+
+    try:
+        subject.on_next(message)
+        assert pending == [(10.0, message)]
+        reception_time[0] = 20.0
+        asyncio.run(callbacks[0](pending[0]))
+    finally:
+        module.stop()
+
+    stream.append.assert_called_once_with(
+        message,
+        ts=1.0,
+        pose=None,
+        tags={"reception_ts": 10.0},
+    )
+
+
+def test_recorder_poseless_stream_records_reception_without_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reception_ts = 10.0
+    store = MagicMock(spec=SqliteStore)
+    stream = MagicMock(spec=Stream)
+    input_topic = MagicMock(spec=In)
+    subject: Subject[Any] = Subject()
+    input_topic.pure_observable.return_value = subject
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        poseless_streams=["command"],
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    append_finished = threading.Event()
+    test_logger = MagicMock()
+
+    async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
+        return None
+
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr("dimos.memory2.module.time.time", lambda: reception_ts)
+    monkeypatch.setattr(memory_module, "logger", test_logger)
+    stream.append.side_effect = lambda *_args, **_kwargs: append_finished.set()
+    module._port_to_stream("command", input_topic, stream)
+    message = SimpleNamespace(ts=1.0)
+
+    try:
+        subject.on_next(message)
+        assert append_finished.wait(timeout=SYNC_TIMEOUT)
+    finally:
+        module.stop()
+
+    test_logger.warning.assert_not_called()
+    stream.append.assert_called_once_with(
+        message,
+        ts=1.0,
+        pose=None,
+        tags={"reception_ts": reception_ts},
+    )
 
 
 def test_recorder_stop_waits_for_active_tf_callback(

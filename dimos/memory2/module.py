@@ -24,6 +24,7 @@ import time
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 from pydantic import Field, field_validator
+from reactivex import operators as ops
 from reactivex.abc import DisposableBase
 from reactivex.disposable import Disposable, SingleAssignmentDisposable
 
@@ -330,6 +331,8 @@ class RecorderConfig(MemoryModuleConfig):
     # read the active remappings from inside the module (AFAIK), so this config
     # arg does the per-stream rename directly.
     stream_remapping: dict[str, str] = Field(default_factory=dict)
+    # Port names that inherently have no pose to anchor (command streams, etc.).
+    poseless_streams: list[str] = Field(default_factory=list)
 
 
 PoseSetter = Callable[[Any], "Awaitable[Pose | None]"]
@@ -464,27 +467,32 @@ class Recorder(MemoryModule):
             nonlocal accepting_callbacks
             with callback_state:
                 accepting_callbacks = False
-            rx_subscription.dispose()
-            dispatcher.dispose()
-            drain_callbacks()
+            try:
+                rx_subscription.dispose()
+            finally:
+                try:
+                    dispatcher.dispose()
+                finally:
+                    drain_callbacks()
 
-        async def on_msg(msg: Any) -> None:
+        async def on_msg(stamped: tuple[float, Any]) -> None:
             nonlocal active_callbacks
             with callback_state:
                 if not accepting_callbacks:
                     return
                 active_callbacks += 1
             try:
+                recv_ts, msg = stamped
                 ts = self._resolve_ts(name, msg)
                 pose = await self._resolve_pose(name, msg, ts)
-                if not pose:
+                if not pose and name not in self.config.poseless_streams:
                     logger.warning(
                         "[%s] No pose for time %s (msg ts: %s), storing without pose",
                         name,
                         ts,
                         getattr(msg, "ts", None),
                     )
-                stream.append(msg, ts=ts, pose=pose)
+                stream.append(msg, ts=ts, pose=pose, tags={"reception_ts": recv_ts})
             finally:
                 with callback_state:
                     active_callbacks -= 1
@@ -517,7 +525,9 @@ class Recorder(MemoryModule):
             on_next, dispatcher_disposable = self._make_async_dispatch(on_msg)
             dispatcher.disposable = dispatcher_disposable
         try:
-            observable_subscription = input_topic.pure_observable().subscribe(on_next)
+            # Stamp arrival time before the coalescing dispatch queue.
+            stamped = input_topic.pure_observable().pipe(ops.map(lambda msg: (time.time(), msg)))
+            observable_subscription = stamped.subscribe(on_next)
         except BaseException:
             input_cleanup.dispose()
             raise
