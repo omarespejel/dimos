@@ -243,14 +243,41 @@ class MemoryModule(Module):
             if self._memory_stopped.is_set():
                 return
             self._memory_stopping = True
-            self._before_memory_stop()
-            super().stop()
+            first_error: BaseException | None = None
+            module_stopped = False
+            store_stopped = False
+
+            try:
+                self._before_memory_stop()
+            except BaseException as exc:
+                first_error = exc
+
+            try:
+                super().stop()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            else:
+                module_stopped = True
 
             store = self._store
-            if store is not None:
-                store.stop()
-                self._store = None
-            self._memory_stopped.set()
+            if store is None:
+                store_stopped = True
+            else:
+                try:
+                    store.stop()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                else:
+                    store_stopped = True
+                    self._store = None
+
+            if module_stopped and store_stopped:
+                self._memory_stopped.set()
+
+            if first_error is not None:
+                raise first_error
 
 
 class SemanticSearchConfig(MemoryModuleConfig):
@@ -489,13 +516,30 @@ class Recorder(MemoryModule):
             nonlocal accepting_callbacks
             with callback_state:
                 accepting_callbacks = False
+            first_error: BaseException | None = None
+
             try:
                 rx_subscription.dispose()
-            finally:
+            except BaseException as exc:
+                first_error = exc
+
+            while True:
                 try:
                     drain_callbacks()
-                finally:
-                    dispatcher.dispose()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                else:
+                    break
+
+            try:
+                dispatcher.dispose()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+
+            if first_error is not None:
+                raise first_error
 
         async def on_msg(stamped: tuple[float, Any]) -> None:
             nonlocal active_callbacks
@@ -658,12 +702,17 @@ class Recorder(MemoryModule):
                 active_callbacks=active_at_unsubscribe,
                 unsubscribe_installed=unsubscribe_now is not None,
             )
+            first_error: BaseException | None = None
+
             try:
                 if unsubscribe_now is not None:
                     unsubscribe_now()
-            finally:
-                wait_started = time.monotonic()
-                while True:
+            except BaseException as exc:
+                first_error = exc
+
+            wait_started = time.monotonic()
+            while True:
+                try:
                     with callback_state:
                         if callback_state.wait_for(
                             lambda: active_callbacks == 0,
@@ -676,6 +725,12 @@ class Recorder(MemoryModule):
                         active_callbacks=remaining_callbacks,
                         elapsed_seconds=time.monotonic() - wait_started,
                     )
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+
+            if first_error is not None:
+                raise first_error
 
         cleanup = Disposable(unsubscribe_and_drain)
         with self._memory_stop_lock:

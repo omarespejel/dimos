@@ -851,15 +851,35 @@ def test_recorder_unsubscribes_when_stop_races_subscribe(
     tf_stream.append.assert_not_called()
 
 
-def test_recorder_tf_gate_runs_before_other_disposables(
+def test_recorder_cleanup_errors_complete_shutdown_and_preserve_first_error(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    events: list[str] = []
+    input_error = RuntimeError("input unsubscribe failed")
+    dispatcher_error = RuntimeError("dispatcher cancellation failed")
+    tf_error = RuntimeError("tf unsubscribe failed")
     store = MagicMock(spec=SqliteStore)
     tf_stream = MagicMock(spec=Stream)
     store.stream.return_value = tf_stream
-    unsubscribe = MagicMock()
+    input_topic = MagicMock(spec=In)
+    observable = MagicMock()
+    stamped_observable = MagicMock()
+    input_topic.pure_observable.return_value = observable
+    observable.pipe.return_value = stamped_observable
+
+    def fail_input_unsubscribe() -> None:
+        events.append("input-unsubscribe")
+        raise input_error
+
+    stamped_observable.subscribe.return_value = Disposable(fail_input_unsubscribe)
+
+    def fail_tf_unsubscribe() -> None:
+        events.append("tf-unsubscribe")
+        raise tf_error
+
     pubsub = MagicMock()
-    pubsub.subscribe.return_value = unsubscribe
+    pubsub.subscribe.return_value = fail_tf_unsubscribe
     tf = MagicMock()
     tf.config.topic = "/tf"
     tf.pubsub = pubsub
@@ -867,36 +887,60 @@ def test_recorder_tf_gate_runs_before_other_disposables(
         db_path=tmp_path / "recording.db",
         rpc_transport=_TestRPC,
     )
-    input_cleanup_disposed = threading.Event()
+    module._store = store
+    module._tf = tf
 
-    def fail_cleanup() -> None:
-        raise RuntimeError("cleanup failed")
+    def make_dispatch(
+        _async_callback: Callable[[Any], Any],
+    ) -> tuple[Callable[[Any], None], Disposable]:
+        def ignore_message(_msg: Any) -> None:
+            pass
 
-    def dispose_input() -> None:
-        input_cleanup_disposed.set()
+        def dispose_dispatcher() -> None:
+            events.append("dispatcher")
+            raise dispatcher_error
 
-    try:
-        module._store = store
-        module._tf = tf
-        module._input_cleanups.append(Disposable(dispose_input))
-        module.register_disposable(Disposable(fail_cleanup))
-        module._record_tf()
-        callback = pubsub.subscribe.call_args.args[1]
+        return ignore_message, Disposable(dispose_dispatcher)
 
-        with pytest.raises(RuntimeError, match="cleanup failed"):
-            module.stop()
+    def dispose_generic() -> None:
+        events.append("generic")
 
-        unsubscribe.assert_called_once_with()
-        assert input_cleanup_disposed.is_set()
-        store.stop.assert_not_called()
+    def stop_store() -> None:
+        events.append("store")
 
+    monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
+    module._port_to_stream("color_image", input_topic, MagicMock(spec=Stream))
+    module._record_tf()
+    module.register_disposable(Disposable(dispose_generic))
+    store.stop.side_effect = stop_store
+
+    with pytest.raises(RuntimeError) as exc_info:
         module.stop()
-        callback(TFMessage(Transform(ts=1.0)), "/tf")
-    finally:
-        module.stop()
 
+    assert exc_info.value is input_error
+    assert events == [
+        "input-unsubscribe",
+        "dispatcher",
+        "tf-unsubscribe",
+        "generic",
+        "store",
+    ]
     store.stop.assert_called_once_with()
-    tf_stream.append.assert_not_called()
+    assert module._store is None
+    assert module._memory_stopped.is_set()
+    assert module._input_cleanups == []
+    assert module._tf_cleanup is None
+
+    module.stop()
+
+    assert events == [
+        "input-unsubscribe",
+        "dispatcher",
+        "tf-unsubscribe",
+        "generic",
+        "store",
+    ]
+    store.stop.assert_called_once_with()
 
 
 def test_recorder_rejects_tf_setup_after_stop(
