@@ -189,6 +189,7 @@ class MemoryModule(Module):
         self._memory_stop_lock = threading.RLock()
         self._memory_stopping = False
         self._memory_stopped = threading.Event()
+        self._memory_stop_active = False
         self._memory_teardown_failed = False
         super().__init__(**kwargs)
 
@@ -198,6 +199,7 @@ class MemoryModule(Module):
         state.pop("_memory_stop_lock", None)
         state.pop("_memory_stopping", None)
         state.pop("_memory_stopped", None)
+        state.pop("_memory_stop_active", None)
         state.pop("_memory_teardown_failed", None)
         state.pop("_store", None)
         return state
@@ -207,6 +209,7 @@ class MemoryModule(Module):
         self._memory_stop_lock = threading.RLock()
         self._memory_stopping = self._module_closed
         self._memory_stopped = threading.Event()
+        self._memory_stop_active = False
         self._memory_teardown_failed = False
         if self._module_closed:
             self._memory_stopped.set()
@@ -250,37 +253,43 @@ class MemoryModule(Module):
                     f"{type(self).__name__} teardown previously failed; "
                     "refusing to close the memory store"
                 )
-            self._memory_stopping = True
-            first_error: BaseException | None = None
-
+            if self._memory_stop_active:
+                return
+            self._memory_stop_active = True
             try:
-                self._before_memory_stop()
-            except BaseException as exc:
-                first_error = exc
+                self._memory_stopping = True
+                first_error: BaseException | None = None
 
-            try:
-                super().stop()
-            except BaseException:
-                self._memory_teardown_failed = True
-                if first_error is not None:
-                    raise first_error
-                raise
-
-            store = self._store
-            if store is not None:
                 try:
-                    store.stop()
+                    self._before_memory_stop()
+                except BaseException as exc:
+                    first_error = exc
+
+                try:
+                    super().stop()
                 except BaseException:
+                    self._memory_teardown_failed = True
                     if first_error is not None:
                         raise first_error
                     raise
-                else:
-                    self._store = None
 
-            self._memory_stopped.set()
+                store = self._store
+                if store is not None:
+                    try:
+                        store.stop()
+                    except BaseException:
+                        if first_error is not None:
+                            raise first_error
+                        raise
+                    else:
+                        self._store = None
 
-            if first_error is not None:
-                raise first_error
+                self._memory_stopped.set()
+
+                if first_error is not None:
+                    raise first_error
+            finally:
+                self._memory_stop_active = False
 
 
 class SemanticSearchConfig(MemoryModuleConfig):

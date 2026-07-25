@@ -1294,6 +1294,7 @@ def test_memory_module_does_not_close_store_after_generic_teardown_error(
         assert module._store is store
         assert not module._memory_stopped.is_set()
         assert module._memory_teardown_failed
+        assert not module._memory_stop_active
 
         with pytest.raises(RuntimeError, match="teardown previously failed"):
             module.stop()
@@ -1302,6 +1303,7 @@ def test_memory_module_does_not_close_store_after_generic_teardown_error(
         store.stop.assert_not_called()
         assert module._store is store
         assert not module._memory_stopped.is_set()
+        assert not module._memory_stop_active
     finally:
         module._store = None
         module._close_module()
@@ -1334,6 +1336,7 @@ def test_memory_module_preserves_cleanup_error_and_blocks_retry_after_teardown_e
 
         assert exc_info.value is cleanup_error
         assert module._memory_teardown_failed
+        assert not module._memory_stop_active
         store.stop.assert_not_called()
 
         with pytest.raises(RuntimeError, match="teardown previously failed"):
@@ -1342,9 +1345,93 @@ def test_memory_module_preserves_cleanup_error_and_blocks_retry_after_teardown_e
         store.stop.assert_not_called()
         assert module._store is store
         assert not module._memory_stopped.is_set()
+        assert not module._memory_stop_active
     finally:
         module._store = None
         module._close_module()
+
+
+def test_recorder_recursive_stop_from_input_cleanup_closes_store_last(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    store = MagicMock(spec=SqliteStore)
+    store.stop.side_effect = lambda: events.append("store")
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+
+    def recursive_cleanup() -> None:
+        events.append("cleanup-start")
+        module.stop()
+        events.append("cleanup-finish")
+
+    module._input_cleanups.append(Disposable(recursive_cleanup))
+
+    module.stop()
+
+    assert events == ["cleanup-start", "cleanup-finish", "store"]
+    store.stop.assert_called_once_with()
+    assert module._store is None
+    assert module._memory_stopped.is_set()
+    assert not module._memory_stop_active
+
+
+def test_memory_module_recursive_stop_from_generic_cleanup_closes_store_last(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    store = MagicMock(spec=SqliteStore)
+    store.stop.side_effect = lambda: events.append("store")
+    module = MemoryModule(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+
+    def recursive_cleanup() -> None:
+        events.append("cleanup-start")
+        module.stop()
+        events.append("cleanup-finish")
+
+    module.register_disposable(Disposable(recursive_cleanup))
+
+    module.stop()
+
+    assert events == ["cleanup-start", "cleanup-finish", "store"]
+    store.stop.assert_called_once_with()
+    assert module._store is None
+    assert module._memory_stopped.is_set()
+    assert not module._memory_stop_active
+
+
+def test_memory_module_recursive_stop_from_store_close_does_not_reenter(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    store = MagicMock(spec=SqliteStore)
+    module = MemoryModule(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+
+    def recursive_store_stop() -> None:
+        events.append("store-start")
+        module.stop()
+        events.append("store-finish")
+
+    store.stop.side_effect = recursive_store_stop
+
+    module.stop()
+
+    assert events == ["store-start", "store-finish"]
+    store.stop.assert_called_once_with()
+    assert module._store is None
+    assert module._memory_stopped.is_set()
+    assert not module._memory_stop_active
 
 
 def test_memory_module_restores_fresh_runtime_store_state(tmp_path: Path) -> None:
@@ -1363,11 +1450,13 @@ def test_memory_module_restores_fresh_runtime_store_state(tmp_path: Path) -> Non
     assert "_memory_stop_lock" not in state
     assert "_memory_stopping" not in state
     assert "_memory_stopped" not in state
+    assert "_memory_stop_active" not in state
     assert "_memory_teardown_failed" not in state
     assert "_store" not in state
     assert restored._store is None
     assert not restored._memory_stopping
     assert not restored._memory_stopped.is_set()
+    assert not restored._memory_stop_active
     assert not restored._memory_teardown_failed
 
 
@@ -1383,6 +1472,7 @@ def test_memory_module_preserves_stopped_state_when_restored(tmp_path: Path) -> 
     assert restored._module_closed
     assert restored._memory_stopping
     assert restored._memory_stopped.is_set()
+    assert not restored._memory_stop_active
     assert not restored._memory_teardown_failed
     with pytest.raises(RuntimeError, match="stopping or stopped"):
         assert restored.store is not None
