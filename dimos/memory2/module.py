@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 from pydantic import Field, field_validator
 from reactivex import operators as ops
 from reactivex.abc import DisposableBase
-from reactivex.disposable import Disposable
+from reactivex.disposable import Disposable, SingleAssignmentDisposable
 
 from dimos.agents.annotation import skill
 from dimos.constants import DIMOS_PROJECT_ROOT
@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
 logger = setup_logger()
 
+_INPUT_DRAIN_LOG_INTERVAL_SECONDS: float = 5.0
 _TF_DRAIN_LOG_INTERVAL_SECONDS: float = 5.0
 
 T = TypeVar("T")
@@ -380,20 +381,42 @@ class Recorder(MemoryModule):
     _pose_setters: dict[str, Any] = {}
     _tf_cleanup: DisposableBase | None = None
 
+    def __init__(self, **kwargs: Any) -> None:
+        self._input_cleanups: list[DisposableBase] = []
+        super().__init__(**kwargs)
+
     def __getstate__(self) -> dict[str, Any]:
         state = super().__getstate__()
+        state.pop("_input_cleanups", None)
         state.pop("_tf_cleanup", None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         super().__setstate__(state)
+        self._input_cleanups = []
         self._tf_cleanup = None
 
     def _before_memory_stop(self) -> None:
-        cleanup, self._tf_cleanup = self._tf_cleanup, None
-        if cleanup is not None:
-            cleanup.dispose()
-        super()._before_memory_stop()
+        cleanups, self._input_cleanups = self._input_cleanups, []
+        tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
+        if tf_cleanup is not None:
+            cleanups.append(tf_cleanup)
+        first_error: BaseException | None = None
+
+        for cleanup in cleanups:
+            try:
+                cleanup.dispose()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        try:
+            super()._before_memory_stop()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+
+        if first_error is not None:
+            raise first_error
 
     @rpc
     def start(self) -> None:
@@ -451,26 +474,106 @@ class Recorder(MemoryModule):
         so every observation gets a robot-pose anchor when tf is publishing.
 
         Each port is recorded by an async callback dispatched on the module's
-        event loop via :meth:`process_observable`, which serialises invocations
-        and registers the subscription for cleanup on stop().
+        event loop. Shutdown stops new callbacks, unsubscribes and cancels the
+        dispatcher, then waits for any admitted callback to finish.
         """
 
-        async def on_msg(stamped: tuple[float, Any]) -> None:
-            recv_ts, msg = stamped
-            ts = self._resolve_ts(name, msg)
-            pose = await self._resolve_pose(name, msg, ts)
-            if not pose and name not in self.config.poseless_streams:
-                logger.warning(
-                    "[%s] No pose for time %s (msg ts: %s), storing without pose",
-                    name,
-                    ts,
-                    getattr(msg, "ts", None),
-                )
-            stream.append(msg, ts=ts, pose=pose, tags={"reception_ts": recv_ts})
+        callback_state = threading.Condition()
+        accepting_callbacks = True
+        active_callbacks = 0
 
-        # Stamp arrival time before the coalescing dispatch queue.
-        stamped = input_topic.pure_observable().pipe(ops.map(lambda msg: (time.time(), msg)))
-        self.process_observable(stamped, on_msg)
+        rx_subscription = SingleAssignmentDisposable()
+        dispatcher = SingleAssignmentDisposable()
+
+        def stop_input() -> None:
+            nonlocal accepting_callbacks
+            with callback_state:
+                accepting_callbacks = False
+            try:
+                rx_subscription.dispose()
+            finally:
+                try:
+                    dispatcher.dispose()
+                finally:
+                    drain_callbacks()
+
+        async def on_msg(stamped: tuple[float, Any]) -> None:
+            nonlocal active_callbacks
+            with callback_state:
+                if not accepting_callbacks:
+                    return
+                active_callbacks += 1
+            try:
+                recv_ts, msg = stamped
+                ts = self._resolve_ts(name, msg)
+                pose = await self._resolve_pose(name, msg, ts)
+                if not pose and name not in self.config.poseless_streams:
+                    logger.warning(
+                        "[%s] No pose for time %s (msg ts: %s), storing without pose",
+                        name,
+                        ts,
+                        getattr(msg, "ts", None),
+                    )
+                stream.append(msg, ts=ts, pose=pose, tags={"reception_ts": recv_ts})
+            finally:
+                with callback_state:
+                    active_callbacks -= 1
+                    if active_callbacks == 0:
+                        callback_state.notify_all()
+
+        def drain_callbacks() -> None:
+            wait_started = time.monotonic()
+
+            def callbacks_drained() -> bool:
+                return active_callbacks == 0
+
+            while True:
+                with callback_state:
+                    if callback_state.wait_for(
+                        callbacks_drained,
+                        timeout=_INPUT_DRAIN_LOG_INTERVAL_SECONDS,
+                    ):
+                        break
+                    remaining_callbacks = active_callbacks
+                logger.warning(
+                    "Still waiting for recorder input callbacks",
+                    active_callbacks=remaining_callbacks,
+                    elapsed_seconds=time.monotonic() - wait_started,
+                )
+
+        # Install the safety cleanup before starting the dispatcher. Make the
+        # dispatcher available to stop() before subscribing; a subscription
+        # returned after stop is disposed immediately by its assignment slot.
+        input_cleanup = Disposable(stop_input)
+        with self._memory_stop_lock:
+            if self._memory_stopping:
+                input_cleanup.dispose()
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+            self._input_cleanups.append(input_cleanup)
+        try:
+            with callback_state:
+                if not accepting_callbacks:
+                    return
+                on_next, dispatcher_disposable = self._make_async_dispatch(on_msg)
+                dispatcher.disposable = dispatcher_disposable
+
+            # Stamp arrival time before the coalescing dispatch queue.
+            def stamp_reception(msg: Any) -> tuple[float, Any]:
+                return time.time(), msg
+
+            stamped = input_topic.pure_observable().pipe(ops.map(stamp_reception))
+            observable_subscription = stamped.subscribe(on_next)
+        except BaseException:
+            with self._memory_stop_lock:
+                try:
+                    input_cleanup.dispose()
+                except BaseException:
+                    logger.exception("Failed to clean up recorder input after setup error")
+                finally:
+                    if input_cleanup in self._input_cleanups:
+                        self._input_cleanups.remove(input_cleanup)
+            raise
+        rx_subscription.disposable = observable_subscription
 
     def _prepare_streams(self) -> None:
         """On APPEND, drop the streams this recorder is about to (re)write — the
