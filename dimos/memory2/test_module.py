@@ -1253,6 +1253,7 @@ def test_memory_module_retries_failed_store_shutdown(
     assert module._memory_stopping
     assert not module._memory_stopped.is_set()
     assert module._store is store
+    assert not module._memory_teardown_failed
     with pytest.raises(RuntimeError, match="stopping or stopped"):
         assert module.store is not None
 
@@ -1262,6 +1263,88 @@ def test_memory_module_retries_failed_store_shutdown(
     store.stop.assert_called_with()
     assert module._store is None
     assert module._memory_stopped.is_set()
+    assert not module._memory_teardown_failed
+
+
+def test_memory_module_does_not_close_store_after_generic_teardown_error(
+    tmp_path: Path,
+) -> None:
+    error = RuntimeError("generic teardown failed")
+    store = MagicMock(spec=SqliteStore)
+    late_cleanup = MagicMock()
+    module = MemoryModule(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+
+    def fail_cleanup() -> None:
+        raise error
+
+    module.register_disposable(Disposable(fail_cleanup))
+    module.register_disposable(Disposable(late_cleanup))
+
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            module.stop()
+
+        assert exc_info.value is error
+        late_cleanup.assert_not_called()
+        store.stop.assert_not_called()
+        assert module._store is store
+        assert not module._memory_stopped.is_set()
+        assert module._memory_teardown_failed
+
+        with pytest.raises(RuntimeError, match="teardown previously failed"):
+            module.stop()
+
+        late_cleanup.assert_not_called()
+        store.stop.assert_not_called()
+        assert module._store is store
+        assert not module._memory_stopped.is_set()
+    finally:
+        module._store = None
+        module._close_module()
+
+
+def test_memory_module_preserves_cleanup_error_and_blocks_retry_after_teardown_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cleanup_error = RuntimeError("recorder cleanup failed")
+    teardown_error = RuntimeError("generic teardown failed")
+    store = MagicMock(spec=SqliteStore)
+    module = MemoryModule(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    monkeypatch.setattr(
+        module,
+        "_before_memory_stop",
+        MagicMock(side_effect=cleanup_error),
+    )
+    module.register_disposable(
+        Disposable(MagicMock(side_effect=teardown_error)),
+    )
+
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            module.stop()
+
+        assert exc_info.value is cleanup_error
+        assert module._memory_teardown_failed
+        store.stop.assert_not_called()
+
+        with pytest.raises(RuntimeError, match="teardown previously failed"):
+            module.stop()
+
+        store.stop.assert_not_called()
+        assert module._store is store
+        assert not module._memory_stopped.is_set()
+    finally:
+        module._store = None
+        module._close_module()
 
 
 def test_memory_module_restores_fresh_runtime_store_state(tmp_path: Path) -> None:
@@ -1280,10 +1363,12 @@ def test_memory_module_restores_fresh_runtime_store_state(tmp_path: Path) -> Non
     assert "_memory_stop_lock" not in state
     assert "_memory_stopping" not in state
     assert "_memory_stopped" not in state
+    assert "_memory_teardown_failed" not in state
     assert "_store" not in state
     assert restored._store is None
     assert not restored._memory_stopping
     assert not restored._memory_stopped.is_set()
+    assert not restored._memory_teardown_failed
 
 
 def test_memory_module_preserves_stopped_state_when_restored(tmp_path: Path) -> None:
@@ -1298,5 +1383,6 @@ def test_memory_module_preserves_stopped_state_when_restored(tmp_path: Path) -> 
     assert restored._module_closed
     assert restored._memory_stopping
     assert restored._memory_stopped.is_set()
+    assert not restored._memory_teardown_failed
     with pytest.raises(RuntimeError, match="stopping or stopped"):
         assert restored.store is not None

@@ -189,6 +189,7 @@ class MemoryModule(Module):
         self._memory_stop_lock = threading.RLock()
         self._memory_stopping = False
         self._memory_stopped = threading.Event()
+        self._memory_teardown_failed = False
         super().__init__(**kwargs)
 
     def __getstate__(self) -> dict[str, Any]:
@@ -197,6 +198,7 @@ class MemoryModule(Module):
         state.pop("_memory_stop_lock", None)
         state.pop("_memory_stopping", None)
         state.pop("_memory_stopped", None)
+        state.pop("_memory_teardown_failed", None)
         state.pop("_store", None)
         return state
 
@@ -205,6 +207,7 @@ class MemoryModule(Module):
         self._memory_stop_lock = threading.RLock()
         self._memory_stopping = self._module_closed
         self._memory_stopped = threading.Event()
+        self._memory_teardown_failed = False
         if self._module_closed:
             self._memory_stopped.set()
         self._store = None
@@ -242,10 +245,13 @@ class MemoryModule(Module):
         with self._memory_stop_lock:
             if self._memory_stopped.is_set():
                 return
+            if self._memory_teardown_failed:
+                raise RuntimeError(
+                    f"{type(self).__name__} teardown previously failed; "
+                    "refusing to close the memory store"
+                )
             self._memory_stopping = True
             first_error: BaseException | None = None
-            module_stopped = False
-            store_stopped = False
 
             try:
                 self._before_memory_stop()
@@ -254,27 +260,24 @@ class MemoryModule(Module):
 
             try:
                 super().stop()
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
-            else:
-                module_stopped = True
+            except BaseException:
+                self._memory_teardown_failed = True
+                if first_error is not None:
+                    raise first_error
+                raise
 
             store = self._store
-            if store is None:
-                store_stopped = True
-            else:
+            if store is not None:
                 try:
                     store.stop()
-                except BaseException as exc:
-                    if first_error is None:
-                        first_error = exc
+                except BaseException:
+                    if first_error is not None:
+                        raise first_error
+                    raise
                 else:
-                    store_stopped = True
                     self._store = None
 
-            if module_stopped and store_stopped:
-                self._memory_stopped.set()
+            self._memory_stopped.set()
 
             if first_error is not None:
                 raise first_error
