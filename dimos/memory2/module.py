@@ -449,24 +449,24 @@ class Recorder(MemoryModule):
         so every observation gets a robot-pose anchor when tf is publishing.
 
         Each port is recorded by an async callback dispatched on the module's
-        event loop via :meth:`process_observable`, which serialises invocations
-        and registers the subscription for cleanup on stop().
+        event loop. Shutdown stops new callbacks, unsubscribes and cancels the
+        dispatcher, then waits for any admitted callback to finish.
         """
 
         callback_state = threading.Condition()
         accepting_callbacks = True
         active_callbacks = 0
 
-        def stop_admitting_callbacks() -> None:
+        rx_subscription = SingleAssignmentDisposable()
+        dispatcher = SingleAssignmentDisposable()
+
+        def stop_input() -> None:
             nonlocal accepting_callbacks
             with callback_state:
                 accepting_callbacks = False
-
-        # Pre-register the subscription slot so stop() can cancel an async
-        # handler before waiting for admitted callbacks to drain. Assignment
-        # after a concurrent stop disposes the subscription immediately.
-        self.register_disposable(Disposable(stop_admitting_callbacks))
-        subscription = self.register_disposable(SingleAssignmentDisposable())
+            rx_subscription.dispose()
+            dispatcher.dispose()
+            drain_callbacks()
 
         async def on_msg(msg: Any) -> None:
             nonlocal active_callbacks
@@ -507,8 +507,21 @@ class Recorder(MemoryModule):
                     elapsed_seconds=time.monotonic() - wait_started,
                 )
 
-        self.register_disposable(Disposable(drain_callbacks))
-        subscription.disposable = self.process_observable(input_topic.pure_observable(), on_msg)
+        # Own setup and teardown through one ordered disposable. Make the
+        # dispatcher available to stop() before subscribing; a subscription
+        # returned after stop is disposed immediately by its assignment slot.
+        input_cleanup = self.register_disposable(Disposable(stop_input))
+        with callback_state:
+            if not accepting_callbacks:
+                return
+            on_next, dispatcher_disposable = self._make_async_dispatch(on_msg)
+            dispatcher.disposable = dispatcher_disposable
+        try:
+            observable_subscription = input_topic.pure_observable().subscribe(on_next)
+        except BaseException:
+            input_cleanup.dispose()
+            raise
+        rx_subscription.disposable = observable_subscription
 
     def _prepare_streams(self) -> None:
         """On APPEND, drop the streams this recorder is about to (re)write — the
