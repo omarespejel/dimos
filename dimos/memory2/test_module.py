@@ -24,7 +24,7 @@ import pickle
 import threading
 from types import SimpleNamespace
 from typing import Any, ClassVar
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 from reactivex import create
@@ -253,8 +253,12 @@ def test_recorder_stop_waits_for_active_input_append(
     )
     store.stop.assert_called_once_with()
     assert store_stopped.is_set()
-    assert test_logger.warning.call_args.args == ("Still waiting for recorder input callbacks",)
-    assert test_logger.warning.call_args.kwargs["active_callbacks"] == 1
+    test_logger.warning.assert_any_call(
+        "Still waiting for recorder input callbacks",
+        input_name="color_image",
+        active_callbacks=1,
+        elapsed_seconds=ANY,
+    )
 
 
 def test_recorder_stop_waits_for_active_pose_lookup(
@@ -286,13 +290,16 @@ def test_recorder_stop_waits_for_active_pose_lookup(
 
     test_logger.warning.side_effect = observe_warning
 
-    def get_pose(*_args: Any, **_kwargs: Any) -> None:
+    async def set_pose(_msg: Any) -> None:
         pose_started.set()
-        assert pose_release.wait(timeout=SYNC_TIMEOUT)
+        while not pose_release.is_set():
+            await asyncio.sleep(0.001)
         pose_finished.set()
+        return None
 
-    def stop_tf() -> None:
+    def stop_store() -> None:
         assert pose_finished.is_set()
+        stream.append.assert_called_once()
 
     def current_time() -> float:
         return reception_ts
@@ -300,10 +307,8 @@ def test_recorder_stop_waits_for_active_pose_lookup(
     monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(memory_module, "logger", test_logger)
     monkeypatch.setattr("dimos.memory2.module.time.time", current_time)
-    tf = MagicMock()
-    tf.get.side_effect = get_pose
-    tf.stop.side_effect = stop_tf
-    module._tf = tf
+    module._pose_setters = {"color_image": set_pose}
+    store.stop.side_effect = stop_store
     module._port_to_stream("color_image", input_topic, stream)
     message = SimpleNamespace(ts=1.0, frame_id="camera")
 
@@ -326,7 +331,6 @@ def test_recorder_stop_waits_for_active_pose_lookup(
         pose=None,
         tags={"reception_ts": reception_ts},
     )
-    tf.stop.assert_called_once_with()
     store.stop.assert_called_once_with()
 
 
@@ -425,6 +429,7 @@ def test_recorder_rejects_input_setup_after_stop(
 
 
 def test_recorder_disposes_late_input_subscription_after_stop(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     store = MagicMock(spec=SqliteStore)
@@ -440,8 +445,11 @@ def test_recorder_disposes_late_input_subscription_after_stop(
     setup_release = threading.Event()
     subscription_disposed = threading.Event()
     setter_started = threading.Event()
-    setter_cancelled = threading.Event()
+    setter_release = threading.Event()
+    setter_finished = threading.Event()
+    drain_started = threading.Event()
     store_stopped = threading.Event()
+    test_logger = MagicMock()
 
     def subscribe(observer: Any, _scheduler: Any) -> Disposable:
         observer.on_next(SimpleNamespace(ts=1.0))
@@ -451,15 +459,21 @@ def test_recorder_disposes_late_input_subscription_after_stop(
 
     async def resolve_pose(_msg: Any) -> None:
         setter_started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            setter_cancelled.set()
-            raise
+        while not setter_release.is_set():
+            await asyncio.sleep(0.001)
+        setter_finished.set()
+        return None
+
+    def observe_warning(message: str, *_args: Any, **_kwargs: Any) -> None:
+        if message == "Still waiting for recorder input callbacks":
+            drain_started.set()
 
     input_topic.pure_observable.return_value = create(subscribe)
     module._pose_setters = {"color_image": resolve_pose}
     store.stop.side_effect = store_stopped.set
+    test_logger.warning.side_effect = observe_warning
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(memory_module, "logger", test_logger)
 
     def setup_recording() -> None:
         module._port_to_stream("color_image", input_topic, stream)
@@ -471,23 +485,30 @@ def test_recorder_disposes_late_input_subscription_after_stop(
             assert setter_started.wait(timeout=SYNC_TIMEOUT)
             stop_future = pool.submit(module.stop)
             try:
-                assert store_stopped.wait(timeout=SYNC_TIMEOUT)
-                stop_future.result(timeout=SYNC_TIMEOUT)
+                assert drain_started.wait(timeout=SYNC_TIMEOUT)
+                assert not store_stopped.is_set()
+                assert not stop_future.done()
                 assert not setup_future.done()
-                assert setter_cancelled.is_set()
                 assert not subscription_disposed.is_set()
             finally:
-                setup_release.set()
+                setter_release.set()
 
+            stop_future.result(timeout=SYNC_TIMEOUT)
+            assert setter_finished.is_set()
+            assert store_stopped.is_set()
+            assert not setup_future.done()
+            assert not subscription_disposed.is_set()
+            setup_release.set()
             setup_future.result(timeout=SYNC_TIMEOUT)
     finally:
+        setter_release.set()
         setup_release.set()
         module.stop()
 
     store.stop.assert_called_once_with()
     assert store_stopped.is_set()
     assert subscription_disposed.is_set()
-    stream.append.assert_not_called()
+    stream.append.assert_called_once()
 
 
 def test_recorder_removes_input_cleanup_after_subscription_setup_fails(

@@ -474,8 +474,8 @@ class Recorder(MemoryModule):
         so every observation gets a robot-pose anchor when tf is publishing.
 
         Each port is recorded by an async callback dispatched on the module's
-        event loop. Shutdown stops new callbacks, unsubscribes and cancels the
-        dispatcher, then waits for any admitted callback to finish.
+        event loop. Shutdown stops new callbacks, unsubscribes, waits for any
+        admitted callback to finish, then cancels the dispatcher.
         """
 
         callback_state = threading.Condition()
@@ -493,9 +493,9 @@ class Recorder(MemoryModule):
                 rx_subscription.dispose()
             finally:
                 try:
-                    dispatcher.dispose()
-                finally:
                     drain_callbacks()
+                finally:
+                    dispatcher.dispose()
 
         async def on_msg(stamped: tuple[float, Any]) -> None:
             nonlocal active_callbacks
@@ -537,6 +537,7 @@ class Recorder(MemoryModule):
                     remaining_callbacks = active_callbacks
                 logger.warning(
                     "Still waiting for recorder input callbacks",
+                    input_name=name,
                     active_callbacks=remaining_callbacks,
                     elapsed_seconds=time.monotonic() - wait_started,
                 )
