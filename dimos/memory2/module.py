@@ -535,14 +535,11 @@ class Recorder(MemoryModule):
             except BaseException as exc:
                 first_error = exc
 
-            while True:
-                try:
-                    drain_callbacks()
-                except BaseException as exc:
-                    if first_error is None:
-                        first_error = exc
-                else:
-                    break
+            try:
+                drain_callbacks()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
 
             try:
                 dispatcher.dispose()
@@ -579,24 +576,40 @@ class Recorder(MemoryModule):
 
         def drain_callbacks() -> None:
             wait_started = time.monotonic()
+            first_error: BaseException | None = None
+            log_waits = True
 
             def callbacks_drained() -> bool:
                 return active_callbacks == 0
 
             while True:
-                with callback_state:
-                    if callback_state.wait_for(
-                        callbacks_drained,
-                        timeout=_INPUT_DRAIN_LOG_INTERVAL_SECONDS,
-                    ):
-                        break
-                    remaining_callbacks = active_callbacks
-                logger.warning(
-                    "Still waiting for recorder input callbacks",
-                    input_name=name,
-                    active_callbacks=remaining_callbacks,
-                    elapsed_seconds=time.monotonic() - wait_started,
-                )
+                try:
+                    with callback_state:
+                        if callback_state.wait_for(
+                            callbacks_drained,
+                            timeout=_INPUT_DRAIN_LOG_INTERVAL_SECONDS,
+                        ):
+                            break
+                        remaining_callbacks = active_callbacks
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    break
+                if log_waits:
+                    try:
+                        logger.warning(
+                            "Still waiting for recorder input callbacks",
+                            input_name=name,
+                            active_callbacks=remaining_callbacks,
+                            elapsed_seconds=time.monotonic() - wait_started,
+                        )
+                    except BaseException as exc:
+                        if first_error is None:
+                            first_error = exc
+                        log_waits = False
+
+            if first_error is not None:
+                raise first_error
 
         # Install the safety cleanup before starting the dispatcher. Make the
         # dispatcher available to stop() before subscribing; a subscription
@@ -723,6 +736,7 @@ class Recorder(MemoryModule):
                 first_error = exc
 
             wait_started = time.monotonic()
+            log_waits = True
             while True:
                 try:
                     with callback_state:
@@ -732,14 +746,21 @@ class Recorder(MemoryModule):
                         ):
                             break
                         remaining_callbacks = active_callbacks
-                    logger.warning(
-                        "Still waiting for tf callbacks",
-                        active_callbacks=remaining_callbacks,
-                        elapsed_seconds=time.monotonic() - wait_started,
-                    )
                 except BaseException as exc:
                     if first_error is None:
                         first_error = exc
+                    break
+                if log_waits:
+                    try:
+                        logger.warning(
+                            "Still waiting for tf callbacks",
+                            active_callbacks=remaining_callbacks,
+                            elapsed_seconds=time.monotonic() - wait_started,
+                        )
+                    except BaseException as exc:
+                        if first_error is None:
+                            first_error = exc
+                        log_waits = False
 
             if first_error is not None:
                 raise first_error
