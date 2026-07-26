@@ -435,12 +435,15 @@ class Recorder(MemoryModule):
     _tf_cleanup: DisposableBase | None = None
 
     def __init__(self, **kwargs: Any) -> None:
+        # Let setup rollback drain outside the memory lock without racing stop().
+        self._input_cleanup_lock = threading.RLock()
         self._input_cleanups: list[DisposableBase] = []
         self._callback_drain_deadline: float | None = None
         super().__init__(**kwargs)
 
     def __getstate__(self) -> dict[str, Any]:
         state = super().__getstate__()
+        state.pop("_input_cleanup_lock", None)
         state.pop("_input_cleanups", None)
         state.pop("_tf_cleanup", None)
         state.pop("_callback_drain_deadline", None)
@@ -448,9 +451,15 @@ class Recorder(MemoryModule):
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         super().__setstate__(state)
+        self._input_cleanup_lock = threading.RLock()
         self._input_cleanups = []
         self._tf_cleanup = None
         self._callback_drain_deadline = None
+
+    @rpc
+    def stop(self) -> None:
+        with self._input_cleanup_lock:
+            super().stop()
 
     def _before_memory_stop(self) -> None:
         input_cleanups, self._input_cleanups = self._input_cleanups, []
@@ -718,39 +727,42 @@ class Recorder(MemoryModule):
         except BaseException as setup_error:
             drain_error: _DrainIncompleteError | None = None
             remaining_cleanups: list[DisposableBase] = []
-            with self._memory_stop_lock:
-                try:
-                    input_cleanup.dispose()
-                except _DrainIncompleteError as exc:
-                    self._memory_stopping = True
-                    self._memory_teardown_failed = True
-                    drain_error = exc
-                except BaseException:
-                    logger.exception("Failed to clean up recorder input after setup error")
-                finally:
-                    if input_cleanup in self._input_cleanups:
+            with self._input_cleanup_lock:
+                with self._memory_stop_lock:
+                    cleanup_owned = input_cleanup in self._input_cleanups
+                    if cleanup_owned:
                         self._input_cleanups.remove(input_cleanup)
+                if cleanup_owned:
+                    try:
+                        input_cleanup.dispose()
+                    except _DrainIncompleteError as exc:
+                        drain_error = exc
+                    except BaseException:
+                        logger.exception("Failed to clean up recorder input after setup error")
+
                 if drain_error is not None:
-                    remaining_cleanups, self._input_cleanups = self._input_cleanups, []
-                    tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
-                    if tf_cleanup is not None:
-                        remaining_cleanups.append(tf_cleanup)
-                    self._callback_drain_deadline = time.monotonic()
-            if drain_error is not None:
-                try:
-                    for cleanup in remaining_cleanups:
-                        try:
-                            cleanup.dispose()
-                        except BaseException:
+                    with self._memory_stop_lock:
+                        self._memory_stopping = True
+                        self._memory_teardown_failed = True
+                        remaining_cleanups, self._input_cleanups = self._input_cleanups, []
+                        tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
+                        if tf_cleanup is not None:
+                            remaining_cleanups.append(tf_cleanup)
+                        self._callback_drain_deadline = time.monotonic()
+                    try:
+                        for cleanup in remaining_cleanups:
                             try:
-                                logger.exception(
-                                    "Failed to stop recorder input after setup drain failure"
-                                )
+                                cleanup.dispose()
                             except BaseException:
-                                pass
-                finally:
-                    self._callback_drain_deadline = None
-                raise drain_error from setup_error
+                                try:
+                                    logger.exception(
+                                        "Failed to stop recorder input after setup drain failure"
+                                    )
+                                except BaseException:
+                                    pass
+                    finally:
+                        self._callback_drain_deadline = None
+                    raise drain_error from setup_error
             raise
         rx_subscription.disposable = observable_subscription
 
