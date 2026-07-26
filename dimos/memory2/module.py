@@ -594,7 +594,11 @@ class Recorder(MemoryModule):
                 except BaseException as exc:
                     if first_error is None:
                         first_error = exc
-                    break
+                    with callback_state:
+                        if callbacks_drained():
+                            break
+                        remaining_callbacks = active_callbacks
+                        callback_state.wait(timeout=_INPUT_DRAIN_LOG_INTERVAL_SECONDS)
                 if log_waits:
                     try:
                         logger.warning(
@@ -749,7 +753,11 @@ class Recorder(MemoryModule):
                 except BaseException as exc:
                     if first_error is None:
                         first_error = exc
-                    break
+                    with callback_state:
+                        if active_callbacks == 0:
+                            break
+                        remaining_callbacks = active_callbacks
+                        callback_state.wait(timeout=_TF_DRAIN_LOG_INTERVAL_SECONDS)
                 if log_waits:
                     try:
                         logger.warning(

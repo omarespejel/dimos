@@ -346,6 +346,77 @@ def test_recorder_input_drain_reports_warning_error_once(
     }
 
 
+def test_recorder_input_drain_wait_error_still_waits_for_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    stream = MagicMock(spec=Stream)
+    input_topic = MagicMock(spec=In)
+    subject: Subject[Any] = Subject()
+    input_topic.pure_observable.return_value = subject
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    append_started = threading.Event()
+    append_release = threading.Event()
+    append_finished = threading.Event()
+    store_stopped = threading.Event()
+    wait_error = RuntimeError("wait failed")
+    original_wait_for = threading.Condition.wait_for
+    wait_failures_remaining = 1
+
+    def wait_for_once_then_normal(
+        condition: threading.Condition,
+        predicate: Callable[[], bool],
+        timeout: float | None = None,
+    ) -> bool:
+        nonlocal wait_failures_remaining
+        if wait_failures_remaining:
+            wait_failures_remaining -= 1
+            raise wait_error
+        return original_wait_for(condition, predicate, timeout)
+
+    async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
+        return None
+
+    def append(*_args: Any, **_kwargs: Any) -> None:
+        append_started.set()
+        assert append_release.wait(timeout=SYNC_TIMEOUT)
+        append_finished.set()
+
+    def stop_store() -> None:
+        assert append_finished.is_set()
+        store_stopped.set()
+
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr(threading.Condition, "wait_for", wait_for_once_then_normal)
+    stream.append.side_effect = append
+    store.stop.side_effect = stop_store
+    module._port_to_stream("color_image", input_topic, stream)
+
+    subject.on_next(SimpleNamespace(ts=1.0))
+    assert append_started.wait(timeout=SYNC_TIMEOUT)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        stop_future = pool.submit(module.stop)
+        try:
+            assert not store_stopped.wait(timeout=0.05)
+            assert not stop_future.done()
+        finally:
+            append_release.set()
+
+        with pytest.raises(RuntimeError) as exc_info:
+            stop_future.result(timeout=SYNC_TIMEOUT)
+
+    assert exc_info.value is wait_error
+    assert append_finished.is_set()
+    store.stop.assert_called_once_with()
+    assert store_stopped.is_set()
+
+
 def test_recorder_stop_waits_for_active_pose_lookup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -874,6 +945,64 @@ def test_recorder_tf_drain_reports_warning_error_once(
         active_callbacks=1,
         elapsed_seconds=ANY,
     )
+
+
+def test_recorder_tf_drain_wait_error_still_waits_for_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tf_recorder: TFRecorderFixture,
+) -> None:
+    module, store, tf_stream, callback, _unsubscribe = tf_recorder
+    append_started = threading.Event()
+    append_release = threading.Event()
+    append_finished = threading.Event()
+    store_stopped = threading.Event()
+    wait_error = RuntimeError("tf wait failed")
+    original_wait_for = threading.Condition.wait_for
+    wait_failures_remaining = 1
+
+    def wait_for_once_then_normal(
+        condition: threading.Condition,
+        predicate: Callable[[], bool],
+        timeout: float | None = None,
+    ) -> bool:
+        nonlocal wait_failures_remaining
+        if wait_failures_remaining:
+            wait_failures_remaining -= 1
+            raise wait_error
+        return original_wait_for(condition, predicate, timeout)
+
+    def append(*_args: Any, **_kwargs: Any) -> None:
+        append_started.set()
+        assert append_release.wait(timeout=SYNC_TIMEOUT)
+        append_finished.set()
+
+    def stop_store() -> None:
+        assert append_finished.is_set()
+        store_stopped.set()
+
+    monkeypatch.setattr(threading.Condition, "wait_for", wait_for_once_then_normal)
+    tf_stream.append.side_effect = append
+    store.stop.side_effect = stop_store
+    message = TFMessage(Transform(ts=1.0))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        callback_future = pool.submit(callback, message, "/tf")
+        assert append_started.wait(timeout=SYNC_TIMEOUT)
+        stop_future = pool.submit(module.stop)
+        try:
+            assert not store_stopped.wait(timeout=0.05)
+            assert not stop_future.done()
+        finally:
+            append_release.set()
+
+        callback_future.result(timeout=SYNC_TIMEOUT)
+        with pytest.raises(RuntimeError) as exc_info:
+            stop_future.result(timeout=SYNC_TIMEOUT)
+
+    assert exc_info.value is wait_error
+    assert append_finished.is_set()
+    store.stop.assert_called_once_with()
+    assert store_stopped.is_set()
 
 
 def test_recorder_rejects_tf_callback_when_stop_races_setup(
