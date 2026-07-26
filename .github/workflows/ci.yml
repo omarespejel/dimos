@@ -341,6 +341,7 @@ jobs:
       - name: Turn coverage into xml
         run: uv run python -m coverage xml
       - name: Upload coverage
+        if: ${{ github.repository == 'dimensionalOS/dimos' }}
         uses: codecov/codecov-action@v7
         with:
           disable_search: true
@@ -355,7 +356,7 @@ jobs:
           use_pypi: true
           version: "11.2.8"
       - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.repository == 'dimensionalOS/dimos' }}
         uses: codecov/codecov-action@v7
         with:
           report_type: test_results
@@ -408,6 +409,7 @@ jobs:
     # merge_group runs the PR's *merged* workflow with secrets, so .github/
     # changes must be reviewed before a fork PR is queued.
     if: |
+      github.repository == 'dimensionalOS/dimos' &&
       !cancelled() &&
       (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) &&
       needs.cmu-nav-natives-marker.outputs.cache-hit != 'true'
@@ -475,6 +477,7 @@ jobs:
     # PR), and same-repo PRs. Skipped on fork PRs, which would expose the
     # self-hosted runner to untrusted code from external contributors.
     if: |
+      github.repository == 'dimensionalOS/dimos' &&
       !cancelled() &&
       (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) &&
       contains(fromJSON('["success", "skipped"]'), needs.cmu-nav-natives.result)
@@ -669,7 +672,8 @@ jobs:
   self-hosted-large-tests:
     # Skip on PRs from forks which would expose the self-hosted runner to untrusted code from external contributors.
     if: |
-      github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+      github.repository == 'dimensionalOS/dimos' &&
+      (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -830,6 +834,7 @@ jobs:
         allowed-skips: cmu-nav-natives, self-hosted-tests, self-hosted-large-tests
         jobs: ${{ toJSON(needs) }}
     - name: Trigger Codecov notifications
+      if: ${{ github.repository == 'dimensionalOS/dimos' }}
       uses: codecov/codecov-action@v7
       with:
         run_command: send-notifications
