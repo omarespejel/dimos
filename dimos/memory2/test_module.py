@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import pickle
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import ANY, MagicMock
@@ -502,6 +503,7 @@ def test_recorder_drain_error_takes_precedence_over_cleanup_error(
         module.stop()
 
     assert exc_info.value is drain_error
+    assert exc_info.value.__cause__ is cleanup_error
     store.stop.assert_not_called()
     assert module._store is store
     assert module._memory_teardown_failed
@@ -567,13 +569,181 @@ def test_recorder_input_drain_error_takes_precedence_over_subscription_error(
     assert not stop_thread.is_alive()
     assert isinstance(stop_result[0], RuntimeError)
     assert "Timed out waiting for recorder input callbacks" in str(stop_result[0])
-    assert stop_result[0].__cause__ is None
+    assert stop_result[0].__cause__ is subscription_error
     assert pose_finished.wait(timeout=SYNC_TIMEOUT)
     store.stop.assert_not_called()
     assert module._store is store
     assert module._memory_teardown_failed
     assert not module._memory_stopped.is_set()
     Module.stop(module)
+
+
+def test_recorder_stop_uses_one_drain_deadline_for_all_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    input_count = 4
+    store = MagicMock(spec=SqliteStore)
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    callback_started = threading.Event()
+    callback_count_lock = threading.Lock()
+    started_callbacks = 0
+    callbacks_release = threading.Event()
+    dispatched: list[Callable[[Any], None]] = []
+    callback_threads: list[threading.Thread] = []
+    subscription_disposed = [threading.Event() for _ in range(input_count)]
+    dispatcher_disposed = [threading.Event() for _ in range(input_count)]
+    drain_wait_timeouts: list[float | None] = []
+    stop_thread_id = threading.get_ident()
+    original_wait_for = threading.Condition.wait_for
+
+    async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
+        nonlocal started_callbacks
+        with callback_count_lock:
+            started_callbacks += 1
+            if started_callbacks == input_count:
+                callback_started.set()
+        assert callbacks_release.wait(timeout=SYNC_TIMEOUT)
+        return None
+
+    def make_dispatch(
+        async_callback: Callable[[Any], Any],
+    ) -> tuple[Callable[[Any], None], Disposable]:
+        disposed = dispatcher_disposed[len(dispatched)]
+
+        def dispatch(stamped: Any) -> None:
+            thread = threading.Thread(target=lambda: asyncio.run(async_callback(stamped)))
+            callback_threads.append(thread)
+            thread.start()
+
+        dispatched.append(dispatch)
+        return dispatch, Disposable(disposed.set)
+
+    def observe_drain_wait(
+        condition: threading.Condition,
+        predicate: Callable[[], bool],
+        timeout: float | None = None,
+    ) -> bool:
+        if threading.get_ident() != stop_thread_id:
+            return original_wait_for(condition, predicate, timeout)
+        drain_wait_timeouts.append(timeout)
+        if len(drain_wait_timeouts) == 1 and timeout is not None:
+            time.sleep(timeout)
+        return predicate()
+
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
+
+    for index in range(input_count):
+        input_topic = MagicMock(spec=In)
+        observable = MagicMock()
+        stamped_observable = MagicMock()
+        input_topic.pure_observable.return_value = observable
+        observable.pipe.return_value = stamped_observable
+        stamped_observable.subscribe.return_value = Disposable(subscription_disposed[index].set)
+        module._port_to_stream(f"input_{index}", input_topic, MagicMock(spec=Stream))
+
+    try:
+        for dispatch in dispatched:
+            dispatch((10.0, SimpleNamespace(ts=1.0)))
+        assert callback_started.wait(timeout=SYNC_TIMEOUT)
+
+        with monkeypatch.context() as drain_patch:
+            drain_patch.setattr(threading.Condition, "wait_for", observe_drain_wait)
+            with pytest.raises(memory_module._DrainIncompleteError):
+                module.stop()
+
+        assert drain_wait_timeouts[0] == pytest.approx(0.05, abs=0.01)
+        assert drain_wait_timeouts[1:] == [0.0] * (input_count - 1)
+        assert all(event.is_set() for event in subscription_disposed)
+        assert all(event.is_set() for event in dispatcher_disposed)
+        store.stop.assert_not_called()
+        assert module._store is store
+        assert module._memory_teardown_failed
+    finally:
+        callbacks_release.set()
+        for thread in callback_threads:
+            thread.join(timeout=SYNC_TIMEOUT)
+        Module.stop(module)
+
+
+def test_recorder_setup_drain_timeout_blocks_later_store_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_error = RuntimeError("subscribe failed")
+    store = MagicMock(spec=SqliteStore)
+    stream = MagicMock(spec=Stream)
+    input_topic = MagicMock(spec=In)
+    observable = MagicMock()
+    stamped_observable = MagicMock()
+    input_topic.pure_observable.return_value = observable
+    observable.pipe.return_value = stamped_observable
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    callback_started = threading.Event()
+    callback_release = threading.Event()
+    callback_threads: list[threading.Thread] = []
+    dispatcher_disposed = threading.Event()
+
+    async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
+        callback_started.set()
+        assert callback_release.wait(timeout=SYNC_TIMEOUT)
+        return None
+
+    def make_dispatch(
+        async_callback: Callable[[Any], Any],
+    ) -> tuple[Callable[[Any], None], Disposable]:
+        def dispatch(stamped: Any) -> None:
+            thread = threading.Thread(target=lambda: asyncio.run(async_callback(stamped)))
+            callback_threads.append(thread)
+            thread.start()
+
+        return dispatch, Disposable(dispatcher_disposed.set)
+
+    def fail_subscribe(on_next: Callable[[Any], None]) -> None:
+        on_next((10.0, SimpleNamespace(ts=1.0)))
+        assert callback_started.wait(timeout=SYNC_TIMEOUT)
+        raise setup_error
+
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
+    stamped_observable.subscribe.side_effect = fail_subscribe
+
+    try:
+        with pytest.raises(memory_module._DrainIncompleteError) as exc_info:
+            module._port_to_stream("color_image", input_topic, stream)
+
+        assert exc_info.value.__cause__ is setup_error
+        assert dispatcher_disposed.is_set()
+        assert module._input_cleanups == []
+        assert module._memory_stopping
+        assert module._memory_teardown_failed
+        assert module._store is store
+        store.stop.assert_not_called()
+
+        with pytest.raises(RuntimeError, match="teardown previously failed"):
+            module.stop()
+
+        assert module._store is store
+        store.stop.assert_not_called()
+    finally:
+        callback_release.set()
+        for thread in callback_threads:
+            thread.join(timeout=SYNC_TIMEOUT)
+        Module.stop(module)
 
 
 def test_recorder_stop_waits_for_active_pose_lookup(
@@ -1406,19 +1576,23 @@ def test_recorder_restores_fresh_cleanup_state(tmp_path: Path) -> None:
     )
     module._input_cleanups.append(Disposable())
     module._tf_cleanup = Disposable()
+    module._callback_drain_deadline = 123.0
 
     state = module.__getstate__()
     restored = pickle.loads(pickle.dumps(module))
 
     module._input_cleanups = []
     module._tf_cleanup = None
+    module._callback_drain_deadline = None
     module.stop()
     restored.stop()
 
     assert "_input_cleanups" not in state
     assert "_tf_cleanup" not in state
+    assert "_callback_drain_deadline" not in state
     assert restored._input_cleanups == []
     assert restored._tf_cleanup is None
+    assert restored._callback_drain_deadline is None
 
 
 @pytest.mark.parametrize("module_cls", module_cases)

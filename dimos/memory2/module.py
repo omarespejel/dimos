@@ -436,24 +436,35 @@ class Recorder(MemoryModule):
 
     def __init__(self, **kwargs: Any) -> None:
         self._input_cleanups: list[DisposableBase] = []
+        self._callback_drain_deadline: float | None = None
         super().__init__(**kwargs)
 
     def __getstate__(self) -> dict[str, Any]:
         state = super().__getstate__()
         state.pop("_input_cleanups", None)
         state.pop("_tf_cleanup", None)
+        state.pop("_callback_drain_deadline", None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         super().__setstate__(state)
         self._input_cleanups = []
         self._tf_cleanup = None
+        self._callback_drain_deadline = None
 
     def _before_memory_stop(self) -> None:
-        cleanups, self._input_cleanups = self._input_cleanups, []
+        input_cleanups, self._input_cleanups = self._input_cleanups, []
         tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
+        cleanups = [*input_cleanups]
+        drain_timeouts: list[float] = []
+        if input_cleanups:
+            drain_timeouts.append(_INPUT_DRAIN_TIMEOUT_SECONDS)
         if tf_cleanup is not None:
             cleanups.append(tf_cleanup)
+            drain_timeouts.append(_TF_DRAIN_TIMEOUT_SECONDS)
+        self._callback_drain_deadline = (
+            time.monotonic() + max(drain_timeouts) if drain_timeouts else None
+        )
         first_error: BaseException | None = None
         drain_error: _DrainIncompleteError | None = None
 
@@ -461,23 +472,32 @@ class Recorder(MemoryModule):
             nonlocal drain_error, first_error
             if isinstance(exc, _DrainIncompleteError) and drain_error is None:
                 drain_error = exc
-            if first_error is None:
+                self._callback_drain_deadline = time.monotonic()
+            if first_error is None or (
+                not isinstance(exc, _DrainIncompleteError)
+                and isinstance(first_error, _DrainIncompleteError)
+            ):
                 first_error = exc
 
-        for cleanup in cleanups:
+        try:
+            for cleanup in cleanups:
+                try:
+                    cleanup.dispose()
+                except BaseException as exc:
+                    record_error(exc)
             try:
-                cleanup.dispose()
+                super()._before_memory_stop()
             except BaseException as exc:
                 record_error(exc)
-        try:
-            super()._before_memory_stop()
-        except BaseException as exc:
-            record_error(exc)
 
-        if drain_error is not None:
-            raise drain_error
-        if first_error is not None:
-            raise first_error
+            if drain_error is not None:
+                if first_error is not None and first_error is not drain_error:
+                    raise drain_error from first_error
+                raise drain_error
+            if first_error is not None:
+                raise first_error
+        finally:
+            self._callback_drain_deadline = None
 
     @rpc
     def start(self) -> None:
@@ -557,7 +577,10 @@ class Recorder(MemoryModule):
                 nonlocal drain_error, first_error
                 if isinstance(exc, _DrainIncompleteError) and drain_error is None:
                     drain_error = exc
-                if first_error is None:
+                if first_error is None or (
+                    not isinstance(exc, _DrainIncompleteError)
+                    and isinstance(first_error, _DrainIncompleteError)
+                ):
                     first_error = exc
 
             try:
@@ -576,6 +599,8 @@ class Recorder(MemoryModule):
                 record_error(exc)
 
             if drain_error is not None:
+                if first_error is not None and first_error is not drain_error:
+                    raise drain_error from first_error
                 raise drain_error
             if first_error is not None:
                 raise first_error
@@ -607,6 +632,8 @@ class Recorder(MemoryModule):
         def drain_callbacks() -> None:
             wait_started = time.monotonic()
             deadline = wait_started + _INPUT_DRAIN_TIMEOUT_SECONDS
+            if self._callback_drain_deadline is not None:
+                deadline = min(deadline, self._callback_drain_deadline)
             first_error: BaseException | None = None
             log_waits = True
 
@@ -688,15 +715,22 @@ class Recorder(MemoryModule):
 
             stamped = input_topic.pure_observable().pipe(ops.map(stamp_reception))
             observable_subscription = stamped.subscribe(on_next)
-        except BaseException:
+        except BaseException as setup_error:
+            drain_error: _DrainIncompleteError | None = None
             with self._memory_stop_lock:
                 try:
                     input_cleanup.dispose()
+                except _DrainIncompleteError as exc:
+                    self._memory_stopping = True
+                    self._memory_teardown_failed = True
+                    drain_error = exc
                 except BaseException:
                     logger.exception("Failed to clean up recorder input after setup error")
                 finally:
                     if input_cleanup in self._input_cleanups:
                         self._input_cleanups.remove(input_cleanup)
+            if drain_error is not None:
+                raise drain_error from setup_error
             raise
         rx_subscription.disposable = observable_subscription
 
@@ -789,7 +823,10 @@ class Recorder(MemoryModule):
                 nonlocal drain_error, first_error
                 if isinstance(exc, _DrainIncompleteError) and drain_error is None:
                     drain_error = exc
-                if first_error is None:
+                if first_error is None or (
+                    not isinstance(exc, _DrainIncompleteError)
+                    and isinstance(first_error, _DrainIncompleteError)
+                ):
                     first_error = exc
 
             try:
@@ -800,6 +837,8 @@ class Recorder(MemoryModule):
 
             wait_started = time.monotonic()
             deadline = wait_started + _TF_DRAIN_TIMEOUT_SECONDS
+            if self._callback_drain_deadline is not None:
+                deadline = min(deadline, self._callback_drain_deadline)
             log_waits = True
             while True:
                 wait_timeout = min(
@@ -850,9 +889,11 @@ class Recorder(MemoryModule):
                             first_error = exc
                         log_waits = False
 
+            if drain_error is not None:
+                if first_error is not None and first_error is not drain_error:
+                    raise drain_error from first_error
+                raise drain_error
             if first_error is not None:
-                if drain_error is not None:
-                    raise drain_error
                 raise first_error
 
         cleanup = Disposable(unsubscribe_and_drain)
