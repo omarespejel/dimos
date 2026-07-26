@@ -360,6 +360,7 @@ def test_recorder_input_drain_wait_error_still_waits_for_callback(
         record_tf=False,
         rpc_transport=_TestRPC,
     )
+    module._loop_thread_timeout = 0.0
     module._store = store
     append_started = threading.Event()
     append_release = threading.Event()
@@ -442,7 +443,7 @@ def test_recorder_input_drain_timeout_keeps_store_open(
         pose_started.set()
         assert allow_store_touch.wait(timeout=SYNC_TIMEOUT)
         with pytest.raises(RuntimeError, match="stopping or stopped"):
-            _ = module.store
+            module.store  # noqa: B018
         pose_finished.set()
         return None
 
@@ -477,6 +478,101 @@ def test_recorder_input_drain_timeout_keeps_store_open(
     assert module._memory_teardown_failed
     assert not module._memory_stopped.is_set()
     module._before_memory_stop()
+    Module.stop(module)
+
+
+def test_recorder_drain_error_takes_precedence_over_cleanup_error(
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    cleanup_error = RuntimeError("unsubscribe failed")
+    drain_error = memory_module._DrainIncompleteError("drain still active")
+    module._input_cleanups = [
+        Disposable(lambda: (_ for _ in ()).throw(cleanup_error)),
+        Disposable(lambda: (_ for _ in ()).throw(drain_error)),
+    ]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        module.stop()
+
+    assert exc_info.value is drain_error
+    store.stop.assert_not_called()
+    assert module._store is store
+    assert module._memory_teardown_failed
+    assert not module._memory_stopped.is_set()
+    Module.stop(module)
+
+
+def test_recorder_input_drain_error_takes_precedence_over_subscription_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    stream = MagicMock(spec=Stream)
+    input_topic = MagicMock(spec=In)
+    source_observers: list[Any] = []
+    subscription_error = RuntimeError("input dispose failed")
+
+    def subscribe(observer: Any, _scheduler: Any) -> Disposable:
+        source_observers.append(observer)
+        return Disposable(lambda: (_ for _ in ()).throw(subscription_error))
+
+    input_topic.pure_observable.return_value = create(subscribe)
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    pose_started = threading.Event()
+    allow_store_touch = threading.Event()
+    pose_finished = threading.Event()
+    stop_result: list[BaseException | None] = []
+
+    async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
+        pose_started.set()
+        assert allow_store_touch.wait(timeout=SYNC_TIMEOUT)
+        with pytest.raises(RuntimeError, match="stopping or stopped"):
+            module.store  # noqa: B018
+        pose_finished.set()
+        return None
+
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
+    module._port_to_stream("color_image", input_topic, stream)
+
+    source_observers[0].on_next(SimpleNamespace(ts=1.0))
+    assert pose_started.wait(timeout=SYNC_TIMEOUT)
+
+    def stop_module() -> None:
+        try:
+            module.stop()
+        except BaseException as exc:
+            stop_result.append(exc)
+        else:
+            stop_result.append(None)
+
+    stop_thread = threading.Thread(target=stop_module)
+    stop_thread.start()
+    allow_store_touch.set()
+    stop_thread.join(timeout=SYNC_TIMEOUT)
+
+    assert not stop_thread.is_alive()
+    assert isinstance(stop_result[0], RuntimeError)
+    assert "Timed out waiting for recorder input callbacks" in str(stop_result[0])
+    assert stop_result[0].__cause__ is None
+    assert pose_finished.wait(timeout=SYNC_TIMEOUT)
+    store.stop.assert_not_called()
+    assert module._store is store
+    assert module._memory_teardown_failed
+    assert not module._memory_stopped.is_set()
     Module.stop(module)
 
 
