@@ -52,11 +52,21 @@ if TYPE_CHECKING:
 logger = setup_logger()
 
 _INPUT_DRAIN_LOG_INTERVAL_SECONDS: float = 5.0
+_INPUT_DRAIN_TIMEOUT_SECONDS: float = 30.0
 _TF_DRAIN_LOG_INTERVAL_SECONDS: float = 5.0
+_TF_DRAIN_TIMEOUT_SECONDS: float = 30.0
 
 T = TypeVar("T")
 TIn = TypeVar("TIn")
 TOut = TypeVar("TOut")
+
+
+class _DrainIncompleteError(RuntimeError):
+    pass
+
+
+def _now() -> float:
+    return time.time()
 
 
 def stream_to_port(stream: Stream[T], out: Out[T]) -> DisposableBase:
@@ -262,6 +272,9 @@ class MemoryModule(Module):
 
                 try:
                     self._before_memory_stop()
+                except _DrainIncompleteError:
+                    self._memory_teardown_failed = True
+                    raise
                 except BaseException as exc:
                     first_error = exc
 
@@ -279,6 +292,7 @@ class MemoryModule(Module):
                         store.stop()
                     except BaseException:
                         if first_error is not None:
+                            logger.exception("Memory store shutdown failed during teardown")
                             raise first_error
                         raise
                     else:
@@ -576,6 +590,7 @@ class Recorder(MemoryModule):
 
         def drain_callbacks() -> None:
             wait_started = time.monotonic()
+            deadline = wait_started + _INPUT_DRAIN_TIMEOUT_SECONDS
             first_error: BaseException | None = None
             log_waits = True
 
@@ -583,11 +598,15 @@ class Recorder(MemoryModule):
                 return active_callbacks == 0
 
             while True:
+                wait_timeout = min(
+                    _INPUT_DRAIN_LOG_INTERVAL_SECONDS,
+                    max(0.0, deadline - time.monotonic()),
+                )
                 try:
                     with callback_state:
                         if callback_state.wait_for(
                             callbacks_drained,
-                            timeout=_INPUT_DRAIN_LOG_INTERVAL_SECONDS,
+                            timeout=wait_timeout,
                         ):
                             break
                         remaining_callbacks = active_callbacks
@@ -598,7 +617,16 @@ class Recorder(MemoryModule):
                         if callbacks_drained():
                             break
                         remaining_callbacks = active_callbacks
-                        callback_state.wait(timeout=_INPUT_DRAIN_LOG_INTERVAL_SECONDS)
+                        wait_timeout = min(
+                            _INPUT_DRAIN_LOG_INTERVAL_SECONDS,
+                            max(0.0, deadline - time.monotonic()),
+                        )
+                        if wait_timeout > 0:
+                            callback_state.wait(timeout=wait_timeout)
+                if time.monotonic() >= deadline:
+                    raise _DrainIncompleteError(
+                        f"Timed out waiting for recorder input callbacks for {name}"
+                    ) from first_error
                 if log_waits:
                     try:
                         logger.warning(
@@ -627,13 +655,13 @@ class Recorder(MemoryModule):
         try:
             with callback_state:
                 if not accepting_callbacks:
-                    return
+                    raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
                 on_next, dispatcher_disposable = self._make_async_dispatch(on_msg)
                 dispatcher.disposable = dispatcher_disposable
 
             # Stamp arrival time before the coalescing dispatch queue.
             def stamp_reception(msg: Any) -> tuple[float, Any]:
-                return time.time(), msg
+                return _now(), msg
 
             stamped = input_topic.pure_observable().pipe(ops.map(stamp_reception))
             observable_subscription = stamped.subscribe(on_next)
@@ -663,7 +691,7 @@ class Recorder(MemoryModule):
 
     def _resolve_ts(self, name: str, msg: Any) -> float:
         """Timestamp to record *msg* at. Override to re-base onto another clock."""
-        return getattr(msg, "ts", None) or time.time()
+        return getattr(msg, "ts", None) or _now()
 
     async def _resolve_pose(self, name: str, msg: Any, ts: float) -> Pose | None:
         """Pose to anchor *msg* with. Dispatches to the stream's (async)
@@ -740,13 +768,18 @@ class Recorder(MemoryModule):
                 first_error = exc
 
             wait_started = time.monotonic()
+            deadline = wait_started + _TF_DRAIN_TIMEOUT_SECONDS
             log_waits = True
             while True:
+                wait_timeout = min(
+                    _TF_DRAIN_LOG_INTERVAL_SECONDS,
+                    max(0.0, deadline - time.monotonic()),
+                )
                 try:
                     with callback_state:
                         if callback_state.wait_for(
                             lambda: active_callbacks == 0,
-                            timeout=_TF_DRAIN_LOG_INTERVAL_SECONDS,
+                            timeout=wait_timeout,
                         ):
                             break
                         remaining_callbacks = active_callbacks
@@ -757,7 +790,16 @@ class Recorder(MemoryModule):
                         if active_callbacks == 0:
                             break
                         remaining_callbacks = active_callbacks
-                        callback_state.wait(timeout=_TF_DRAIN_LOG_INTERVAL_SECONDS)
+                        wait_timeout = min(
+                            _TF_DRAIN_LOG_INTERVAL_SECONDS,
+                            max(0.0, deadline - time.monotonic()),
+                        )
+                        if wait_timeout > 0:
+                            callback_state.wait(timeout=wait_timeout)
+                if time.monotonic() >= deadline:
+                    raise _DrainIncompleteError(
+                        "Timed out waiting for tf callbacks"
+                    ) from first_error
                 if log_waits:
                     try:
                         logger.warning(

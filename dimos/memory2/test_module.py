@@ -31,7 +31,7 @@ from reactivex import create
 from reactivex.disposable import Disposable
 from reactivex.subject import Subject
 
-from dimos.core.module import ModuleConfig
+from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
 from dimos.memory2 import module as memory_module
 from dimos.memory2.module import MemoryModule, Recorder, StreamModule
@@ -220,7 +220,7 @@ def test_recorder_stop_waits_for_active_input_append(
         return reception_ts
 
     monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
-    monkeypatch.setattr("dimos.memory2.module.time.time", current_time)
+    monkeypatch.setattr(memory_module, "_now", current_time)
     monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(memory_module, "logger", test_logger)
     stream.append.side_effect = append
@@ -306,7 +306,7 @@ def test_recorder_input_drain_reports_warning_error_once(
         return reception_ts
 
     monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
-    monkeypatch.setattr("dimos.memory2.module.time.time", current_time)
+    monkeypatch.setattr(memory_module, "_now", current_time)
     monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(memory_module, "logger", test_logger)
     test_logger.warning.side_effect = fail_warning
@@ -417,6 +417,69 @@ def test_recorder_input_drain_wait_error_still_waits_for_callback(
     assert store_stopped.is_set()
 
 
+def test_recorder_input_drain_timeout_keeps_store_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    stream = MagicMock(spec=Stream)
+    input_topic = MagicMock(spec=In)
+    subject: Subject[Any] = Subject()
+    input_topic.pure_observable.return_value = subject
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    pose_started = threading.Event()
+    allow_store_touch = threading.Event()
+    pose_finished = threading.Event()
+    stop_result: list[BaseException | None] = []
+    test_logger = MagicMock()
+
+    async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
+        pose_started.set()
+        assert allow_store_touch.wait(timeout=SYNC_TIMEOUT)
+        with pytest.raises(RuntimeError, match="stopping or stopped"):
+            _ = module.store
+        pose_finished.set()
+        return None
+
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(memory_module, "logger", test_logger)
+    module._port_to_stream("color_image", input_topic, stream)
+
+    subject.on_next(SimpleNamespace(ts=1.0))
+    assert pose_started.wait(timeout=SYNC_TIMEOUT)
+
+    def stop_module() -> None:
+        try:
+            module.stop()
+        except BaseException as exc:
+            stop_result.append(exc)
+        else:
+            stop_result.append(None)
+
+    stop_thread = threading.Thread(target=stop_module)
+    stop_thread.start()
+    allow_store_touch.set()
+    stop_thread.join(timeout=SYNC_TIMEOUT)
+
+    assert not stop_thread.is_alive()
+    assert isinstance(stop_result[0], RuntimeError)
+    assert "Timed out waiting for recorder input callbacks" in str(stop_result[0])
+    assert pose_finished.wait(timeout=SYNC_TIMEOUT)
+    store.stop.assert_not_called()
+    assert module._store is store
+    assert module._memory_teardown_failed
+    assert not module._memory_stopped.is_set()
+    module._before_memory_stop()
+    Module.stop(module)
+
+
 def test_recorder_stop_waits_for_active_pose_lookup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -462,7 +525,7 @@ def test_recorder_stop_waits_for_active_pose_lookup(
 
     monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(memory_module, "logger", test_logger)
-    monkeypatch.setattr("dimos.memory2.module.time.time", current_time)
+    monkeypatch.setattr(memory_module, "_now", current_time)
     module._pose_setters = {"color_image": set_pose}
     store.stop.side_effect = stop_store
     module._port_to_stream("color_image", input_topic, stream)
@@ -808,7 +871,7 @@ def test_recorder_preserves_reception_time_for_poseless_input(
 
     monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
     monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
-    monkeypatch.setattr("dimos.memory2.module.time.time", current_time)
+    monkeypatch.setattr(memory_module, "_now", current_time)
     monkeypatch.setattr(memory_module, "logger", test_logger)
     module._port_to_stream("color_image", input_topic, stream)
     message = SimpleNamespace(ts=1.0)
@@ -1539,6 +1602,37 @@ def test_memory_module_retries_failed_store_shutdown(
     assert module._store is None
     assert module._memory_stopped.is_set()
     assert not module._memory_teardown_failed
+
+
+def test_memory_module_logs_store_error_after_cleanup_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cleanup_error = RuntimeError("recorder cleanup failed")
+    store_error = OSError("disk gone")
+    store = MagicMock(spec=SqliteStore)
+    test_logger = MagicMock()
+    module = MemoryModule(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    monkeypatch.setattr(
+        module,
+        "_before_memory_stop",
+        MagicMock(side_effect=cleanup_error),
+    )
+    monkeypatch.setattr(memory_module, "logger", test_logger)
+    store.stop.side_effect = store_error
+
+    with pytest.raises(RuntimeError) as exc_info:
+        module.stop()
+
+    assert exc_info.value is cleanup_error
+    store.stop.assert_called_once_with()
+    test_logger.exception.assert_called_once_with("Memory store shutdown failed during teardown")
+    assert module._store is store
+    assert not module._memory_stopped.is_set()
 
 
 def test_memory_module_does_not_close_store_after_generic_teardown_error(
