@@ -717,6 +717,7 @@ class Recorder(MemoryModule):
             observable_subscription = stamped.subscribe(on_next)
         except BaseException as setup_error:
             drain_error: _DrainIncompleteError | None = None
+            remaining_cleanups: list[DisposableBase] = []
             with self._memory_stop_lock:
                 try:
                     input_cleanup.dispose()
@@ -729,7 +730,26 @@ class Recorder(MemoryModule):
                 finally:
                     if input_cleanup in self._input_cleanups:
                         self._input_cleanups.remove(input_cleanup)
+                if drain_error is not None:
+                    remaining_cleanups, self._input_cleanups = self._input_cleanups, []
+                    tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
+                    if tf_cleanup is not None:
+                        remaining_cleanups.append(tf_cleanup)
+                    self._callback_drain_deadline = time.monotonic()
             if drain_error is not None:
+                try:
+                    for cleanup in remaining_cleanups:
+                        try:
+                            cleanup.dispose()
+                        except BaseException:
+                            try:
+                                logger.exception(
+                                    "Failed to stop recorder input after setup drain failure"
+                                )
+                            except BaseException:
+                                pass
+                finally:
+                    self._callback_drain_deadline = None
                 raise drain_error from setup_error
             raise
         rx_subscription.disposable = observable_subscription
@@ -811,11 +831,6 @@ class Recorder(MemoryModule):
                 accepting_callbacks = False
                 unsubscribe_now = unsubscribe
                 active_at_unsubscribe = active_callbacks
-            logger.info(
-                "Stopping tf recording",
-                active_callbacks=active_at_unsubscribe,
-                unsubscribe_installed=unsubscribe_now is not None,
-            )
             first_error: BaseException | None = None
             drain_error: _DrainIncompleteError | None = None
 
@@ -828,6 +843,15 @@ class Recorder(MemoryModule):
                     and isinstance(first_error, _DrainIncompleteError)
                 ):
                     first_error = exc
+
+            try:
+                logger.info(
+                    "Stopping tf recording",
+                    active_callbacks=active_at_unsubscribe,
+                    unsubscribe_installed=unsubscribe_now is not None,
+                )
+            except BaseException as exc:
+                record_error(exc)
 
             try:
                 if unsubscribe_now is not None:

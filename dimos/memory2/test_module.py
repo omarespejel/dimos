@@ -746,6 +746,102 @@ def test_recorder_setup_drain_timeout_blocks_later_store_close(
         Module.stop(module)
 
 
+def test_recorder_setup_drain_timeout_stops_existing_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_error = RuntimeError("subscribe failed")
+    store = MagicMock(spec=SqliteStore)
+    first_stream = MagicMock(spec=Stream)
+    second_stream = MagicMock(spec=Stream)
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    second_callback_started = threading.Event()
+    second_callback_release = threading.Event()
+    first_pose_called = threading.Event()
+    callback_threads: list[threading.Thread] = []
+    async_callbacks: list[Callable[[Any], Any]] = []
+    dispatcher_disposed = [threading.Event(), threading.Event()]
+    first_subscription_disposed = threading.Event()
+    tf_cleanup_disposed = threading.Event()
+    module._tf_cleanup = Disposable(tf_cleanup_disposed.set)
+
+    async def resolve_pose(name: str, _msg: Any, _ts: float) -> None:
+        if name == "second":
+            second_callback_started.set()
+            assert second_callback_release.wait(timeout=SYNC_TIMEOUT)
+        else:
+            first_pose_called.set()
+        return None
+
+    def make_dispatch(
+        async_callback: Callable[[Any], Any],
+    ) -> tuple[Callable[[Any], None], Disposable]:
+        disposed = dispatcher_disposed[len(async_callbacks)]
+        async_callbacks.append(async_callback)
+
+        def dispatch(stamped: Any) -> None:
+            thread = threading.Thread(target=lambda: asyncio.run(async_callback(stamped)))
+            callback_threads.append(thread)
+            thread.start()
+
+        return dispatch, Disposable(disposed.set)
+
+    first_input = MagicMock(spec=In)
+    first_observable = MagicMock()
+    first_stamped = MagicMock()
+    first_input.pure_observable.return_value = first_observable
+    first_observable.pipe.return_value = first_stamped
+    first_stamped.subscribe.return_value = Disposable(first_subscription_disposed.set)
+
+    second_input = MagicMock(spec=In)
+    second_observable = MagicMock()
+    second_stamped = MagicMock()
+    second_input.pure_observable.return_value = second_observable
+    second_observable.pipe.return_value = second_stamped
+
+    def fail_subscribe(on_next: Callable[[Any], None]) -> None:
+        on_next((10.0, SimpleNamespace(ts=1.0)))
+        assert second_callback_started.wait(timeout=SYNC_TIMEOUT)
+        raise setup_error
+
+    second_stamped.subscribe.side_effect = fail_subscribe
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
+
+    try:
+        module._port_to_stream("first", first_input, first_stream)
+
+        with pytest.raises(memory_module._DrainIncompleteError) as exc_info:
+            module._port_to_stream("second", second_input, second_stream)
+
+        assert exc_info.value.__cause__ is setup_error
+        assert first_subscription_disposed.is_set()
+        assert all(event.is_set() for event in dispatcher_disposed)
+        assert tf_cleanup_disposed.is_set()
+        assert module._tf_cleanup is None
+        assert module._input_cleanups == []
+        assert module._memory_stopping
+        assert module._memory_teardown_failed
+        assert module._store is store
+        store.stop.assert_not_called()
+
+        asyncio.run(async_callbacks[0]((20.0, SimpleNamespace(ts=2.0))))
+        assert not first_pose_called.is_set()
+        first_stream.append.assert_not_called()
+    finally:
+        second_callback_release.set()
+        for thread in callback_threads:
+            thread.join(timeout=SYNC_TIMEOUT)
+        Module.stop(module)
+
+
 def test_recorder_stop_waits_for_active_pose_lookup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1213,6 +1309,57 @@ def test_recorder_stop_waits_for_active_tf_callback(
     test_logger.warning.assert_called()
     assert test_logger.warning.call_args.args == ("Still waiting for tf callbacks",)
     assert test_logger.warning.call_args.kwargs["active_callbacks"] == 1
+
+
+def test_recorder_tf_info_error_still_drains_active_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tf_recorder: TFRecorderFixture,
+) -> None:
+    module, store, tf_stream, callback, unsubscribe = tf_recorder
+    append_started = threading.Event()
+    append_release = threading.Event()
+    append_finished = threading.Event()
+    unsubscribed = threading.Event()
+    store_stopped = threading.Event()
+    info_error = RuntimeError("tf info failed")
+    test_logger = MagicMock()
+    test_logger.info.side_effect = info_error
+    monkeypatch.setattr(memory_module, "logger", test_logger)
+
+    def append(*_args: Any, **_kwargs: Any) -> None:
+        append_started.set()
+        assert append_release.wait(timeout=SYNC_TIMEOUT)
+        append_finished.set()
+
+    def stop_store() -> None:
+        assert append_finished.is_set()
+        store_stopped.set()
+
+    tf_stream.append.side_effect = append
+    unsubscribe.side_effect = unsubscribed.set
+    store.stop.side_effect = stop_store
+    message = TFMessage(Transform(ts=1.0))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        callback_future = pool.submit(callback, message, "/tf")
+        assert append_started.wait(timeout=SYNC_TIMEOUT)
+        stop_future = pool.submit(module.stop)
+        try:
+            assert unsubscribed.wait(timeout=SYNC_TIMEOUT)
+            assert not store_stopped.wait(timeout=0.05)
+            assert not stop_future.done()
+        finally:
+            append_release.set()
+
+        callback_future.result(timeout=SYNC_TIMEOUT)
+        with pytest.raises(RuntimeError) as exc_info:
+            stop_future.result(timeout=SYNC_TIMEOUT)
+
+    assert exc_info.value is info_error
+    assert append_finished.is_set()
+    unsubscribe.assert_called_once_with()
+    store.stop.assert_called_once_with()
+    assert store_stopped.is_set()
 
 
 def test_recorder_tf_drain_reports_warning_error_once(
