@@ -28,26 +28,10 @@ import pytest
 from reactivex.disposable import Disposable
 
 from dimos.core.stream import In
-from dimos.memory2 import module as memory_module
 from dimos.memory2.module import Recorder
 from dimos.memory2.store.sqlite import SqliteStore
 from dimos.memory2.stream import Stream
-from dimos.protocol.rpc.spec import Args, RPCSpec
-
-
-class _TestRPC(RPCSpec):
-    def __init__(self, **_kwargs: Any) -> None:
-        pass
-
-    def serve_rpc(self, _f: Any, _name: str) -> Any:
-        return lambda: None
-
-    def call(self, _name: str, _arguments: Args, _cb: Any) -> Any:
-        return None
-
-    def call_nowait(self, _name: str, _arguments: Args) -> None:
-        pass
-
+from dimos.memory2.test_module import _TestRPC
 
 SYNC_TIMEOUT: float = 2.0
 
@@ -178,7 +162,7 @@ def test_recorder_removes_input_cleanup_after_subscription_setup_fails(
         raise setup_error
 
     monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
-    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.1)
+    module.config.drain_timeout = 0.1
     stamped_observable.subscribe.side_effect = fail_subscribe
     stream.append.side_effect = append
     store.stop.side_effect = stop_store

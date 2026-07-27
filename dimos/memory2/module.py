@@ -51,12 +51,8 @@ if TYPE_CHECKING:
 
 logger = setup_logger()
 
-# The run registry and PythonWorker escalate process shutdown after five seconds.
-# Use the standard thread shutdown budget so a failed drain surfaces before then.
 _INPUT_DRAIN_LOG_INTERVAL_SECONDS: float = 1.0
-_INPUT_DRAIN_TIMEOUT_SECONDS: float = DEFAULT_THREAD_JOIN_TIMEOUT
 _TF_DRAIN_LOG_INTERVAL_SECONDS: float = 1.0
-_TF_DRAIN_TIMEOUT_SECONDS: float = DEFAULT_THREAD_JOIN_TIMEOUT
 
 T = TypeVar("T")
 TIn = TypeVar("TIn")
@@ -388,6 +384,13 @@ class RecorderConfig(MemoryModuleConfig):
     stream_remapping: dict[str, str] = Field(default_factory=dict)
     # Port names that inherently have no pose to anchor (command streams, etc.).
     poseless_streams: list[str] = Field(default_factory=list)
+    # Total budget for draining in-flight callbacks at stop(), shared across every
+    # recorded port and tf rather than spent per-port. The run registry and
+    # PythonWorker escalate process shutdown after five seconds, so the default is
+    # the standard thread shutdown budget — a stalled drain surfaces before then.
+    # Raise it for recorders whose appends are slow (large frames, contended disk):
+    # exceeding the budget fails teardown closed and leaves the store open.
+    drain_timeout: float = Field(default=DEFAULT_THREAD_JOIN_TIMEOUT, gt=0)
 
 
 PoseSetter = Callable[[Any], "Awaitable[Pose | None]"]
@@ -429,6 +432,15 @@ class Recorder(MemoryModule):
         @pose_setter_for("lidar")
         async def _lidar_pose(self, msg):
             return self._last_odom_pose
+
+    **Shutdown contract.** ``stop()`` stops admitting callbacks, unsubscribes,
+    then waits for the callbacks already in flight — every port and tf sharing a
+    single ``config.drain_timeout`` budget, so the wait cannot compound with the
+    number of recorded ports. If that budget is exceeded the teardown **fails
+    closed**: the SQLite store is deliberately left open rather than closed under
+    a live writer, ``stop()`` raises, and the module refuses to stop again. A
+    recorder whose appends are slow should raise ``drain_timeout`` rather than
+    absorb repeated teardown failures.
     """
 
     config: RecorderConfig
@@ -467,14 +479,11 @@ class Recorder(MemoryModule):
         input_cleanups, self._input_cleanups = self._input_cleanups, []
         tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
         cleanups = [*input_cleanups]
-        drain_timeouts: list[float] = []
-        if input_cleanups:
-            drain_timeouts.append(_INPUT_DRAIN_TIMEOUT_SECONDS)
         if tf_cleanup is not None:
             cleanups.append(tf_cleanup)
-            drain_timeouts.append(_TF_DRAIN_TIMEOUT_SECONDS)
+        # One deadline for every port plus tf, so the budget cannot compound.
         self._callback_drain_deadline = (
-            time.monotonic() + max(drain_timeouts) if drain_timeouts else None
+            time.monotonic() + self.config.drain_timeout if cleanups else None
         )
         first_error: BaseException | None = None
         drain_error: _DrainIncompleteError | None = None
@@ -644,7 +653,7 @@ class Recorder(MemoryModule):
 
         def drain_callbacks() -> None:
             wait_started = time.monotonic()
-            deadline = wait_started + _INPUT_DRAIN_TIMEOUT_SECONDS
+            deadline = wait_started + self.config.drain_timeout
             if self._callback_drain_deadline is not None:
                 deadline = min(deadline, self._callback_drain_deadline)
             first_error: BaseException | None = None
@@ -879,7 +888,7 @@ class Recorder(MemoryModule):
                 record_error(exc)
 
             wait_started = time.monotonic()
-            deadline = wait_started + _TF_DRAIN_TIMEOUT_SECONDS
+            deadline = wait_started + self.config.drain_timeout
             if self._callback_drain_deadline is not None:
                 deadline = min(deadline, self._callback_drain_deadline)
             log_waits = True
