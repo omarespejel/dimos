@@ -28,7 +28,6 @@ from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import ANY, MagicMock
 
-from pydantic import ValidationError
 import pytest
 from reactivex import create
 from reactivex.disposable import Disposable
@@ -38,7 +37,7 @@ from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
 from dimos.memory2 import module as memory_module
-from dimos.memory2.module import MemoryModule, Recorder, RecorderConfig, StreamModule
+from dimos.memory2.module import MemoryModule, Recorder, StreamModule
 from dimos.memory2.store.sqlite import SqliteStore
 from dimos.memory2.stream import Stream
 from dimos.memory2.transform import Transformer
@@ -154,20 +153,17 @@ SYNC_TIMEOUT: float = 2.0
 
 
 def test_recorder_default_drain_budget_uses_thread_shutdown_timeout() -> None:
-    drain_timeout = RecorderConfig().drain_timeout
+    drain_timeouts = (
+        memory_module._INPUT_DRAIN_TIMEOUT_SECONDS,
+        memory_module._TF_DRAIN_TIMEOUT_SECONDS,
+    )
 
-    assert drain_timeout == DEFAULT_THREAD_JOIN_TIMEOUT
+    assert drain_timeouts == (
+        DEFAULT_THREAD_JOIN_TIMEOUT,
+        DEFAULT_THREAD_JOIN_TIMEOUT,
+    )
     # The CLI and worker process escalate teardown after five seconds.
-    assert drain_timeout < 5.0
-
-
-def test_recorder_drain_budget_is_configurable() -> None:
-    """Recorders with slow appends must be able to buy more drain budget than
-    the generic thread-join default without patching module internals."""
-    assert RecorderConfig(drain_timeout=30.0).drain_timeout == 30.0
-
-    with pytest.raises(ValidationError):
-        RecorderConfig(drain_timeout=0.0)
+    assert max(drain_timeouts) < 5.0
 
 
 @pytest.fixture
@@ -486,7 +482,7 @@ def test_recorder_input_drain_timeout_keeps_store_open(
 
     monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
     monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
-    module.config.drain_timeout = 0.05
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(memory_module, "logger", test_logger)
 
     try:
@@ -530,7 +526,7 @@ def test_recorder_drain_error_takes_precedence_over_cleanup_error(
     )
     module._store = store
     cleanup_error = RuntimeError("unsubscribe failed")
-    drain_error = memory_module.DrainIncompleteError("drain still active")
+    drain_error = memory_module._DrainIncompleteError("drain still active")
     module._input_cleanups = [
         Disposable(lambda: (_ for _ in ()).throw(cleanup_error)),
         Disposable(lambda: (_ for _ in ()).throw(drain_error)),
@@ -595,7 +591,7 @@ def test_recorder_input_drain_error_takes_precedence_over_subscription_error(
 
     monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
     monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
-    module.config.drain_timeout = 0.05
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
 
     try:
         module._port_to_stream("color_image", input_topic, stream)
@@ -694,7 +690,7 @@ def test_recorder_stop_uses_one_drain_deadline_for_all_inputs(
 
     monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
     monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
-    module.config.drain_timeout = 0.05
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
 
     try:
         for index in range(input_count):
@@ -713,7 +709,7 @@ def test_recorder_stop_uses_one_drain_deadline_for_all_inputs(
         with monkeypatch.context() as drain_patch:
             drain_patch.setattr(threading.Condition, "wait_for", observe_drain_wait)
             drain_patch.setattr(time, "monotonic", observe_monotonic)
-            with pytest.raises(memory_module.DrainIncompleteError):
+            with pytest.raises(memory_module._DrainIncompleteError):
                 module.stop()
 
         first_timeout = drain_wait_timeouts[0]
@@ -781,11 +777,11 @@ def test_recorder_setup_drain_timeout_blocks_later_store_close(
     monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
     monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
     monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
-    module.config.drain_timeout = 0.05
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
     stamped_observable.subscribe.side_effect = fail_subscribe
 
     try:
-        with pytest.raises(memory_module.DrainIncompleteError) as exc_info:
+        with pytest.raises(memory_module._DrainIncompleteError) as exc_info:
             module._port_to_stream("color_image", input_topic, stream)
 
         assert exc_info.value.__cause__ is setup_error
@@ -875,12 +871,12 @@ def test_recorder_setup_drain_timeout_stops_existing_inputs(
     monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
     monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
     monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
-    module.config.drain_timeout = 0.05
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
 
     try:
         module._port_to_stream("first", first_input, first_stream)
 
-        with pytest.raises(memory_module.DrainIncompleteError) as exc_info:
+        with pytest.raises(memory_module._DrainIncompleteError) as exc_info:
             module._port_to_stream("second", second_input, second_stream)
 
         assert exc_info.value.__cause__ is setup_error

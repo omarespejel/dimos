@@ -51,16 +51,20 @@ if TYPE_CHECKING:
 
 logger = setup_logger()
 
+# The run registry and PythonWorker escalate process shutdown after five seconds.
+# Use the standard thread shutdown budget so a failed drain surfaces before then.
 _INPUT_DRAIN_LOG_INTERVAL_SECONDS: float = 1.0
+_INPUT_DRAIN_TIMEOUT_SECONDS: float = DEFAULT_THREAD_JOIN_TIMEOUT
 _TF_DRAIN_LOG_INTERVAL_SECONDS: float = 1.0
+_TF_DRAIN_TIMEOUT_SECONDS: float = DEFAULT_THREAD_JOIN_TIMEOUT
 
 T = TypeVar("T")
 TIn = TypeVar("TIn")
 TOut = TypeVar("TOut")
 
 
-class DrainIncompleteError(RuntimeError):
-    """Raised when recorder callbacks are still active at the drain deadline."""
+class _DrainIncompleteError(RuntimeError):
+    pass
 
 
 def _now() -> float:
@@ -270,7 +274,7 @@ class MemoryModule(Module):
 
                 try:
                     self._before_memory_stop()
-                except DrainIncompleteError:
+                except _DrainIncompleteError:
                     self._memory_teardown_failed = True
                     raise
                 except BaseException as exc:
@@ -384,13 +388,6 @@ class RecorderConfig(MemoryModuleConfig):
     stream_remapping: dict[str, str] = Field(default_factory=dict)
     # Port names that inherently have no pose to anchor (command streams, etc.).
     poseless_streams: list[str] = Field(default_factory=list)
-    # Total budget for draining in-flight callbacks at stop(), shared across every
-    # recorded port and tf rather than spent per-port. The run registry and
-    # PythonWorker escalate process shutdown after five seconds, so the default is
-    # the standard thread shutdown budget — a stalled drain surfaces before then.
-    # Raise it for recorders whose appends are slow (large frames, contended disk):
-    # exceeding the budget fails teardown closed and leaves the store open.
-    drain_timeout: float = Field(default=DEFAULT_THREAD_JOIN_TIMEOUT, gt=0)
 
 
 PoseSetter = Callable[[Any], "Awaitable[Pose | None]"]
@@ -432,15 +429,6 @@ class Recorder(MemoryModule):
         @pose_setter_for("lidar")
         async def _lidar_pose(self, msg):
             return self._last_odom_pose
-
-    **Shutdown contract.** ``stop()`` stops admitting callbacks, unsubscribes,
-    then waits for the callbacks already in flight — every port and tf sharing a
-    single ``config.drain_timeout`` budget, so the wait cannot compound with the
-    number of recorded ports. If that budget is exceeded the teardown **fails
-    closed**: the SQLite store is deliberately left open rather than closed under
-    a live writer, ``stop()`` raises, and the module refuses to stop again. A
-    recorder whose appends are slow should raise ``drain_timeout`` rather than
-    absorb repeated teardown failures.
     """
 
     config: RecorderConfig
@@ -479,23 +467,26 @@ class Recorder(MemoryModule):
         input_cleanups, self._input_cleanups = self._input_cleanups, []
         tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
         cleanups = [*input_cleanups]
+        drain_timeouts: list[float] = []
+        if input_cleanups:
+            drain_timeouts.append(_INPUT_DRAIN_TIMEOUT_SECONDS)
         if tf_cleanup is not None:
             cleanups.append(tf_cleanup)
-        # One deadline for every port plus tf, so the budget cannot compound.
+            drain_timeouts.append(_TF_DRAIN_TIMEOUT_SECONDS)
         self._callback_drain_deadline = (
-            time.monotonic() + self.config.drain_timeout if cleanups else None
+            time.monotonic() + max(drain_timeouts) if drain_timeouts else None
         )
         first_error: BaseException | None = None
-        drain_error: DrainIncompleteError | None = None
+        drain_error: _DrainIncompleteError | None = None
 
         def record_error(exc: BaseException) -> None:
             nonlocal drain_error, first_error
-            if isinstance(exc, DrainIncompleteError) and drain_error is None:
+            if isinstance(exc, _DrainIncompleteError) and drain_error is None:
                 drain_error = exc
                 self._callback_drain_deadline = time.monotonic()
             if first_error is None or (
-                not isinstance(exc, DrainIncompleteError)
-                and isinstance(first_error, DrainIncompleteError)
+                not isinstance(exc, _DrainIncompleteError)
+                and isinstance(first_error, _DrainIncompleteError)
             ):
                 first_error = exc
 
@@ -593,15 +584,15 @@ class Recorder(MemoryModule):
             with callback_state:
                 accepting_callbacks = False
             first_error: BaseException | None = None
-            drain_error: DrainIncompleteError | None = None
+            drain_error: _DrainIncompleteError | None = None
 
             def record_error(exc: BaseException) -> None:
                 nonlocal drain_error, first_error
-                if isinstance(exc, DrainIncompleteError) and drain_error is None:
+                if isinstance(exc, _DrainIncompleteError) and drain_error is None:
                     drain_error = exc
                 if first_error is None or (
-                    not isinstance(exc, DrainIncompleteError)
-                    and isinstance(first_error, DrainIncompleteError)
+                    not isinstance(exc, _DrainIncompleteError)
+                    and isinstance(first_error, _DrainIncompleteError)
                 ):
                     first_error = exc
 
@@ -653,7 +644,7 @@ class Recorder(MemoryModule):
 
         def drain_callbacks() -> None:
             wait_started = time.monotonic()
-            deadline = wait_started + self.config.drain_timeout
+            deadline = wait_started + _INPUT_DRAIN_TIMEOUT_SECONDS
             if self._callback_drain_deadline is not None:
                 deadline = min(deadline, self._callback_drain_deadline)
             first_error: BaseException | None = None
@@ -692,11 +683,11 @@ class Recorder(MemoryModule):
                     except BaseException as recovery_exc:
                         if first_error is None:
                             first_error = recovery_exc
-                        raise DrainIncompleteError(
+                        raise _DrainIncompleteError(
                             f"Failed waiting for recorder input callbacks for {name}"
                         ) from first_error
                 if time.monotonic() >= deadline:
-                    raise DrainIncompleteError(
+                    raise _DrainIncompleteError(
                         f"Timed out waiting for recorder input callbacks for {name}"
                     ) from first_error
                 if log_waits:
@@ -741,7 +732,7 @@ class Recorder(MemoryModule):
             stamped = input_topic.pure_observable().pipe(ops.map(stamp_reception))
             observable_subscription = stamped.subscribe(on_next)
         except BaseException as setup_error:
-            drain_error: DrainIncompleteError | None = None
+            drain_error: _DrainIncompleteError | None = None
             remaining_cleanups: list[DisposableBase] = []
             with self._input_cleanup_lock:
                 with self._memory_stop_lock:
@@ -751,7 +742,7 @@ class Recorder(MemoryModule):
                 if cleanup_owned:
                     try:
                         input_cleanup.dispose()
-                    except DrainIncompleteError as exc:
+                    except _DrainIncompleteError as exc:
                         drain_error = exc
                     except BaseException:
                         logger.exception("Failed to clean up recorder input after setup error")
@@ -860,15 +851,15 @@ class Recorder(MemoryModule):
                 unsubscribe_now = unsubscribe
                 active_at_unsubscribe = active_callbacks
             first_error: BaseException | None = None
-            drain_error: DrainIncompleteError | None = None
+            drain_error: _DrainIncompleteError | None = None
 
             def record_error(exc: BaseException) -> None:
                 nonlocal drain_error, first_error
-                if isinstance(exc, DrainIncompleteError) and drain_error is None:
+                if isinstance(exc, _DrainIncompleteError) and drain_error is None:
                     drain_error = exc
                 if first_error is None or (
-                    not isinstance(exc, DrainIncompleteError)
-                    and isinstance(first_error, DrainIncompleteError)
+                    not isinstance(exc, _DrainIncompleteError)
+                    and isinstance(first_error, _DrainIncompleteError)
                 ):
                     first_error = exc
 
@@ -888,7 +879,7 @@ class Recorder(MemoryModule):
                 record_error(exc)
 
             wait_started = time.monotonic()
-            deadline = wait_started + self.config.drain_timeout
+            deadline = wait_started + _TF_DRAIN_TIMEOUT_SECONDS
             if self._callback_drain_deadline is not None:
                 deadline = min(deadline, self._callback_drain_deadline)
             log_waits = True
@@ -922,11 +913,11 @@ class Recorder(MemoryModule):
                     except BaseException as recovery_exc:
                         if first_error is None:
                             first_error = recovery_exc
-                        raise DrainIncompleteError(
+                        raise _DrainIncompleteError(
                             "Failed waiting for tf callbacks"
                         ) from first_error
                 if time.monotonic() >= deadline:
-                    raise DrainIncompleteError(
+                    raise _DrainIncompleteError(
                         "Timed out waiting for tf callbacks"
                     ) from first_error
                 if log_waits:
