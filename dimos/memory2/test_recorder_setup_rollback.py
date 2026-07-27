@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from reactivex.disposable import Disposable
 
 from dimos.core.stream import In
 from dimos.memory2 import module as memory_module
@@ -49,6 +50,63 @@ class _TestRPC(RPCSpec):
 
 
 SYNC_TIMEOUT: float = 2.0
+
+
+def test_recorder_stop_is_not_blocked_by_dispatcher_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    stream = MagicMock(spec=Stream)
+    input_topic = MagicMock(spec=In)
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    bootstrap_started = threading.Event()
+    bootstrap_release = threading.Event()
+    dispatcher_disposed = threading.Event()
+    store_stopped = threading.Event()
+
+    def make_dispatch(
+        _async_callback: Callable[[Any], Any],
+    ) -> tuple[Callable[[Any], None], Disposable]:
+        bootstrap_started.set()
+        assert bootstrap_release.wait(timeout=2 * SYNC_TIMEOUT)
+        return lambda _stamped: None, Disposable(dispatcher_disposed.set)
+
+    monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
+    store.stop.side_effect = store_stopped.set
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            setup_future = pool.submit(
+                module._port_to_stream,
+                "color_image",
+                input_topic,
+                stream,
+            )
+            try:
+                assert bootstrap_started.wait(timeout=SYNC_TIMEOUT)
+                stop_future = pool.submit(module.stop)
+                assert store_stopped.wait(timeout=SYNC_TIMEOUT)
+                stop_future.result(timeout=SYNC_TIMEOUT)
+                assert not setup_future.done()
+            finally:
+                bootstrap_release.set()
+
+            with pytest.raises(RuntimeError, match="stopping or stopped"):
+                setup_future.result(timeout=SYNC_TIMEOUT)
+
+        assert dispatcher_disposed.is_set()
+        assert module._input_cleanups == []
+        assert module._memory_stopped.is_set()
+        store.stop.assert_called_once_with()
+    finally:
+        bootstrap_release.set()
+        module.stop()
 
 
 def test_recorder_removes_input_cleanup_after_subscription_setup_fails(

@@ -716,11 +716,14 @@ class Recorder(MemoryModule):
                 raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
             self._input_cleanups.append(input_cleanup)
         try:
+            on_next, dispatcher_disposable = self._make_async_dispatch(on_msg)
             with callback_state:
-                if not accepting_callbacks:
-                    raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
-                on_next, dispatcher_disposable = self._make_async_dispatch(on_msg)
-                dispatcher.disposable = dispatcher_disposable
+                shutdown_won = not accepting_callbacks
+                if not shutdown_won:
+                    dispatcher.disposable = dispatcher_disposable
+            if shutdown_won:
+                dispatcher_disposable.dispose()
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
 
             # Stamp arrival time before the coalescing dispatch queue.
             def stamp_reception(msg: Any) -> tuple[float, Any]:

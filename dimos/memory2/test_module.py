@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 import pickle
 import threading
@@ -461,6 +462,7 @@ def test_recorder_input_drain_timeout_keeps_store_open(
     pose_finished = threading.Event()
     stop_result: list[BaseException | None] = []
     test_logger = MagicMock()
+    stop_thread: threading.Thread | None = None
 
     async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
         pose_started.set()
@@ -470,15 +472,6 @@ def test_recorder_input_drain_timeout_keeps_store_open(
         pose_finished.set()
         return None
 
-    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
-    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
-    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
-    monkeypatch.setattr(memory_module, "logger", test_logger)
-    module._port_to_stream("color_image", input_topic, stream)
-
-    subject.on_next(SimpleNamespace(ts=1.0))
-    assert pose_started.wait(timeout=SYNC_TIMEOUT)
-
     def stop_module() -> None:
         try:
             module.stop()
@@ -487,21 +480,39 @@ def test_recorder_input_drain_timeout_keeps_store_open(
         else:
             stop_result.append(None)
 
-    stop_thread = threading.Thread(target=stop_module)
-    stop_thread.start()
-    allow_store_touch.set()
-    stop_thread.join(timeout=SYNC_TIMEOUT)
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(memory_module, "logger", test_logger)
 
-    assert not stop_thread.is_alive()
-    assert isinstance(stop_result[0], RuntimeError)
-    assert "Timed out waiting for recorder input callbacks" in str(stop_result[0])
-    assert pose_finished.wait(timeout=SYNC_TIMEOUT)
-    store.stop.assert_not_called()
-    assert module._store is store
-    assert module._memory_teardown_failed
-    assert not module._memory_stopped.is_set()
-    module._before_memory_stop()
-    Module.stop(module)
+    try:
+        module._port_to_stream("color_image", input_topic, stream)
+        subject.on_next(SimpleNamespace(ts=1.0))
+        assert pose_started.wait(timeout=SYNC_TIMEOUT)
+
+        stop_thread = threading.Thread(target=stop_module)
+        stop_thread.start()
+        allow_store_touch.set()
+        stop_thread.join(timeout=SYNC_TIMEOUT)
+
+        assert not stop_thread.is_alive()
+        assert isinstance(stop_result[0], RuntimeError)
+        assert "Timed out waiting for recorder input callbacks" in str(stop_result[0])
+        assert pose_finished.wait(timeout=SYNC_TIMEOUT)
+        store.stop.assert_not_called()
+        assert module._store is store
+        assert module._memory_teardown_failed
+        assert not module._memory_stopped.is_set()
+    finally:
+        allow_store_touch.set()
+        if stop_thread is not None:
+            stop_thread.join(timeout=SYNC_TIMEOUT)
+        if pose_started.is_set():
+            pose_finished.wait(timeout=SYNC_TIMEOUT)
+        try:
+            module._before_memory_stop()
+        finally:
+            Module.stop(module)
 
 
 def test_recorder_drain_error_takes_precedence_over_cleanup_error(
@@ -521,16 +532,18 @@ def test_recorder_drain_error_takes_precedence_over_cleanup_error(
         Disposable(lambda: (_ for _ in ()).throw(drain_error)),
     ]
 
-    with pytest.raises(RuntimeError) as exc_info:
-        module.stop()
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            module.stop()
 
-    assert exc_info.value is drain_error
-    assert exc_info.value.__cause__ is cleanup_error
-    store.stop.assert_not_called()
-    assert module._store is store
-    assert module._memory_teardown_failed
-    assert not module._memory_stopped.is_set()
-    Module.stop(module)
+        assert exc_info.value is drain_error
+        assert exc_info.value.__cause__ is cleanup_error
+        store.stop.assert_not_called()
+        assert module._store is store
+        assert module._memory_teardown_failed
+        assert not module._memory_stopped.is_set()
+    finally:
+        Module.stop(module)
 
 
 def test_recorder_input_drain_error_takes_precedence_over_subscription_error(
@@ -558,6 +571,7 @@ def test_recorder_input_drain_error_takes_precedence_over_subscription_error(
     allow_store_touch = threading.Event()
     pose_finished = threading.Event()
     stop_result: list[BaseException | None] = []
+    stop_thread: threading.Thread | None = None
 
     async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
         pose_started.set()
@@ -567,14 +581,6 @@ def test_recorder_input_drain_error_takes_precedence_over_subscription_error(
         pose_finished.set()
         return None
 
-    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
-    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
-    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
-    module._port_to_stream("color_image", input_topic, stream)
-
-    source_observers[0].on_next(SimpleNamespace(ts=1.0))
-    assert pose_started.wait(timeout=SYNC_TIMEOUT)
-
     def stop_module() -> None:
         try:
             module.stop()
@@ -583,21 +589,38 @@ def test_recorder_input_drain_error_takes_precedence_over_subscription_error(
         else:
             stop_result.append(None)
 
-    stop_thread = threading.Thread(target=stop_module)
-    stop_thread.start()
-    allow_store_touch.set()
-    stop_thread.join(timeout=SYNC_TIMEOUT)
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
 
-    assert not stop_thread.is_alive()
-    assert isinstance(stop_result[0], RuntimeError)
-    assert "Timed out waiting for recorder input callbacks" in str(stop_result[0])
-    assert stop_result[0].__cause__ is subscription_error
-    assert pose_finished.wait(timeout=SYNC_TIMEOUT)
-    store.stop.assert_not_called()
-    assert module._store is store
-    assert module._memory_teardown_failed
-    assert not module._memory_stopped.is_set()
-    Module.stop(module)
+    try:
+        module._port_to_stream("color_image", input_topic, stream)
+        source_observers[0].on_next(SimpleNamespace(ts=1.0))
+        assert pose_started.wait(timeout=SYNC_TIMEOUT)
+
+        stop_thread = threading.Thread(target=stop_module)
+        stop_thread.start()
+        allow_store_touch.set()
+        stop_thread.join(timeout=SYNC_TIMEOUT)
+
+        assert not stop_thread.is_alive()
+        assert isinstance(stop_result[0], RuntimeError)
+        assert "Timed out waiting for recorder input callbacks" in str(stop_result[0])
+        assert stop_result[0].__cause__ is subscription_error
+        assert pose_finished.wait(timeout=SYNC_TIMEOUT)
+        store.stop.assert_not_called()
+        assert module._store is store
+        assert module._memory_teardown_failed
+        assert not module._memory_stopped.is_set()
+    finally:
+        allow_store_touch.set()
+        if stop_thread is not None:
+            stop_thread.join(timeout=SYNC_TIMEOUT)
+        if pose_started.is_set():
+            pose_finished.wait(timeout=SYNC_TIMEOUT)
+        with suppress(BaseException):
+            module._before_memory_stop()
+        Module.stop(module)
 
 
 def test_recorder_stop_uses_one_drain_deadline_for_all_inputs(
@@ -623,6 +646,8 @@ def test_recorder_stop_uses_one_drain_deadline_for_all_inputs(
     drain_wait_timeouts: list[float | None] = []
     stop_thread_id = threading.get_ident()
     original_wait_for = threading.Condition.wait_for
+    original_monotonic = time.monotonic
+    drain_now = [original_monotonic()]
 
     async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
         nonlocal started_callbacks
@@ -655,29 +680,35 @@ def test_recorder_stop_uses_one_drain_deadline_for_all_inputs(
             return original_wait_for(condition, predicate, timeout)
         drain_wait_timeouts.append(timeout)
         if len(drain_wait_timeouts) == 1 and timeout is not None:
-            time.sleep(timeout)
+            drain_now[0] += timeout
         return predicate()
+
+    def observe_monotonic() -> float:
+        if threading.get_ident() == stop_thread_id:
+            return drain_now[0]
+        return original_monotonic()
 
     monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
     monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
     monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
 
-    for index in range(input_count):
-        input_topic = MagicMock(spec=In)
-        observable = MagicMock()
-        stamped_observable = MagicMock()
-        input_topic.pure_observable.return_value = observable
-        observable.pipe.return_value = stamped_observable
-        stamped_observable.subscribe.return_value = Disposable(subscription_disposed[index].set)
-        module._port_to_stream(f"input_{index}", input_topic, MagicMock(spec=Stream))
-
     try:
+        for index in range(input_count):
+            input_topic = MagicMock(spec=In)
+            observable = MagicMock()
+            stamped_observable = MagicMock()
+            input_topic.pure_observable.return_value = observable
+            observable.pipe.return_value = stamped_observable
+            stamped_observable.subscribe.return_value = Disposable(subscription_disposed[index].set)
+            module._port_to_stream(f"input_{index}", input_topic, MagicMock(spec=Stream))
+
         for dispatch in dispatched:
             dispatch((10.0, SimpleNamespace(ts=1.0)))
         assert callback_started.wait(timeout=SYNC_TIMEOUT)
 
         with monkeypatch.context() as drain_patch:
             drain_patch.setattr(threading.Condition, "wait_for", observe_drain_wait)
+            drain_patch.setattr(time, "monotonic", observe_monotonic)
             with pytest.raises(memory_module._DrainIncompleteError):
                 module.stop()
 
@@ -694,6 +725,8 @@ def test_recorder_stop_uses_one_drain_deadline_for_all_inputs(
         callbacks_release.set()
         for thread in callback_threads:
             thread.join(timeout=SYNC_TIMEOUT)
+        with suppress(BaseException):
+            module._before_memory_stop()
         Module.stop(module)
 
 
