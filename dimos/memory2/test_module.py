@@ -530,7 +530,7 @@ def test_recorder_drain_error_takes_precedence_over_cleanup_error(
     )
     module._store = store
     cleanup_error = RuntimeError("unsubscribe failed")
-    drain_error = memory_module._DrainIncompleteError("drain still active")
+    drain_error = memory_module.DrainIncompleteError("drain still active")
     module._input_cleanups = [
         Disposable(lambda: (_ for _ in ()).throw(cleanup_error)),
         Disposable(lambda: (_ for _ in ()).throw(drain_error)),
@@ -713,7 +713,7 @@ def test_recorder_stop_uses_one_drain_deadline_for_all_inputs(
         with monkeypatch.context() as drain_patch:
             drain_patch.setattr(threading.Condition, "wait_for", observe_drain_wait)
             drain_patch.setattr(time, "monotonic", observe_monotonic)
-            with pytest.raises(memory_module._DrainIncompleteError):
+            with pytest.raises(memory_module.DrainIncompleteError):
                 module.stop()
 
         first_timeout = drain_wait_timeouts[0]
@@ -785,7 +785,7 @@ def test_recorder_setup_drain_timeout_blocks_later_store_close(
     stamped_observable.subscribe.side_effect = fail_subscribe
 
     try:
-        with pytest.raises(memory_module._DrainIncompleteError) as exc_info:
+        with pytest.raises(memory_module.DrainIncompleteError) as exc_info:
             module._port_to_stream("color_image", input_topic, stream)
 
         assert exc_info.value.__cause__ is setup_error
@@ -880,7 +880,7 @@ def test_recorder_setup_drain_timeout_stops_existing_inputs(
     try:
         module._port_to_stream("first", first_input, first_stream)
 
-        with pytest.raises(memory_module._DrainIncompleteError) as exc_info:
+        with pytest.raises(memory_module.DrainIncompleteError) as exc_info:
             module._port_to_stream("second", second_input, second_stream)
 
         assert exc_info.value.__cause__ is setup_error

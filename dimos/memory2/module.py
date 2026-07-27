@@ -59,8 +59,8 @@ TIn = TypeVar("TIn")
 TOut = TypeVar("TOut")
 
 
-class _DrainIncompleteError(RuntimeError):
-    pass
+class DrainIncompleteError(RuntimeError):
+    """Raised when recorder callbacks are still active at the drain deadline."""
 
 
 def _now() -> float:
@@ -270,7 +270,7 @@ class MemoryModule(Module):
 
                 try:
                     self._before_memory_stop()
-                except _DrainIncompleteError:
+                except DrainIncompleteError:
                     self._memory_teardown_failed = True
                     raise
                 except BaseException as exc:
@@ -486,16 +486,16 @@ class Recorder(MemoryModule):
             time.monotonic() + self.config.drain_timeout if cleanups else None
         )
         first_error: BaseException | None = None
-        drain_error: _DrainIncompleteError | None = None
+        drain_error: DrainIncompleteError | None = None
 
         def record_error(exc: BaseException) -> None:
             nonlocal drain_error, first_error
-            if isinstance(exc, _DrainIncompleteError) and drain_error is None:
+            if isinstance(exc, DrainIncompleteError) and drain_error is None:
                 drain_error = exc
                 self._callback_drain_deadline = time.monotonic()
             if first_error is None or (
-                not isinstance(exc, _DrainIncompleteError)
-                and isinstance(first_error, _DrainIncompleteError)
+                not isinstance(exc, DrainIncompleteError)
+                and isinstance(first_error, DrainIncompleteError)
             ):
                 first_error = exc
 
@@ -593,15 +593,15 @@ class Recorder(MemoryModule):
             with callback_state:
                 accepting_callbacks = False
             first_error: BaseException | None = None
-            drain_error: _DrainIncompleteError | None = None
+            drain_error: DrainIncompleteError | None = None
 
             def record_error(exc: BaseException) -> None:
                 nonlocal drain_error, first_error
-                if isinstance(exc, _DrainIncompleteError) and drain_error is None:
+                if isinstance(exc, DrainIncompleteError) and drain_error is None:
                     drain_error = exc
                 if first_error is None or (
-                    not isinstance(exc, _DrainIncompleteError)
-                    and isinstance(first_error, _DrainIncompleteError)
+                    not isinstance(exc, DrainIncompleteError)
+                    and isinstance(first_error, DrainIncompleteError)
                 ):
                     first_error = exc
 
@@ -692,11 +692,11 @@ class Recorder(MemoryModule):
                     except BaseException as recovery_exc:
                         if first_error is None:
                             first_error = recovery_exc
-                        raise _DrainIncompleteError(
+                        raise DrainIncompleteError(
                             f"Failed waiting for recorder input callbacks for {name}"
                         ) from first_error
                 if time.monotonic() >= deadline:
-                    raise _DrainIncompleteError(
+                    raise DrainIncompleteError(
                         f"Timed out waiting for recorder input callbacks for {name}"
                     ) from first_error
                 if log_waits:
@@ -741,7 +741,7 @@ class Recorder(MemoryModule):
             stamped = input_topic.pure_observable().pipe(ops.map(stamp_reception))
             observable_subscription = stamped.subscribe(on_next)
         except BaseException as setup_error:
-            drain_error: _DrainIncompleteError | None = None
+            drain_error: DrainIncompleteError | None = None
             remaining_cleanups: list[DisposableBase] = []
             with self._input_cleanup_lock:
                 with self._memory_stop_lock:
@@ -751,7 +751,7 @@ class Recorder(MemoryModule):
                 if cleanup_owned:
                     try:
                         input_cleanup.dispose()
-                    except _DrainIncompleteError as exc:
+                    except DrainIncompleteError as exc:
                         drain_error = exc
                     except BaseException:
                         logger.exception("Failed to clean up recorder input after setup error")
@@ -860,15 +860,15 @@ class Recorder(MemoryModule):
                 unsubscribe_now = unsubscribe
                 active_at_unsubscribe = active_callbacks
             first_error: BaseException | None = None
-            drain_error: _DrainIncompleteError | None = None
+            drain_error: DrainIncompleteError | None = None
 
             def record_error(exc: BaseException) -> None:
                 nonlocal drain_error, first_error
-                if isinstance(exc, _DrainIncompleteError) and drain_error is None:
+                if isinstance(exc, DrainIncompleteError) and drain_error is None:
                     drain_error = exc
                 if first_error is None or (
-                    not isinstance(exc, _DrainIncompleteError)
-                    and isinstance(first_error, _DrainIncompleteError)
+                    not isinstance(exc, DrainIncompleteError)
+                    and isinstance(first_error, DrainIncompleteError)
                 ):
                     first_error = exc
 
@@ -922,11 +922,11 @@ class Recorder(MemoryModule):
                     except BaseException as recovery_exc:
                         if first_error is None:
                             first_error = recovery_exc
-                        raise _DrainIncompleteError(
+                        raise DrainIncompleteError(
                             "Failed waiting for tf callbacks"
                         ) from first_error
                 if time.monotonic() >= deadline:
-                    raise _DrainIncompleteError(
+                    raise DrainIncompleteError(
                         "Timed out waiting for tf callbacks"
                     ) from first_error
                 if log_waits:
