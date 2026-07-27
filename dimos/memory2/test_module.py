@@ -714,7 +714,8 @@ def test_recorder_stop_uses_one_drain_deadline_for_all_inputs(
 
         first_timeout = drain_wait_timeouts[0]
         assert first_timeout is not None
-        assert 0 <= first_timeout <= 0.05
+        assert first_timeout >= 0
+        assert first_timeout == pytest.approx(0.05)
         assert drain_wait_timeouts[1:] == [0.0] * (input_count - 1)
         assert all(event.is_set() for event in subscription_disposed)
         assert all(event.is_set() for event in dispatcher_disposed)
