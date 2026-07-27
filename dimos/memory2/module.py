@@ -29,7 +29,7 @@ from reactivex.abc import DisposableBase
 from reactivex.disposable import Disposable, SingleAssignmentDisposable
 
 from dimos.agents.annotation import skill
-from dimos.constants import DIMOS_PROJECT_ROOT
+from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT, DIMOS_PROJECT_ROOT
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.memory2.embed import EmbedImages
@@ -51,10 +51,12 @@ if TYPE_CHECKING:
 
 logger = setup_logger()
 
-_INPUT_DRAIN_LOG_INTERVAL_SECONDS: float = 5.0
-_INPUT_DRAIN_TIMEOUT_SECONDS: float = 30.0
-_TF_DRAIN_LOG_INTERVAL_SECONDS: float = 5.0
-_TF_DRAIN_TIMEOUT_SECONDS: float = 30.0
+# The run registry and PythonWorker escalate process shutdown after five seconds.
+# Use the standard thread shutdown budget so a failed drain surfaces before then.
+_INPUT_DRAIN_LOG_INTERVAL_SECONDS: float = 1.0
+_INPUT_DRAIN_TIMEOUT_SECONDS: float = DEFAULT_THREAD_JOIN_TIMEOUT
+_TF_DRAIN_LOG_INTERVAL_SECONDS: float = 1.0
+_TF_DRAIN_TIMEOUT_SECONDS: float = DEFAULT_THREAD_JOIN_TIMEOUT
 
 T = TypeVar("T")
 TIn = TypeVar("TIn")
@@ -564,8 +566,10 @@ class Recorder(MemoryModule):
         so every observation gets a robot-pose anchor when tf is publishing.
 
         Each port is recorded by an async callback dispatched on the module's
-        event loop. Shutdown stops new callbacks, unsubscribes, waits for any
-        admitted callback to finish, then cancels the dispatcher.
+        event loop. Shutdown stops new callbacks, unsubscribes, and waits up to
+        the shared drain deadline for admitted callbacks to finish before
+        cancelling the dispatcher. If a callback remains active, shutdown
+        fails without closing the store.
         """
 
         callback_state = threading.Condition()

@@ -32,6 +32,7 @@ from reactivex import create
 from reactivex.disposable import Disposable
 from reactivex.subject import Subject
 
+from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
 from dimos.memory2 import module as memory_module
@@ -148,6 +149,20 @@ TFRecorderFixture = tuple[
     MagicMock,
 ]
 SYNC_TIMEOUT: float = 2.0
+
+
+def test_recorder_default_drain_budget_uses_thread_shutdown_timeout() -> None:
+    drain_timeouts = (
+        memory_module._INPUT_DRAIN_TIMEOUT_SECONDS,
+        memory_module._TF_DRAIN_TIMEOUT_SECONDS,
+    )
+
+    assert drain_timeouts == (
+        DEFAULT_THREAD_JOIN_TIMEOUT,
+        DEFAULT_THREAD_JOIN_TIMEOUT,
+    )
+    # The CLI and worker process escalate teardown after five seconds.
+    assert max(drain_timeouts) < 5.0
 
 
 @pytest.fixture
