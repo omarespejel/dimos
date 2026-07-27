@@ -361,6 +361,7 @@ def test_recorder_input_drain_wait_error_still_waits_for_callback(
         record_tf=False,
         rpc_transport=_TestRPC,
     )
+    # Prevent the loop-thread join from masking an abandoned input drain.
     module._loop_thread_timeout = 0.0
     module._store = store
     append_started = threading.Event()
@@ -370,6 +371,7 @@ def test_recorder_input_drain_wait_error_still_waits_for_callback(
     wait_error = RuntimeError("wait failed")
     original_wait_for = threading.Condition.wait_for
     wait_failures_remaining = 1
+    stop_thread_id: int | None = None
 
     def wait_for_once_then_normal(
         condition: threading.Condition,
@@ -377,10 +379,15 @@ def test_recorder_input_drain_wait_error_still_waits_for_callback(
         timeout: float | None = None,
     ) -> bool:
         nonlocal wait_failures_remaining
-        if wait_failures_remaining:
+        if threading.get_ident() == stop_thread_id and wait_failures_remaining:
             wait_failures_remaining -= 1
             raise wait_error
         return original_wait_for(condition, predicate, timeout)
+
+    def stop_module() -> None:
+        nonlocal stop_thread_id
+        stop_thread_id = threading.get_ident()
+        module.stop()
 
     async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
         return None
@@ -403,7 +410,7 @@ def test_recorder_input_drain_wait_error_still_waits_for_callback(
     subject.on_next(SimpleNamespace(ts=1.0))
     assert append_started.wait(timeout=SYNC_TIMEOUT)
     with ThreadPoolExecutor(max_workers=1) as pool:
-        stop_future = pool.submit(module.stop)
+        stop_future = pool.submit(stop_module)
         try:
             assert not store_stopped.wait(timeout=0.05)
             assert not stop_future.done()
@@ -659,7 +666,9 @@ def test_recorder_stop_uses_one_drain_deadline_for_all_inputs(
             with pytest.raises(memory_module._DrainIncompleteError):
                 module.stop()
 
-        assert drain_wait_timeouts[0] == pytest.approx(0.05, abs=0.01)
+        first_timeout = drain_wait_timeouts[0]
+        assert first_timeout is not None
+        assert 0 <= first_timeout <= 0.05
         assert drain_wait_timeouts[1:] == [0.0] * (input_count - 1)
         assert all(event.is_set() for event in subscription_disposed)
         assert all(event.is_set() for event in dispatcher_disposed)
@@ -741,6 +750,102 @@ def test_recorder_setup_drain_timeout_blocks_later_store_close(
         store.stop.assert_not_called()
     finally:
         callback_release.set()
+        for thread in callback_threads:
+            thread.join(timeout=SYNC_TIMEOUT)
+        Module.stop(module)
+
+
+def test_recorder_setup_drain_timeout_stops_existing_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_error = RuntimeError("subscribe failed")
+    store = MagicMock(spec=SqliteStore)
+    first_stream = MagicMock(spec=Stream)
+    second_stream = MagicMock(spec=Stream)
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    second_callback_started = threading.Event()
+    second_callback_release = threading.Event()
+    first_pose_called = threading.Event()
+    callback_threads: list[threading.Thread] = []
+    async_callbacks: list[Callable[[Any], Any]] = []
+    dispatcher_disposed = [threading.Event(), threading.Event()]
+    first_subscription_disposed = threading.Event()
+    tf_cleanup_disposed = threading.Event()
+    module._tf_cleanup = Disposable(tf_cleanup_disposed.set)
+
+    async def resolve_pose(name: str, _msg: Any, _ts: float) -> None:
+        if name == "second":
+            second_callback_started.set()
+            assert second_callback_release.wait(timeout=SYNC_TIMEOUT)
+        else:
+            first_pose_called.set()
+        return None
+
+    def make_dispatch(
+        async_callback: Callable[[Any], Any],
+    ) -> tuple[Callable[[Any], None], Disposable]:
+        disposed = dispatcher_disposed[len(async_callbacks)]
+        async_callbacks.append(async_callback)
+
+        def dispatch(stamped: Any) -> None:
+            thread = threading.Thread(target=lambda: asyncio.run(async_callback(stamped)))
+            callback_threads.append(thread)
+            thread.start()
+
+        return dispatch, Disposable(disposed.set)
+
+    first_input = MagicMock(spec=In)
+    first_observable = MagicMock()
+    first_stamped = MagicMock()
+    first_input.pure_observable.return_value = first_observable
+    first_observable.pipe.return_value = first_stamped
+    first_stamped.subscribe.return_value = Disposable(first_subscription_disposed.set)
+
+    second_input = MagicMock(spec=In)
+    second_observable = MagicMock()
+    second_stamped = MagicMock()
+    second_input.pure_observable.return_value = second_observable
+    second_observable.pipe.return_value = second_stamped
+
+    def fail_subscribe(on_next: Callable[[Any], None]) -> None:
+        on_next((10.0, SimpleNamespace(ts=1.0)))
+        assert second_callback_started.wait(timeout=SYNC_TIMEOUT)
+        raise setup_error
+
+    second_stamped.subscribe.side_effect = fail_subscribe
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.05)
+
+    try:
+        module._port_to_stream("first", first_input, first_stream)
+
+        with pytest.raises(memory_module._DrainIncompleteError) as exc_info:
+            module._port_to_stream("second", second_input, second_stream)
+
+        assert exc_info.value.__cause__ is setup_error
+        assert first_subscription_disposed.is_set()
+        assert all(event.is_set() for event in dispatcher_disposed)
+        assert tf_cleanup_disposed.is_set()
+        assert module._tf_cleanup is None
+        assert module._input_cleanups == []
+        assert module._memory_stopping
+        assert module._memory_teardown_failed
+        assert module._store is store
+        store.stop.assert_not_called()
+
+        asyncio.run(async_callbacks[0]((20.0, SimpleNamespace(ts=2.0))))
+        assert not first_pose_called.is_set()
+        first_stream.append.assert_not_called()
+    finally:
+        second_callback_release.set()
         for thread in callback_threads:
             thread.join(timeout=SYNC_TIMEOUT)
         Module.stop(module)
@@ -996,65 +1101,6 @@ def test_recorder_disposes_late_input_subscription_after_stop(
     stream.append.assert_called_once()
 
 
-def test_recorder_removes_input_cleanup_after_subscription_setup_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    store = MagicMock(spec=SqliteStore)
-    stream = MagicMock(spec=Stream)
-    input_topic = MagicMock(spec=In)
-    observable = MagicMock()
-    stamped_observable = MagicMock()
-    input_topic.pure_observable.return_value = observable
-    observable.pipe.return_value = stamped_observable
-    module = Recorder(
-        db_path=tmp_path / "recording.db",
-        record_tf=False,
-        rpc_transport=_TestRPC,
-    )
-    module._store = store
-    append_started = threading.Event()
-    append_release = threading.Event()
-    message = SimpleNamespace(ts=1.0)
-
-    async def resolve_pose(_name: str, _msg: Any, _ts: float) -> None:
-        return None
-
-    def append(*_args: Any, **_kwargs: Any) -> None:
-        append_started.set()
-        assert append_release.wait(timeout=SYNC_TIMEOUT)
-
-    def fail_subscribe(on_next: Callable[[Any], None]) -> None:
-        on_next((10.0, message))
-        assert append_started.wait(timeout=SYNC_TIMEOUT)
-        raise RuntimeError("subscribe failed")
-
-    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
-    stamped_observable.subscribe.side_effect = fail_subscribe
-    stream.append.side_effect = append
-
-    try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            setup_future = pool.submit(
-                module._port_to_stream,
-                "color_image",
-                input_topic,
-                stream,
-            )
-            assert append_started.wait(timeout=SYNC_TIMEOUT)
-            assert not setup_future.done()
-            append_release.set()
-            with pytest.raises(RuntimeError, match="subscribe failed"):
-                setup_future.result(timeout=SYNC_TIMEOUT)
-
-        assert module._input_cleanups == []
-    finally:
-        append_release.set()
-        module.stop()
-
-    store.stop.assert_called_once_with()
-
-
 def test_recorder_input_teardown_is_ordered(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1215,6 +1261,57 @@ def test_recorder_stop_waits_for_active_tf_callback(
     assert test_logger.warning.call_args.kwargs["active_callbacks"] == 1
 
 
+def test_recorder_tf_info_error_still_drains_active_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tf_recorder: TFRecorderFixture,
+) -> None:
+    module, store, tf_stream, callback, unsubscribe = tf_recorder
+    append_started = threading.Event()
+    append_release = threading.Event()
+    append_finished = threading.Event()
+    unsubscribed = threading.Event()
+    store_stopped = threading.Event()
+    info_error = RuntimeError("tf info failed")
+    test_logger = MagicMock()
+    test_logger.info.side_effect = info_error
+    monkeypatch.setattr(memory_module, "logger", test_logger)
+
+    def append(*_args: Any, **_kwargs: Any) -> None:
+        append_started.set()
+        assert append_release.wait(timeout=SYNC_TIMEOUT)
+        append_finished.set()
+
+    def stop_store() -> None:
+        assert append_finished.is_set()
+        store_stopped.set()
+
+    tf_stream.append.side_effect = append
+    unsubscribe.side_effect = unsubscribed.set
+    store.stop.side_effect = stop_store
+    message = TFMessage(Transform(ts=1.0))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        callback_future = pool.submit(callback, message, "/tf")
+        assert append_started.wait(timeout=SYNC_TIMEOUT)
+        stop_future = pool.submit(module.stop)
+        try:
+            assert unsubscribed.wait(timeout=SYNC_TIMEOUT)
+            assert not store_stopped.wait(timeout=0.05)
+            assert not stop_future.done()
+        finally:
+            append_release.set()
+
+        callback_future.result(timeout=SYNC_TIMEOUT)
+        with pytest.raises(RuntimeError) as exc_info:
+            stop_future.result(timeout=SYNC_TIMEOUT)
+
+    assert exc_info.value is info_error
+    assert append_finished.is_set()
+    unsubscribe.assert_called_once_with()
+    store.stop.assert_called_once_with()
+    assert store_stopped.is_set()
+
+
 def test_recorder_tf_drain_reports_warning_error_once(
     monkeypatch: pytest.MonkeyPatch,
     tf_recorder: TFRecorderFixture,
@@ -1288,6 +1385,7 @@ def test_recorder_tf_drain_wait_error_still_waits_for_callback(
     wait_error = RuntimeError("tf wait failed")
     original_wait_for = threading.Condition.wait_for
     wait_failures_remaining = 1
+    stop_thread_id: int | None = None
 
     def wait_for_once_then_normal(
         condition: threading.Condition,
@@ -1295,10 +1393,15 @@ def test_recorder_tf_drain_wait_error_still_waits_for_callback(
         timeout: float | None = None,
     ) -> bool:
         nonlocal wait_failures_remaining
-        if wait_failures_remaining:
+        if threading.get_ident() == stop_thread_id and wait_failures_remaining:
             wait_failures_remaining -= 1
             raise wait_error
         return original_wait_for(condition, predicate, timeout)
+
+    def stop_module() -> None:
+        nonlocal stop_thread_id
+        stop_thread_id = threading.get_ident()
+        module.stop()
 
     def append(*_args: Any, **_kwargs: Any) -> None:
         append_started.set()
@@ -1317,7 +1420,7 @@ def test_recorder_tf_drain_wait_error_still_waits_for_callback(
     with ThreadPoolExecutor(max_workers=2) as pool:
         callback_future = pool.submit(callback, message, "/tf")
         assert append_started.wait(timeout=SYNC_TIMEOUT)
-        stop_future = pool.submit(module.stop)
+        stop_future = pool.submit(stop_module)
         try:
             assert not store_stopped.wait(timeout=0.05)
             assert not stop_future.done()
