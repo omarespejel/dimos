@@ -152,6 +152,14 @@ TFRecorderFixture = tuple[
 SYNC_TIMEOUT: float = 2.0
 
 
+def _recorder_cleanup(
+    block: Callable[[], None] = lambda: None,
+    unsubscribe: Callable[[], None] = lambda: None,
+    drain: Callable[[], None] = lambda: None,
+) -> memory_module._RecorderCleanup:
+    return memory_module._RecorderCleanup(block, unsubscribe, drain)
+
+
 def test_recorder_default_drain_budget_uses_thread_shutdown_timeout() -> None:
     drain_timeouts = (
         memory_module._INPUT_DRAIN_TIMEOUT_SECONDS,
@@ -528,8 +536,8 @@ def test_recorder_drain_error_takes_precedence_over_cleanup_error(
     cleanup_error = RuntimeError("unsubscribe failed")
     drain_error = memory_module._DrainIncompleteError("drain still active")
     module._input_cleanups = [
-        Disposable(lambda: (_ for _ in ()).throw(cleanup_error)),
-        Disposable(lambda: (_ for _ in ()).throw(drain_error)),
+        _recorder_cleanup(unsubscribe=lambda: (_ for _ in ()).throw(cleanup_error)),
+        _recorder_cleanup(drain=lambda: (_ for _ in ()).throw(drain_error)),
     ]
 
     try:
@@ -826,7 +834,7 @@ def test_recorder_setup_drain_timeout_stops_existing_inputs(
     dispatcher_disposed = [threading.Event(), threading.Event()]
     first_subscription_disposed = threading.Event()
     tf_cleanup_disposed = threading.Event()
-    module._tf_cleanup = Disposable(tf_cleanup_disposed.set)
+    module._tf_cleanup = _recorder_cleanup(drain=tf_cleanup_disposed.set)
 
     async def resolve_pose(name: str, _msg: Any, _ts: float) -> None:
         if name == "second":
@@ -1676,8 +1684,8 @@ def test_recorder_cleanup_errors_complete_shutdown_and_preserve_first_error(
     assert exc_info.value is input_error
     assert events == [
         "input-unsubscribe",
-        "dispatcher",
         "tf-unsubscribe",
+        "dispatcher",
         "generic",
         "store",
     ]
@@ -1691,8 +1699,8 @@ def test_recorder_cleanup_errors_complete_shutdown_and_preserve_first_error(
 
     assert events == [
         "input-unsubscribe",
-        "dispatcher",
         "tf-unsubscribe",
+        "dispatcher",
         "generic",
         "store",
     ]
@@ -1726,8 +1734,8 @@ def test_recorder_restores_fresh_cleanup_state(tmp_path: Path) -> None:
         record_tf=False,
         rpc_transport=_TestRPC,
     )
-    module._input_cleanups.append(Disposable())
-    module._tf_cleanup = Disposable()
+    module._input_cleanups.append(_recorder_cleanup())
+    module._tf_cleanup = _recorder_cleanup()
     module._callback_drain_deadline = 123.0
 
     state = module.__getstate__()
@@ -2159,7 +2167,7 @@ def test_recorder_recursive_stop_from_input_cleanup_closes_store_last(
         module.stop()
         events.append("cleanup-finish")
 
-    module._input_cleanups.append(Disposable(recursive_cleanup))
+    module._input_cleanups.append(_recorder_cleanup(unsubscribe=recursive_cleanup))
 
     module.stop()
 

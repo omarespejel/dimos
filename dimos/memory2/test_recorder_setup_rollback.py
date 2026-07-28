@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -27,6 +29,7 @@ from unittest.mock import MagicMock
 import pytest
 from reactivex.disposable import Disposable
 
+from dimos.core.module import Module
 from dimos.core.stream import In
 from dimos.memory2 import module as memory_module
 from dimos.memory2.module import Recorder
@@ -212,4 +215,248 @@ def test_recorder_removes_input_cleanup_after_subscription_setup_fails(
         module.stop()
 
     store.stop.assert_called_once_with()
+    assert store_stopped.is_set()
+
+
+def test_recorder_callback_gate_error_keeps_store_open(tmp_path: Path) -> None:
+    store = MagicMock(spec=SqliteStore)
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    gate_error = RuntimeError("callback gate failed")
+    module._input_cleanups = [
+        memory_module._RecorderCleanup(
+            lambda: (_ for _ in ()).throw(gate_error),
+            lambda: None,
+            lambda: None,
+        )
+    ]
+
+    try:
+        with pytest.raises(
+            memory_module._DrainIncompleteError,
+            match="Failed to block recorder callbacks",
+        ) as exc_info:
+            module.stop()
+
+        assert exc_info.value.__cause__ is gate_error
+        store.stop.assert_not_called()
+        assert module._store is store
+        assert module._memory_teardown_failed
+        assert not module._memory_stopped.is_set()
+    finally:
+        Module.stop(module)
+
+
+def test_recorder_stop_blocks_all_inputs_before_draining_any(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = MagicMock(spec=SqliteStore)
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    first_stream = MagicMock(spec=Stream)
+    second_stream = MagicMock(spec=Stream)
+    callbacks: list[Callable[[Any], Any]] = []
+    first_started = threading.Event()
+    first_release = threading.Event()
+    second_started = threading.Event()
+    first_unsubscribed = threading.Event()
+    second_unsubscribed = threading.Event()
+    stop_errors: list[BaseException] = []
+
+    async def resolve_pose(name: str, _msg: Any, _ts: float) -> None:
+        if name == "first":
+            first_started.set()
+            assert first_release.wait(timeout=SYNC_TIMEOUT)
+        else:
+            second_started.set()
+        return None
+
+    def make_dispatch(
+        async_callback: Callable[[Any], Any],
+    ) -> tuple[Callable[[Any], None], Disposable]:
+        callbacks.append(async_callback)
+
+        def dispatch(stamped: Any) -> None:
+            threading.Thread(target=lambda: asyncio.run(async_callback(stamped))).start()
+
+        return dispatch, Disposable()
+
+    def make_input(on_dispose: Callable[[], None]) -> MagicMock:
+        input_topic = MagicMock(spec=In)
+        observable = MagicMock()
+        stamped = MagicMock()
+        input_topic.pure_observable.return_value = observable
+        observable.pipe.return_value = stamped
+        stamped.subscribe.return_value = Disposable(on_dispose)
+        return input_topic
+
+    def stop_module() -> None:
+        try:
+            module.stop()
+        except BaseException as exc:
+            stop_errors.append(exc)
+
+    monkeypatch.setattr(module, "_resolve_pose", resolve_pose)
+    monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
+    monkeypatch.setattr(memory_module, "_INPUT_DRAIN_TIMEOUT_SECONDS", 0.5)
+    module._port_to_stream("first", make_input(first_unsubscribed.set), first_stream)
+    module._port_to_stream("second", make_input(second_unsubscribed.set), second_stream)
+
+    first_thread = threading.Thread(
+        target=lambda: asyncio.run(callbacks[0]((10.0, SimpleNamespace(ts=1.0))))
+    )
+    second_thread: threading.Thread | None = None
+    stop_thread = threading.Thread(target=stop_module)
+    try:
+        first_thread.start()
+        assert first_started.wait(timeout=SYNC_TIMEOUT)
+        stop_thread.start()
+        assert first_unsubscribed.wait(timeout=SYNC_TIMEOUT)
+        assert second_unsubscribed.wait(timeout=SYNC_TIMEOUT)
+
+        second_thread = threading.Thread(
+            target=lambda: asyncio.run(callbacks[1]((20.0, SimpleNamespace(ts=2.0))))
+        )
+        second_thread.start()
+        second_thread.join(timeout=SYNC_TIMEOUT)
+        assert not second_thread.is_alive()
+        first_release.set()
+        stop_thread.join(timeout=SYNC_TIMEOUT)
+
+        assert not stop_thread.is_alive()
+        assert not second_started.is_set()
+        assert stop_errors == []
+        second_stream.append.assert_not_called()
+        store.stop.assert_called_once_with()
+    finally:
+        first_release.set()
+        first_thread.join(timeout=SYNC_TIMEOUT)
+        if second_thread is not None:
+            second_thread.join(timeout=SYNC_TIMEOUT)
+        stop_thread.join(timeout=SYNC_TIMEOUT)
+        with suppress(BaseException):
+            Module.stop(module)
+
+
+def test_recorder_stop_waits_for_input_stream_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class InputRecorder(Recorder):
+        color_image: In[int]
+
+    store = MagicMock(spec=SqliteStore)
+    stream = MagicMock(spec=Stream)
+    stream_started = threading.Event()
+    stream_release = threading.Event()
+    stream_finished = threading.Event()
+    stop_started = threading.Event()
+    store_stopped = threading.Event()
+
+    def open_stream(*_args: Any, **_kwargs: Any) -> MagicMock:
+        stream_started.set()
+        assert stream_release.wait(timeout=SYNC_TIMEOUT)
+        stream_finished.set()
+        return stream
+
+    def stop_store() -> None:
+        store_stopped.set()
+        assert stream_finished.is_set()
+
+    store.stream.side_effect = open_stream
+    store.stop.side_effect = stop_store
+    module = InputRecorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    monkeypatch.setattr(module, "_port_to_stream", MagicMock())
+
+    def stop_module() -> None:
+        stop_started.set()
+        module.stop()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            start_future = pool.submit(module.start)
+            assert stream_started.wait(timeout=SYNC_TIMEOUT)
+            stop_future = pool.submit(stop_module)
+            try:
+                assert stop_started.wait(timeout=SYNC_TIMEOUT)
+                assert not store_stopped.wait(timeout=0.05)
+            finally:
+                stream_release.set()
+
+            start_future.result(timeout=SYNC_TIMEOUT)
+            stop_future.result(timeout=SYNC_TIMEOUT)
+    finally:
+        stream_release.set()
+        with suppress(BaseException):
+            module.stop()
+
+    store.stop.assert_called_once_with()
+    assert store_stopped.is_set()
+
+
+def test_recorder_stop_waits_for_append_stream_preparation(tmp_path: Path) -> None:
+    store = MagicMock(spec=SqliteStore)
+    prepare_started = threading.Event()
+    prepare_release = threading.Event()
+    prepare_finished = threading.Event()
+    stop_started = threading.Event()
+    store_stopped = threading.Event()
+
+    def delete_stream(_name: str) -> None:
+        prepare_started.set()
+        assert prepare_release.wait(timeout=SYNC_TIMEOUT)
+        prepare_finished.set()
+
+    def stop_store() -> None:
+        store_stopped.set()
+        assert prepare_finished.is_set()
+
+    store.list_streams.return_value = ["tf"]
+    store.delete_stream.side_effect = delete_stream
+    store.stop.side_effect = stop_store
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        on_existing=memory_module.OnExisting.APPEND,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+
+    def stop_module() -> None:
+        stop_started.set()
+        module.stop()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            prepare_future = pool.submit(module._prepare_streams)
+            assert prepare_started.wait(timeout=SYNC_TIMEOUT)
+            stop_future = pool.submit(stop_module)
+            try:
+                assert stop_started.wait(timeout=SYNC_TIMEOUT)
+                assert not store_stopped.wait(timeout=0.05)
+            finally:
+                prepare_release.set()
+
+            prepare_future.result(timeout=SYNC_TIMEOUT)
+            stop_future.result(timeout=SYNC_TIMEOUT)
+    finally:
+        prepare_release.set()
+        with suppress(BaseException):
+            module.stop()
+
+    store.stop.assert_called_once_with()
+    store.delete_stream.assert_called_once_with("tf")
     assert store_stopped.is_set()
