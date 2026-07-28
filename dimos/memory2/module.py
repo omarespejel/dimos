@@ -19,16 +19,17 @@ import enum
 import inspect
 import os
 from pathlib import Path
-import sqlite3
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 from pydantic import Field, field_validator
 from reactivex import operators as ops
-from reactivex.disposable import Disposable
+from reactivex.abc import DisposableBase
+from reactivex.disposable import Disposable, SingleAssignmentDisposable
 
 from dimos.agents.annotation import skill
-from dimos.constants import DIMOS_PROJECT_ROOT
+from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT, DIMOS_PROJECT_ROOT
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.memory2.embed import EmbedImages
@@ -45,16 +46,29 @@ from dimos.utils.data import backup_file
 from dimos.utils.logging_config import setup_logger
 
 if TYPE_CHECKING:
-    from reactivex.abc import DisposableBase
-
     from dimos.core.stream import In, Out
     from dimos.msgs.geometry_msgs.Pose import Pose
 
 logger = setup_logger()
 
+# The run registry and PythonWorker escalate process shutdown after five seconds.
+# Use the standard thread shutdown budget so a failed drain surfaces before then.
+_INPUT_DRAIN_LOG_INTERVAL_SECONDS: float = 1.0
+_INPUT_DRAIN_TIMEOUT_SECONDS: float = DEFAULT_THREAD_JOIN_TIMEOUT
+_TF_DRAIN_LOG_INTERVAL_SECONDS: float = 1.0
+_TF_DRAIN_TIMEOUT_SECONDS: float = DEFAULT_THREAD_JOIN_TIMEOUT
+
 T = TypeVar("T")
 TIn = TypeVar("TIn")
 TOut = TypeVar("TOut")
+
+
+class _DrainIncompleteError(RuntimeError):
+    pass
+
+
+def _now() -> float:
+    return time.time()
 
 
 def stream_to_port(stream: Stream[T], out: Out[T]) -> DisposableBase:
@@ -183,16 +197,115 @@ class MemoryModule(Module):
     config: MemoryModuleConfig
     _store: SqliteStore | None = None
 
+    def __init__(self, **kwargs: Any) -> None:
+        self._memory_stop_lock = threading.RLock()
+        self._memory_stopping = False
+        self._memory_stopped = threading.Event()
+        self._memory_stop_active = False
+        self._memory_teardown_failed = False
+        super().__init__(**kwargs)
+
+    def __getstate__(self) -> dict[str, Any]:
+        # ModuleBase's pickle hook is intentionally untyped.
+        state: dict[str, Any] = super().__getstate__()  # type: ignore[no-untyped-call]
+        state.pop("_memory_stop_lock", None)
+        state.pop("_memory_stopping", None)
+        state.pop("_memory_stopped", None)
+        state.pop("_memory_stop_active", None)
+        state.pop("_memory_teardown_failed", None)
+        state.pop("_store", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        self._memory_stop_lock = threading.RLock()
+        self._memory_stopping = self._module_closed
+        self._memory_stopped = threading.Event()
+        self._memory_stop_active = False
+        self._memory_teardown_failed = False
+        if self._module_closed:
+            self._memory_stopped.set()
+        self._store = None
+
+    def _open_store(self, path: str | Path) -> SqliteStore:
+        with self._memory_stop_lock:
+            if self._memory_stopping:
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+            if self._store is not None:
+                raise RuntimeError("Memory store is already open")
+
+            store = SqliteStore(path=str(path))
+            store.start()
+            self._store = store
+            return store
+
     @property
     def store(self) -> SqliteStore:
-        if self._store is not None:
-            return self._store
+        with self._memory_stop_lock:
+            if self._memory_stopping:
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+            if self._store is not None:
+                return self._store
 
-        self._store = self.register_disposable(
-            SqliteStore(path=str(self.config.db_path)),
-        )
-        self._store.start()
-        return self._store
+            return self._open_store(self.config.db_path)
+
+    def _before_memory_stop(self) -> None:
+        pass
+
+    @rpc
+    def stop(self) -> None:
+        # Keep concurrent RPC and worker shutdown calls in the same critical
+        # section so neither can close the store while the other is disposing
+        # subscriptions.
+        with self._memory_stop_lock:
+            if self._memory_stopped.is_set():
+                return
+            if self._memory_teardown_failed:
+                raise RuntimeError(
+                    f"{type(self).__name__} teardown previously failed; "
+                    "refusing to close the memory store"
+                )
+            if self._memory_stop_active:
+                return
+            self._memory_stop_active = True
+            try:
+                self._memory_stopping = True
+                first_error: BaseException | None = None
+
+                try:
+                    self._before_memory_stop()
+                except _DrainIncompleteError:
+                    self._memory_teardown_failed = True
+                    raise
+                except BaseException as exc:
+                    first_error = exc
+
+                try:
+                    super().stop()
+                except BaseException:
+                    self._memory_teardown_failed = True
+                    if first_error is not None:
+                        raise first_error
+                    raise
+
+                store = self._store
+                if store is not None:
+                    try:
+                        store.stop()
+                    except BaseException:
+                        if first_error is not None:
+                            logger.exception("Memory store shutdown failed during teardown")
+                            raise first_error
+                        raise
+                    else:
+                        self._store = None
+
+                self._memory_stopped.set()
+
+                if first_error is not None:
+                    raise first_error
+            finally:
+                self._memory_stop_active = False
 
 
 class SemanticSearchConfig(MemoryModuleConfig):
@@ -321,6 +434,81 @@ class Recorder(MemoryModule):
     config: RecorderConfig
 
     _pose_setters: dict[str, Any] = {}
+    _tf_cleanup: DisposableBase | None = None
+
+    def __init__(self, **kwargs: Any) -> None:
+        # Let setup rollback drain outside the memory lock without racing stop().
+        self._input_cleanup_lock = threading.RLock()
+        self._input_cleanups: list[DisposableBase] = []
+        self._callback_drain_deadline: float | None = None
+        super().__init__(**kwargs)
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = super().__getstate__()
+        state.pop("_input_cleanup_lock", None)
+        state.pop("_input_cleanups", None)
+        state.pop("_tf_cleanup", None)
+        state.pop("_callback_drain_deadline", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        self._input_cleanup_lock = threading.RLock()
+        self._input_cleanups = []
+        self._tf_cleanup = None
+        self._callback_drain_deadline = None
+
+    @rpc
+    def stop(self) -> None:
+        with self._input_cleanup_lock:
+            super().stop()
+
+    def _before_memory_stop(self) -> None:
+        input_cleanups, self._input_cleanups = self._input_cleanups, []
+        tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
+        cleanups = [*input_cleanups]
+        drain_timeouts: list[float] = []
+        if input_cleanups:
+            drain_timeouts.append(_INPUT_DRAIN_TIMEOUT_SECONDS)
+        if tf_cleanup is not None:
+            cleanups.append(tf_cleanup)
+            drain_timeouts.append(_TF_DRAIN_TIMEOUT_SECONDS)
+        self._callback_drain_deadline = (
+            time.monotonic() + max(drain_timeouts) if drain_timeouts else None
+        )
+        first_error: BaseException | None = None
+        drain_error: _DrainIncompleteError | None = None
+
+        def record_error(exc: BaseException) -> None:
+            nonlocal drain_error, first_error
+            if isinstance(exc, _DrainIncompleteError) and drain_error is None:
+                drain_error = exc
+                self._callback_drain_deadline = time.monotonic()
+            if first_error is None or (
+                not isinstance(exc, _DrainIncompleteError)
+                and isinstance(first_error, _DrainIncompleteError)
+            ):
+                first_error = exc
+
+        try:
+            for cleanup in cleanups:
+                try:
+                    cleanup.dispose()
+                except BaseException as exc:
+                    record_error(exc)
+            try:
+                super()._before_memory_stop()
+            except BaseException as exc:
+                record_error(exc)
+
+            if drain_error is not None:
+                if first_error is not None and first_error is not drain_error:
+                    raise drain_error from first_error
+                raise drain_error
+            if first_error is not None:
+                raise first_error
+        finally:
+            self._callback_drain_deadline = None
 
     @rpc
     def start(self) -> None:
@@ -378,26 +566,212 @@ class Recorder(MemoryModule):
         so every observation gets a robot-pose anchor when tf is publishing.
 
         Each port is recorded by an async callback dispatched on the module's
-        event loop via :meth:`process_observable`, which serialises invocations
-        and registers the subscription for cleanup on stop().
+        event loop. Shutdown stops new callbacks, unsubscribes, and waits up to
+        the shared drain deadline for admitted callbacks to finish before
+        cancelling the dispatcher. If a callback remains active, shutdown
+        fails without closing the store.
         """
 
-        async def on_msg(stamped: tuple[float, Any]) -> None:
-            recv_ts, msg = stamped
-            ts = self._resolve_ts(name, msg)
-            pose = await self._resolve_pose(name, msg, ts)
-            if not pose and name not in self.config.poseless_streams:
-                logger.warning(
-                    "[%s] No pose for time %s (msg ts: %s), storing without pose",
-                    name,
-                    ts,
-                    getattr(msg, "ts", None),
-                )
-            stream.append(msg, ts=ts, pose=pose, tags={"reception_ts": recv_ts})
+        callback_state = threading.Condition()
+        accepting_callbacks = True
+        active_callbacks = 0
 
-        # Stamp arrival time before the coalescing dispatch queue.
-        stamped = input_topic.pure_observable().pipe(ops.map(lambda msg: (time.time(), msg)))
-        self.process_observable(stamped, on_msg)
+        rx_subscription = SingleAssignmentDisposable()
+        dispatcher = SingleAssignmentDisposable()
+
+        def stop_input() -> None:
+            nonlocal accepting_callbacks
+            with callback_state:
+                accepting_callbacks = False
+            first_error: BaseException | None = None
+            drain_error: _DrainIncompleteError | None = None
+
+            def record_error(exc: BaseException) -> None:
+                nonlocal drain_error, first_error
+                if isinstance(exc, _DrainIncompleteError) and drain_error is None:
+                    drain_error = exc
+                if first_error is None or (
+                    not isinstance(exc, _DrainIncompleteError)
+                    and isinstance(first_error, _DrainIncompleteError)
+                ):
+                    first_error = exc
+
+            try:
+                rx_subscription.dispose()
+            except BaseException as exc:
+                record_error(exc)
+
+            try:
+                drain_callbacks()
+            except BaseException as exc:
+                record_error(exc)
+
+            try:
+                dispatcher.dispose()
+            except BaseException as exc:
+                record_error(exc)
+
+            if drain_error is not None:
+                if first_error is not None and first_error is not drain_error:
+                    raise drain_error from first_error
+                raise drain_error
+            if first_error is not None:
+                raise first_error
+
+        async def on_msg(stamped: tuple[float, Any]) -> None:
+            nonlocal active_callbacks
+            with callback_state:
+                if not accepting_callbacks:
+                    return
+                active_callbacks += 1
+            try:
+                recv_ts, msg = stamped
+                ts = self._resolve_ts(name, msg)
+                pose = await self._resolve_pose(name, msg, ts)
+                if not pose and name not in self.config.poseless_streams:
+                    logger.warning(
+                        "[%s] No pose for time %s (msg ts: %s), storing without pose",
+                        name,
+                        ts,
+                        getattr(msg, "ts", None),
+                    )
+                stream.append(msg, ts=ts, pose=pose, tags={"reception_ts": recv_ts})
+            finally:
+                with callback_state:
+                    active_callbacks -= 1
+                    if active_callbacks == 0:
+                        callback_state.notify_all()
+
+        def drain_callbacks() -> None:
+            wait_started = time.monotonic()
+            deadline = wait_started + _INPUT_DRAIN_TIMEOUT_SECONDS
+            if self._callback_drain_deadline is not None:
+                deadline = min(deadline, self._callback_drain_deadline)
+            first_error: BaseException | None = None
+            log_waits = True
+
+            def callbacks_drained() -> bool:
+                return active_callbacks == 0
+
+            while True:
+                wait_timeout = min(
+                    _INPUT_DRAIN_LOG_INTERVAL_SECONDS,
+                    max(0.0, deadline - time.monotonic()),
+                )
+                try:
+                    with callback_state:
+                        if callback_state.wait_for(
+                            callbacks_drained,
+                            timeout=wait_timeout,
+                        ):
+                            break
+                        remaining_callbacks = active_callbacks
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    try:
+                        with callback_state:
+                            if callbacks_drained():
+                                break
+                            remaining_callbacks = active_callbacks
+                            wait_timeout = min(
+                                _INPUT_DRAIN_LOG_INTERVAL_SECONDS,
+                                max(0.0, deadline - time.monotonic()),
+                            )
+                            if wait_timeout > 0:
+                                callback_state.wait(timeout=wait_timeout)
+                    except BaseException as recovery_exc:
+                        if first_error is None:
+                            first_error = recovery_exc
+                        raise _DrainIncompleteError(
+                            f"Failed waiting for recorder input callbacks for {name}"
+                        ) from first_error
+                if time.monotonic() >= deadline:
+                    raise _DrainIncompleteError(
+                        f"Timed out waiting for recorder input callbacks for {name}"
+                    ) from first_error
+                if log_waits:
+                    try:
+                        logger.warning(
+                            "Still waiting for recorder input callbacks",
+                            input_name=name,
+                            active_callbacks=remaining_callbacks,
+                            elapsed_seconds=time.monotonic() - wait_started,
+                        )
+                    except BaseException as exc:
+                        if first_error is None:
+                            first_error = exc
+                        log_waits = False
+
+            if first_error is not None:
+                raise first_error
+
+        # Install the safety cleanup before starting the dispatcher. Make the
+        # dispatcher available to stop() before subscribing; a subscription
+        # returned after stop is disposed immediately by its assignment slot.
+        input_cleanup = Disposable(stop_input)
+        with self._memory_stop_lock:
+            if self._memory_stopping:
+                input_cleanup.dispose()
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+            self._input_cleanups.append(input_cleanup)
+        try:
+            on_next, dispatcher_disposable = self._make_async_dispatch(on_msg)
+            with callback_state:
+                shutdown_won = not accepting_callbacks
+                if not shutdown_won:
+                    dispatcher.disposable = dispatcher_disposable
+            if shutdown_won:
+                dispatcher_disposable.dispose()
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+
+            # Stamp arrival time before the coalescing dispatch queue.
+            def stamp_reception(msg: Any) -> tuple[float, Any]:
+                return _now(), msg
+
+            stamped = input_topic.pure_observable().pipe(ops.map(stamp_reception))
+            observable_subscription = stamped.subscribe(on_next)
+        except BaseException as setup_error:
+            drain_error: _DrainIncompleteError | None = None
+            remaining_cleanups: list[DisposableBase] = []
+            with self._input_cleanup_lock:
+                with self._memory_stop_lock:
+                    cleanup_owned = input_cleanup in self._input_cleanups
+                    if cleanup_owned:
+                        self._input_cleanups.remove(input_cleanup)
+                if cleanup_owned:
+                    try:
+                        input_cleanup.dispose()
+                    except _DrainIncompleteError as exc:
+                        drain_error = exc
+                    except BaseException:
+                        logger.exception("Failed to clean up recorder input after setup error")
+
+                if drain_error is not None:
+                    with self._memory_stop_lock:
+                        self._memory_stopping = True
+                        self._memory_teardown_failed = True
+                        remaining_cleanups, self._input_cleanups = self._input_cleanups, []
+                        tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
+                        if tf_cleanup is not None:
+                            remaining_cleanups.append(tf_cleanup)
+                        self._callback_drain_deadline = time.monotonic()
+                    try:
+                        for cleanup in remaining_cleanups:
+                            try:
+                                cleanup.dispose()
+                            except BaseException:
+                                try:
+                                    logger.exception(
+                                        "Failed to stop recorder input after setup drain failure"
+                                    )
+                                except BaseException:
+                                    pass
+                    finally:
+                        self._callback_drain_deadline = None
+                    raise drain_error from setup_error
+            raise
+        rx_subscription.disposable = observable_subscription
 
     def _prepare_streams(self) -> None:
         """On APPEND, drop the streams this recorder is about to (re)write — the
@@ -413,7 +787,7 @@ class Recorder(MemoryModule):
 
     def _resolve_ts(self, name: str, msg: Any) -> float:
         """Timestamp to record *msg* at. Override to re-base onto another clock."""
-        return getattr(msg, "ts", None) or time.time()
+        return getattr(msg, "ts", None) or _now()
 
     async def _resolve_pose(self, name: str, msg: Any, ts: float) -> Pose | None:
         """Pose to anchor *msg* with. Dispatches to the stream's (async)
@@ -439,19 +813,147 @@ class Recorder(MemoryModule):
 
     def _record_tf(self) -> None:
         """Record the live tf stream under "tf" (no-op without a pubsub tf)."""
-        topic = getattr(self.tf.config, "topic", None)
-        pubsub = getattr(self.tf, "pubsub", None)
+        with self._memory_stop_lock:
+            if self._memory_stopping:
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+            tf = self.tf
+            topic = getattr(tf.config, "topic", None)
+            pubsub = getattr(tf, "pubsub", None)
         if not topic or pubsub is None:
             logger.warning("Recorder: no pubsub tf available — not recording tf")
             return
-        tf_stream = self.store.stream("tf", TFMessage)
+        callback_state = threading.Condition()
+        accepting_callbacks = True
+        active_callbacks = 0
+        unsubscribe: Callable[[], None] | None = None
+        tf_stream: Stream[TFMessage] | None = None
 
         def on_tf(msg: TFMessage, _topic: Any) -> None:
+            nonlocal active_callbacks
+            with callback_state:
+                if not accepting_callbacks:
+                    return
+                active_callbacks += 1
             try:
+                assert tf_stream is not None
                 for transform in msg.transforms:
                     tf_stream.append(TFMessage(transform), ts=transform.ts, pose=None)
-            except sqlite3.ProgrammingError:
-                # A late LCM callback raced teardown and hit the closed store.
-                pass
+            finally:
+                with callback_state:
+                    active_callbacks -= 1
+                    if active_callbacks == 0:
+                        callback_state.notify_all()
 
-        self.register_disposable(Disposable(pubsub.subscribe(topic, on_tf)))
+        def unsubscribe_and_drain() -> None:
+            nonlocal accepting_callbacks
+            with callback_state:
+                accepting_callbacks = False
+                unsubscribe_now = unsubscribe
+                active_at_unsubscribe = active_callbacks
+            first_error: BaseException | None = None
+            drain_error: _DrainIncompleteError | None = None
+
+            def record_error(exc: BaseException) -> None:
+                nonlocal drain_error, first_error
+                if isinstance(exc, _DrainIncompleteError) and drain_error is None:
+                    drain_error = exc
+                if first_error is None or (
+                    not isinstance(exc, _DrainIncompleteError)
+                    and isinstance(first_error, _DrainIncompleteError)
+                ):
+                    first_error = exc
+
+            try:
+                logger.info(
+                    "Stopping tf recording",
+                    active_callbacks=active_at_unsubscribe,
+                    unsubscribe_installed=unsubscribe_now is not None,
+                )
+            except BaseException as exc:
+                record_error(exc)
+
+            try:
+                if unsubscribe_now is not None:
+                    unsubscribe_now()
+            except BaseException as exc:
+                record_error(exc)
+
+            wait_started = time.monotonic()
+            deadline = wait_started + _TF_DRAIN_TIMEOUT_SECONDS
+            if self._callback_drain_deadline is not None:
+                deadline = min(deadline, self._callback_drain_deadline)
+            log_waits = True
+            while True:
+                wait_timeout = min(
+                    _TF_DRAIN_LOG_INTERVAL_SECONDS,
+                    max(0.0, deadline - time.monotonic()),
+                )
+                try:
+                    with callback_state:
+                        if callback_state.wait_for(
+                            lambda: active_callbacks == 0,
+                            timeout=wait_timeout,
+                        ):
+                            break
+                        remaining_callbacks = active_callbacks
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    try:
+                        with callback_state:
+                            if active_callbacks == 0:
+                                break
+                            remaining_callbacks = active_callbacks
+                            wait_timeout = min(
+                                _TF_DRAIN_LOG_INTERVAL_SECONDS,
+                                max(0.0, deadline - time.monotonic()),
+                            )
+                            if wait_timeout > 0:
+                                callback_state.wait(timeout=wait_timeout)
+                    except BaseException as recovery_exc:
+                        if first_error is None:
+                            first_error = recovery_exc
+                        raise _DrainIncompleteError(
+                            "Failed waiting for tf callbacks"
+                        ) from first_error
+                if time.monotonic() >= deadline:
+                    raise _DrainIncompleteError(
+                        "Timed out waiting for tf callbacks"
+                    ) from first_error
+                if log_waits:
+                    try:
+                        logger.warning(
+                            "Still waiting for tf callbacks",
+                            active_callbacks=remaining_callbacks,
+                            elapsed_seconds=time.monotonic() - wait_started,
+                        )
+                    except BaseException as exc:
+                        if first_error is None:
+                            first_error = exc
+                        log_waits = False
+
+            if drain_error is not None:
+                if first_error is not None and first_error is not drain_error:
+                    raise drain_error from first_error
+                raise drain_error
+            if first_error is not None:
+                raise first_error
+
+        cleanup = Disposable(unsubscribe_and_drain)
+        with self._memory_stop_lock:
+            if self._memory_stopping:
+                cleanup.dispose()
+                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+            self._tf_cleanup = cleanup
+            self.register_disposable(cleanup)
+            tf_stream = self.store.stream("tf", TFMessage)
+
+        returned_unsubscribe = pubsub.subscribe(topic, on_tf)
+        with callback_state:
+            if accepting_callbacks:
+                unsubscribe = returned_unsubscribe
+                unsubscribe_now = None
+            else:
+                unsubscribe_now = returned_unsubscribe
+        if unsubscribe_now is not None:
+            unsubscribe_now()
