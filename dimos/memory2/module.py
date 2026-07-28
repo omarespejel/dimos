@@ -325,7 +325,17 @@ class MemoryModule(Module):
                 try:
                     self._before_memory_stop()
                 except _DrainIncompleteError:
+                    # The callback may still depend on the module loop or ports.
+                    # Leave the runtime and store alive so it can finish.
                     self._memory_teardown_failed = True
+                    try:
+                        logger.error(
+                            "Memory callback drain failed; leaving module runtime and store open",
+                            module=type(self).__name__,
+                            action="force-stop the worker if shutdown must complete",
+                        )
+                    except BaseException:
+                        pass
                     raise
                 except BaseException as exc:
                     first_error = exc
@@ -969,6 +979,10 @@ class Recorder(MemoryModule):
             if self._callback_drain_deadline is not None:
                 deadline = min(deadline, self._callback_drain_deadline)
             log_waits = True
+
+            def callbacks_drained() -> bool:
+                return active_callbacks == 0
+
             while True:
                 wait_timeout = min(
                     _TF_DRAIN_LOG_INTERVAL_SECONDS,
@@ -977,7 +991,7 @@ class Recorder(MemoryModule):
                 try:
                     with callback_state:
                         if callback_state.wait_for(
-                            lambda: active_callbacks == 0,
+                            callbacks_drained,
                             timeout=wait_timeout,
                         ):
                             break
@@ -1030,7 +1044,50 @@ class Recorder(MemoryModule):
             self.register_disposable(cleanup)
             tf_stream = self.store.stream("tf", TFMessage)
 
-        returned_unsubscribe = pubsub.subscribe(topic, on_tf)
+        try:
+            returned_unsubscribe = pubsub.subscribe(topic, on_tf)
+        except BaseException as setup_error:
+            drain_error: _DrainIncompleteError | None = None
+            remaining_cleanups: list[_RecorderCleanup] = []
+            with self._input_cleanup_lock:
+                with self._memory_stop_lock:
+                    cleanup_owned = self._tf_cleanup is cleanup
+                    if cleanup_owned:
+                        self._tf_cleanup = None
+                if cleanup_owned:
+                    try:
+                        cleanup.dispose()
+                    except _DrainIncompleteError as exc:
+                        drain_error = exc
+                    except BaseException:
+                        try:
+                            logger.exception("Failed to clean up tf after setup error")
+                        except BaseException:
+                            pass
+
+                if drain_error is not None:
+                    with self._memory_stop_lock:
+                        self._memory_stopping = True
+                        self._memory_teardown_failed = True
+                        remaining_cleanups, self._input_cleanups = self._input_cleanups, []
+                        tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
+                        if tf_cleanup is not None:
+                            remaining_cleanups.append(tf_cleanup)
+                        self._callback_drain_deadline = time.monotonic()
+                    try:
+                        try:
+                            self._dispose_recorder_cleanups(remaining_cleanups)
+                        except BaseException:
+                            try:
+                                logger.exception(
+                                    "Failed to stop recorder after tf setup drain failure"
+                                )
+                            except BaseException:
+                                pass
+                    finally:
+                        self._callback_drain_deadline = None
+                    raise drain_error from setup_error
+            raise
         with callback_state:
             if accepting_callbacks:
                 unsubscribe = returned_unsubscribe

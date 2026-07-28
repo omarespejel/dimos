@@ -152,10 +152,21 @@ TFRecorderFixture = tuple[
 SYNC_TIMEOUT: float = 2.0
 
 
+def _noop() -> None:
+    pass
+
+
+def _raising(error: BaseException) -> Callable[[], None]:
+    def raise_error() -> None:
+        raise error
+
+    return raise_error
+
+
 def _recorder_cleanup(
-    block: Callable[[], None] = lambda: None,
-    unsubscribe: Callable[[], None] = lambda: None,
-    drain: Callable[[], None] = lambda: None,
+    block: Callable[[], None] = _noop,
+    unsubscribe: Callable[[], None] = _noop,
+    drain: Callable[[], None] = _noop,
 ) -> memory_module._RecorderCleanup:
     return memory_module._RecorderCleanup(block, unsubscribe, drain)
 
@@ -450,7 +461,7 @@ def test_recorder_input_drain_wait_error_still_waits_for_callback(
     assert store_stopped.is_set()
 
 
-def test_recorder_input_drain_timeout_keeps_store_open(
+def test_recorder_input_drain_timeout_keeps_store_and_module_runtime_open(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -511,6 +522,14 @@ def test_recorder_input_drain_timeout_keeps_store_open(
         assert module._store is store
         assert module._memory_teardown_failed
         assert not module._memory_stopped.is_set()
+        assert not module._module_closed
+        assert module._loop_thread is not None
+        assert module._loop_thread.is_alive()
+        test_logger.error.assert_called_once_with(
+            "Memory callback drain failed; leaving module runtime and store open",
+            module="Recorder",
+            action="force-stop the worker if shutdown must complete",
+        )
     finally:
         allow_store_touch.set()
         if stop_thread is not None:
@@ -536,8 +555,8 @@ def test_recorder_drain_error_takes_precedence_over_cleanup_error(
     cleanup_error = RuntimeError("unsubscribe failed")
     drain_error = memory_module._DrainIncompleteError("drain still active")
     module._input_cleanups = [
-        _recorder_cleanup(unsubscribe=lambda: (_ for _ in ()).throw(cleanup_error)),
-        _recorder_cleanup(drain=lambda: (_ for _ in ()).throw(drain_error)),
+        _recorder_cleanup(unsubscribe=_raising(cleanup_error)),
+        _recorder_cleanup(drain=_raising(drain_error)),
     ]
 
     try:
@@ -1273,12 +1292,20 @@ def test_recorder_stop_waits_for_active_tf_callback(
     unsubscribed = threading.Event()
     store_stopped = threading.Event()
     warning_logged = threading.Event()
+    recorded_messages: list[TFMessage] = []
     test_logger = MagicMock()
-    test_logger.warning.side_effect = lambda *_args, **_kwargs: warning_logged.set()
+
+    def observe_warning(_message: str, *_args: Any, **_kwargs: Any) -> None:
+        warning_logged.set()
+
+    test_logger.warning.side_effect = observe_warning
     monkeypatch.setattr(memory_module, "_TF_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(memory_module, "logger", test_logger)
 
-    def append(*_args: Any, **_kwargs: Any) -> None:
+    def append(message: TFMessage, *, ts: float, pose: None) -> None:
+        recorded_messages.append(message)
+        assert ts == 1.0
+        assert pose is None
         append_started.set()
         assert append_release.wait(timeout=SYNC_TIMEOUT)
         append_finished.set()
@@ -1307,15 +1334,16 @@ def test_recorder_stop_waits_for_active_tf_callback(
         callback_future.result(timeout=SYNC_TIMEOUT)
         stop_future.result(timeout=SYNC_TIMEOUT)
 
-    recorded_message = tf_stream.append.call_args.args[0]
-    assert recorded_message.transforms == [transform]
-    assert tf_stream.append.call_args.kwargs == {"ts": 1.0, "pose": None}
+    assert len(recorded_messages) == 1
+    assert recorded_messages[0].transforms == [transform]
     unsubscribe.assert_called_once_with()
     store.stop.assert_called_once_with()
     assert store_stopped.is_set()
-    test_logger.warning.assert_called()
-    assert test_logger.warning.call_args.args == ("Still waiting for tf callbacks",)
-    assert test_logger.warning.call_args.kwargs["active_callbacks"] == 1
+    test_logger.warning.assert_any_call(
+        "Still waiting for tf callbacks",
+        active_callbacks=1,
+        elapsed_seconds=ANY,
+    )
 
 
 def test_recorder_tf_info_error_still_drains_active_callback(

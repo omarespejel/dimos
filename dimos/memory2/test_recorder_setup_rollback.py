@@ -35,6 +35,8 @@ from dimos.memory2 import module as memory_module
 from dimos.memory2.module import Recorder
 from dimos.memory2.store.sqlite import SqliteStore
 from dimos.memory2.stream import Stream
+from dimos.msgs.geometry_msgs.Transform import Transform
+from dimos.msgs.tf2_msgs.TFMessage import TFMessage
 from dimos.protocol.rpc.spec import Args, RPCSpec
 
 
@@ -218,6 +220,170 @@ def test_recorder_removes_input_cleanup_after_subscription_setup_fails(
     assert store_stopped.is_set()
 
 
+def test_recorder_removes_tf_cleanup_after_subscription_setup_fails(tmp_path: Path) -> None:
+    setup_error = RuntimeError("subscribe failed")
+    store = MagicMock(spec=SqliteStore)
+    tf_stream = MagicMock(spec=Stream)
+    store.stream.return_value = tf_stream
+    retained_callbacks: list[Callable[[TFMessage, Any], None]] = []
+    pubsub = MagicMock()
+
+    def fail_subscribe(
+        _topic: str,
+        callback: Callable[[TFMessage, Any], None],
+    ) -> None:
+        retained_callbacks.append(callback)
+        raise setup_error
+
+    pubsub.subscribe.side_effect = fail_subscribe
+    tf = MagicMock()
+    tf.config.topic = "/tf"
+    tf.pubsub = pubsub
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    module._tf = tf
+
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            module._record_tf()
+
+        assert exc_info.value is setup_error
+        assert module._tf_cleanup is None
+        assert len(retained_callbacks) == 1
+        retained_callbacks[0](TFMessage(Transform(ts=1.0)), "/tf")
+        tf_stream.append.assert_not_called()
+        assert not module._memory_teardown_failed
+        module.stop()
+    finally:
+        with suppress(BaseException):
+            module.stop()
+
+    store.stop.assert_called_once_with()
+
+
+def test_recorder_stop_can_win_tf_subscription_setup_failure(tmp_path: Path) -> None:
+    setup_error = RuntimeError("subscribe failed")
+    store = MagicMock(spec=SqliteStore)
+    tf_stream = MagicMock(spec=Stream)
+    store.stream.return_value = tf_stream
+    subscribe_started = threading.Event()
+    subscribe_release = threading.Event()
+    store_stopped = threading.Event()
+    retained_callbacks: list[Callable[[TFMessage, Any], None]] = []
+    pubsub = MagicMock()
+
+    def fail_subscribe(
+        _topic: str,
+        callback: Callable[[TFMessage, Any], None],
+    ) -> None:
+        retained_callbacks.append(callback)
+        subscribe_started.set()
+        assert subscribe_release.wait(timeout=SYNC_TIMEOUT)
+        raise setup_error
+
+    pubsub.subscribe.side_effect = fail_subscribe
+    tf = MagicMock()
+    tf.config.topic = "/tf"
+    tf.pubsub = pubsub
+    store.stop.side_effect = store_stopped.set
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    module._tf = tf
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            record_future = pool.submit(module._record_tf)
+            assert subscribe_started.wait(timeout=SYNC_TIMEOUT)
+            stop_future = pool.submit(module.stop)
+            assert store_stopped.wait(timeout=SYNC_TIMEOUT)
+            subscribe_release.set()
+
+            with pytest.raises(RuntimeError) as exc_info:
+                record_future.result(timeout=SYNC_TIMEOUT)
+            stop_future.result(timeout=SYNC_TIMEOUT)
+
+        assert exc_info.value is setup_error
+        assert module._tf_cleanup is None
+        assert len(retained_callbacks) == 1
+        retained_callbacks[0](TFMessage(Transform(ts=1.0)), "/tf")
+        tf_stream.append.assert_not_called()
+    finally:
+        subscribe_release.set()
+        with suppress(BaseException):
+            module.stop()
+
+    store.stop.assert_called_once_with()
+
+
+def test_recorder_tf_setup_drain_timeout_blocks_later_store_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_error = RuntimeError("subscribe failed")
+    store = MagicMock(spec=SqliteStore)
+    tf_stream = MagicMock(spec=Stream)
+    store.stream.return_value = tf_stream
+    callback_started = threading.Event()
+    callback_release = threading.Event()
+    callback_threads: list[threading.Thread] = []
+    pubsub = MagicMock()
+    message = TFMessage(Transform(ts=1.0))
+
+    def append(*_args: Any, **_kwargs: Any) -> None:
+        callback_started.set()
+        assert callback_release.wait(timeout=SYNC_TIMEOUT)
+
+    def fail_subscribe(
+        _topic: str,
+        callback: Callable[[TFMessage, Any], None],
+    ) -> None:
+        thread = threading.Thread(target=callback, args=(message, "/tf"))
+        callback_threads.append(thread)
+        thread.start()
+        assert callback_started.wait(timeout=SYNC_TIMEOUT)
+        raise setup_error
+
+    tf_stream.append.side_effect = append
+    pubsub.subscribe.side_effect = fail_subscribe
+    tf = MagicMock()
+    tf.config.topic = "/tf"
+    tf.pubsub = pubsub
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    module._tf = tf
+    monkeypatch.setattr(memory_module, "_TF_DRAIN_LOG_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(memory_module, "_TF_DRAIN_TIMEOUT_SECONDS", 0.05)
+
+    try:
+        with pytest.raises(memory_module._DrainIncompleteError) as exc_info:
+            module._record_tf()
+
+        assert exc_info.value.__cause__ is setup_error
+        assert module._tf_cleanup is None
+        assert module._memory_stopping
+        assert module._memory_teardown_failed
+        assert module._store is store
+        store.stop.assert_not_called()
+
+        with pytest.raises(RuntimeError, match="teardown previously failed"):
+            module.stop()
+        store.stop.assert_not_called()
+    finally:
+        callback_release.set()
+        for thread in callback_threads:
+            thread.join(timeout=SYNC_TIMEOUT)
+        Module.stop(module)
+
+
 def test_recorder_callback_gate_error_keeps_store_open(tmp_path: Path) -> None:
     store = MagicMock(spec=SqliteStore)
     module = Recorder(
@@ -227,11 +393,18 @@ def test_recorder_callback_gate_error_keeps_store_open(tmp_path: Path) -> None:
     )
     module._store = store
     gate_error = RuntimeError("callback gate failed")
+
+    def fail_gate() -> None:
+        raise gate_error
+
+    def noop() -> None:
+        pass
+
     module._input_cleanups = [
         memory_module._RecorderCleanup(
-            lambda: (_ for _ in ()).throw(gate_error),
-            lambda: None,
-            lambda: None,
+            fail_gate,
+            noop,
+            noop,
         )
     ]
 
