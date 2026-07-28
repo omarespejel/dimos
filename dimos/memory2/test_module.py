@@ -396,8 +396,11 @@ def test_recorder_input_drain_wait_error_still_waits_for_callback(
         record_tf=False,
         rpc_transport=_TestRPC,
     )
-    # Prevent the loop-thread join from masking an abandoned input drain.
-    module._loop_thread_timeout = 0.0
+    loop = module._loop
+    assert loop is not None
+    ready = threading.Event()
+    loop.call_soon_threadsafe(ready.set)
+    assert ready.wait(SYNC_TIMEOUT)
     module._store = store
     append_started = threading.Event()
     append_release = threading.Event()
@@ -405,7 +408,7 @@ def test_recorder_input_drain_wait_error_still_waits_for_callback(
     store_stopped = threading.Event()
     wait_error = RuntimeError("wait failed")
     original_wait_for = threading.Condition.wait_for
-    wait_failures_remaining = 1
+    wait_calls = 0
     stop_thread_id: int | None = None
 
     def wait_for_once_then_normal(
@@ -413,10 +416,11 @@ def test_recorder_input_drain_wait_error_still_waits_for_callback(
         predicate: Callable[[], bool],
         timeout: float | None = None,
     ) -> bool:
-        nonlocal wait_failures_remaining
-        if threading.get_ident() == stop_thread_id and wait_failures_remaining:
-            wait_failures_remaining -= 1
-            raise wait_error
+        nonlocal wait_calls
+        if threading.get_ident() == stop_thread_id:
+            wait_calls += 1
+            if wait_calls == 1:
+                raise wait_error
         return original_wait_for(condition, predicate, timeout)
 
     def stop_module() -> None:
@@ -457,6 +461,7 @@ def test_recorder_input_drain_wait_error_still_waits_for_callback(
 
     assert exc_info.value is wait_error
     assert append_finished.is_set()
+    assert wait_calls >= 2
     store.stop.assert_called_once_with()
     assert store_stopped.is_set()
 
