@@ -253,6 +253,7 @@ class MemoryModule(Module):
         self._memory_stopped = threading.Event()
         self._memory_stop_active = False
         self._memory_teardown_failed = False
+        self._memory_store_retained = False
         super().__init__(**kwargs)
 
     def __getstate__(self) -> dict[str, Any]:
@@ -263,6 +264,7 @@ class MemoryModule(Module):
         state.pop("_memory_stopped", None)
         state.pop("_memory_stop_active", None)
         state.pop("_memory_teardown_failed", None)
+        state.pop("_memory_store_retained", None)
         state.pop("_store", None)
         return state
 
@@ -273,6 +275,7 @@ class MemoryModule(Module):
         self._memory_stopped = threading.Event()
         self._memory_stop_active = False
         self._memory_teardown_failed = False
+        self._memory_store_retained = False
         if self._module_closed:
             self._memory_stopped.set()
         self._store = None
@@ -293,6 +296,8 @@ class MemoryModule(Module):
     def store(self) -> SqliteStore:
         with self._memory_stop_lock:
             if self._memory_stopping:
+                if self._memory_store_retained and self._store is not None:
+                    return self._store
                 raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
             if self._store is not None:
                 return self._store
@@ -328,6 +333,7 @@ class MemoryModule(Module):
                     # The callback may still depend on the module loop or ports.
                     # Leave the runtime and store alive so it can finish.
                     self._memory_teardown_failed = True
+                    self._memory_store_retained = True
                     try:
                         logger.error(
                             "Memory callback drain failed; leaving module runtime and store open",
@@ -556,6 +562,51 @@ class Recorder(MemoryModule):
         if first_error is not None:
             raise first_error
 
+    def _rollback_recorder_setup(
+        self,
+        failed_cleanup: _RecorderCleanup,
+        *,
+        is_tf_cleanup: bool,
+    ) -> None:
+        with self._input_cleanup_lock:
+            with self._memory_stop_lock:
+                cleanup_owned = (
+                    self._tf_cleanup is failed_cleanup
+                    if is_tf_cleanup
+                    else failed_cleanup in self._input_cleanups
+                )
+                if not cleanup_owned:
+                    return
+
+                input_cleanups, self._input_cleanups = self._input_cleanups, []
+                tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
+                cleanups = [*input_cleanups]
+                drain_timeouts: list[float] = []
+                if input_cleanups:
+                    drain_timeouts.append(_INPUT_DRAIN_TIMEOUT_SECONDS)
+                if tf_cleanup is not None:
+                    cleanups.append(tf_cleanup)
+                    drain_timeouts.append(_TF_DRAIN_TIMEOUT_SECONDS)
+                self._callback_drain_deadline = time.monotonic() + max(drain_timeouts)
+
+            try:
+                self._dispose_recorder_cleanups(cleanups)
+            except _DrainIncompleteError:
+                with self._memory_stop_lock:
+                    self._memory_stopping = True
+                    self._memory_teardown_failed = True
+                    self._memory_store_retained = True
+                raise
+            except BaseException:
+                try:
+                    logger.exception("Failed to roll back recorder setup")
+                except BaseException:
+                    pass
+            finally:
+                with self._memory_stop_lock:
+                    self._memory_stopping = True
+                self._callback_drain_deadline = None
+
     def _before_memory_stop(self) -> None:
         input_cleanups, self._input_cleanups = self._input_cleanups, []
         tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
@@ -701,10 +752,11 @@ class Recorder(MemoryModule):
             except BaseException as exc:
                 record_error(exc)
 
-            try:
-                dispatcher.dispose()
-            except BaseException as exc:
-                record_error(exc)
+            if drain_error is None:
+                try:
+                    dispatcher.dispose()
+                except BaseException as exc:
+                    record_error(exc)
 
             if drain_error is not None:
                 if first_error is not None and first_error is not drain_error:
@@ -805,11 +857,12 @@ class Recorder(MemoryModule):
         # dispatcher available to stop() before subscribing; a subscription
         # returned after stop is disposed immediately by its assignment slot.
         input_cleanup = _RecorderCleanup(block_input, unsubscribe_input, drain_input)
-        with self._memory_stop_lock:
-            if self._memory_stopping:
-                input_cleanup.dispose()
-                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
-            self._input_cleanups.append(input_cleanup)
+        with self._input_cleanup_lock:
+            with self._memory_stop_lock:
+                if self._memory_stopping:
+                    input_cleanup.dispose()
+                    raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+                self._input_cleanups.append(input_cleanup)
         try:
             on_next, dispatcher_disposable = self._make_async_dispatch(on_msg)
             with callback_state:
@@ -827,43 +880,10 @@ class Recorder(MemoryModule):
             stamped = input_topic.pure_observable().pipe(ops.map(stamp_reception))
             observable_subscription = stamped.subscribe(on_next)
         except BaseException as setup_error:
-            drain_error: _DrainIncompleteError | None = None
-            remaining_cleanups: list[_RecorderCleanup] = []
-            with self._input_cleanup_lock:
-                with self._memory_stop_lock:
-                    cleanup_owned = input_cleanup in self._input_cleanups
-                    if cleanup_owned:
-                        self._input_cleanups.remove(input_cleanup)
-                if cleanup_owned:
-                    try:
-                        input_cleanup.dispose()
-                    except _DrainIncompleteError as exc:
-                        drain_error = exc
-                    except BaseException:
-                        logger.exception("Failed to clean up recorder input after setup error")
-
-                if drain_error is not None:
-                    with self._memory_stop_lock:
-                        self._memory_stopping = True
-                        self._memory_teardown_failed = True
-                        remaining_cleanups, self._input_cleanups = self._input_cleanups, []
-                        tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
-                        if tf_cleanup is not None:
-                            remaining_cleanups.append(tf_cleanup)
-                        self._callback_drain_deadline = time.monotonic()
-                    try:
-                        try:
-                            self._dispose_recorder_cleanups(remaining_cleanups)
-                        except BaseException:
-                            try:
-                                logger.exception(
-                                    "Failed to stop recorder input after setup drain failure"
-                                )
-                            except BaseException:
-                                pass
-                    finally:
-                        self._callback_drain_deadline = None
-                    raise drain_error from setup_error
+            try:
+                self._rollback_recorder_setup(input_cleanup, is_tf_cleanup=False)
+            except _DrainIncompleteError as drain_error:
+                raise drain_error from setup_error
             raise
         rx_subscription.disposable = observable_subscription
 
@@ -1036,57 +1056,22 @@ class Recorder(MemoryModule):
                 raise first_error
 
         cleanup = _RecorderCleanup(block_tf, unsubscribe_tf, drain_tf)
-        with self._memory_stop_lock:
-            if self._memory_stopping:
-                cleanup.dispose()
-                raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
-            self._tf_cleanup = cleanup
-            self.register_disposable(cleanup)
-            tf_stream = self.store.stream("tf", TFMessage)
+        with self._input_cleanup_lock:
+            with self._memory_stop_lock:
+                if self._memory_stopping:
+                    cleanup.dispose()
+                    raise RuntimeError(f"{type(self).__name__} is stopping or stopped")
+                self._tf_cleanup = cleanup
+                self.register_disposable(cleanup)
+                tf_stream = self.store.stream("tf", TFMessage)
 
         try:
             returned_unsubscribe = pubsub.subscribe(topic, on_tf)
         except BaseException as setup_error:
-            drain_error: _DrainIncompleteError | None = None
-            remaining_cleanups: list[_RecorderCleanup] = []
-            with self._input_cleanup_lock:
-                with self._memory_stop_lock:
-                    cleanup_owned = self._tf_cleanup is cleanup
-                    if cleanup_owned:
-                        self._tf_cleanup = None
-                if cleanup_owned:
-                    try:
-                        cleanup.dispose()
-                    except _DrainIncompleteError as exc:
-                        drain_error = exc
-                    except BaseException:
-                        try:
-                            logger.exception("Failed to clean up tf after setup error")
-                        except BaseException:
-                            pass
-
-                if drain_error is not None:
-                    with self._memory_stop_lock:
-                        self._memory_stopping = True
-                        self._memory_teardown_failed = True
-                        remaining_cleanups, self._input_cleanups = self._input_cleanups, []
-                        tf_cleanup, self._tf_cleanup = self._tf_cleanup, None
-                        if tf_cleanup is not None:
-                            remaining_cleanups.append(tf_cleanup)
-                        self._callback_drain_deadline = time.monotonic()
-                    try:
-                        try:
-                            self._dispose_recorder_cleanups(remaining_cleanups)
-                        except BaseException:
-                            try:
-                                logger.exception(
-                                    "Failed to stop recorder after tf setup drain failure"
-                                )
-                            except BaseException:
-                                pass
-                    finally:
-                        self._callback_drain_deadline = None
-                    raise drain_error from setup_error
+            try:
+                self._rollback_recorder_setup(cleanup, is_tf_cleanup=True)
+            except _DrainIncompleteError as drain_error:
+                raise drain_error from setup_error
             raise
         with callback_state:
             if accepting_callbacks:
