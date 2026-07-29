@@ -703,11 +703,13 @@ def test_recorder_setup_drain_timeout_stops_existing_inputs(
     module._tf_cleanup = _recorder_cleanup(drain=tf_cleanup_disposed.set)
 
     async def resolve_pose(name: str, _msg: Any, _ts: float) -> None:
+        callback_released = True
         if name == "second":
             second_callback_started.set()
-            assert second_callback_release.wait(timeout=SYNC_TIMEOUT)
+            callback_released = second_callback_release.wait(timeout=SYNC_TIMEOUT)
         else:
             first_pose_called.set()
+        assert callback_released
         return None
 
     def make_dispatch(

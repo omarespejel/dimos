@@ -598,10 +598,11 @@ class Recorder(MemoryModule):
                     self._memory_store_retained = True
                 raise
             except BaseException:
-                try:
-                    logger.exception("Failed to roll back recorder setup")
-                except BaseException:
-                    pass
+                with self._memory_stop_lock:
+                    self._memory_stopping = True
+                    self._memory_teardown_failed = True
+                    self._memory_store_retained = True
+                raise
             finally:
                 with self._memory_stop_lock:
                     self._memory_stopping = True
@@ -882,8 +883,8 @@ class Recorder(MemoryModule):
         except BaseException as setup_error:
             try:
                 self._rollback_recorder_setup(input_cleanup, is_tf_cleanup=False)
-            except _DrainIncompleteError as drain_error:
-                raise drain_error from setup_error
+            except BaseException as cleanup_error:
+                raise cleanup_error from setup_error
             raise
         rx_subscription.disposable = observable_subscription
 
@@ -1070,8 +1071,8 @@ class Recorder(MemoryModule):
         except BaseException as setup_error:
             try:
                 self._rollback_recorder_setup(cleanup, is_tf_cleanup=True)
-            except _DrainIncompleteError as drain_error:
-                raise drain_error from setup_error
+            except BaseException as cleanup_error:
+                raise cleanup_error from setup_error
             raise
         with callback_state:
             if accepting_callbacks:

@@ -439,6 +439,72 @@ def test_later_input_setup_failure_stops_existing_recorder_sources(
             module.stop()
 
 
+def test_later_input_setup_cleanup_failure_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    setup_error = RuntimeError("subscribe failed")
+    cleanup_error = RuntimeError("unsubscribe failed")
+    store = MagicMock(spec=SqliteStore)
+    stream = MagicMock(spec=Stream)
+    cleanup_attempts = 0
+
+    def fail_cleanup() -> None:
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        raise cleanup_error
+
+    def ignore_message(_stamped: Any) -> None:
+        pass
+
+    def make_dispatch(
+        _callback: Callable[[Any], Any],
+    ) -> tuple[Callable[[Any], None], Disposable]:
+        return ignore_message, Disposable()
+
+    def make_input(*, fail: bool = False) -> MagicMock:
+        input_topic = MagicMock(spec=In)
+        observable = MagicMock()
+        stamped = MagicMock()
+        input_topic.pure_observable.return_value = observable
+        observable.pipe.return_value = stamped
+        if fail:
+            stamped.subscribe.side_effect = setup_error
+        else:
+            stamped.subscribe.return_value = Disposable(fail_cleanup)
+        return input_topic
+
+    module = Recorder(
+        db_path=tmp_path / "recording.db",
+        record_tf=False,
+        rpc_transport=_TestRPC,
+    )
+    module._store = store
+    monkeypatch.setattr(module, "_make_async_dispatch", make_dispatch)
+
+    try:
+        module._port_to_stream("first", make_input(), stream)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            module._port_to_stream("second", make_input(fail=True), stream)
+
+        assert exc_info.value is cleanup_error
+        assert exc_info.value.__cause__ is setup_error
+        assert cleanup_attempts == 1
+        assert module._input_cleanups == []
+        assert module._memory_stopping
+        assert module._memory_teardown_failed
+        assert module._memory_store_retained
+        assert module.store is store
+        store.stop.assert_not_called()
+
+        with pytest.raises(RuntimeError, match="teardown previously failed"):
+            module.stop()
+        store.stop.assert_not_called()
+    finally:
+        Module.stop(module)
+
+
 def test_tf_setup_failure_stops_existing_input_sources(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
